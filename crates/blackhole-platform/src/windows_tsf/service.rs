@@ -121,18 +121,17 @@ impl BlackholeTextService {
         let mut inner = self.inner.lock().unwrap();
         if let Some(ref mut conn) = inner.ipc_conn {
             let request = IpcRequest::GetSettings;
-            if super::super::ipc::send_request(&mut conn.writer, &request).is_ok() {
-                if let Ok(IpcResponse::Settings { scheme_id, theme }) =
+            if super::super::ipc::send_request(&mut conn.writer, &request).is_ok()
+                && let Ok(IpcResponse::Settings { scheme_id, theme }) =
                     super::super::ipc::read_response(&mut conn.reader)
-                {
-                    inner.current_scheme = scheme_id;
-                    inner.current_theme = theme;
-                    tracing::info!(
-                        "Synced settings from daemon: scheme={:?}, theme={:?}",
-                        scheme_id,
-                        theme
-                    );
-                }
+            {
+                inner.current_scheme = scheme_id;
+                inner.current_theme = theme;
+                tracing::info!(
+                    "Synced settings from daemon: scheme={:?}, theme={:?}",
+                    scheme_id,
+                    theme
+                );
             }
         }
     }
