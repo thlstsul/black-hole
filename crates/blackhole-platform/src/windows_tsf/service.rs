@@ -1,0 +1,548 @@
+use super::super::ipc::{IpcRequest, IpcResponse};
+use super::{ServiceInner, send_ui_command_inner};
+use blackhole_shared::{KeyState, UiCommand};
+use std::sync::{Arc, Mutex};
+use windows::Win32::Foundation::{E_UNEXPECTED, LPARAM, WPARAM};
+use windows::Win32::UI::TextServices::{
+    ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfContextView,
+    ITfDocumentMgr, ITfEditSession, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
+    ITfLangBarItem, ITfLangBarItemMgr, ITfSource, ITfTextInputProcessor,
+    ITfTextInputProcessor_Impl, ITfTextLayoutSink, ITfTextLayoutSink_Impl, ITfThreadMgr,
+    ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC,
+    TF_LC_CHANGE, TfLayoutCode,
+};
+use windows_core::{BOOL, GUID, Interface, Ref, implement};
+
+// ---------------------------------------------------------------------------
+// COM object: BlackholeTextService
+// ---------------------------------------------------------------------------
+
+#[implement(
+    ITfTextInputProcessor,
+    ITfKeyEventSink,
+    ITfCompositionSink,
+    ITfTextLayoutSink,
+    ITfThreadMgrEventSink
+)]
+pub struct BlackholeTextService {
+    pub(crate) inner: Arc<Mutex<ServiceInner>>,
+    /// Only the primary COM object created by the class factory should
+    /// influence the DLL global reference count.  Temporary sink objects
+    /// reused inside the same DLL must not touch it.
+    pub(crate) track_ref_count: bool,
+}
+
+impl Default for BlackholeTextService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for BlackholeTextService {
+    fn drop(&mut self) {
+        if self.track_ref_count {
+            super::dll_release();
+        }
+    }
+}
+
+impl BlackholeTextService {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ServiceInner::new())),
+            track_ref_count: true,
+        }
+    }
+
+    /// Create a lightweight sink wrapper that shares the same inner state
+    /// but does not affect the DLL reference count.
+    pub(crate) fn new_for_sink(inner: Arc<Mutex<ServiceInner>>) -> Self {
+        Self {
+            inner,
+            track_ref_count: false,
+        }
+    }
+
+    /// Connect to the daemon IPC server with retry mechanism.
+    fn connect_ipc(&self) -> windows_core::Result<()> {
+        let inner = self.inner.lock().unwrap();
+        if inner.ipc_conn.is_some() {
+            tracing::info!("connect_ipc: already connected");
+            return Ok(());
+        }
+        drop(inner);
+
+        let max_retries = 3;
+        let mut retry_delay_ms = 500;
+
+        for attempt in 1..=max_retries {
+            match std::net::TcpStream::connect(super::super::ipc::IPC_SERVER_ADDR) {
+                Ok(stream) => {
+                    let _ = stream.set_nodelay(true);
+                    tracing::info!(
+                        "connect_ipc: connected to daemon at {} (attempt {})",
+                        super::super::ipc::IPC_SERVER_ADDR,
+                        attempt
+                    );
+                    let reader =
+                        std::io::BufReader::new(stream.try_clone().map_err(|_| E_UNEXPECTED)?);
+                    let mut inner = self.inner.lock().unwrap();
+                    inner.ipc_conn = Some(super::IpcConnection {
+                        writer: stream,
+                        reader,
+                    });
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "connect_ipc: failed to connect to daemon (attempt {}/{}): {}",
+                        attempt,
+                        max_retries,
+                        e
+                    );
+                    if attempt < max_retries {
+                        std::thread::sleep(std::time::Duration::from_millis(retry_delay_ms));
+                        retry_delay_ms = (retry_delay_ms * 2).min(3000);
+                    }
+                }
+            }
+        }
+
+        tracing::error!(
+            "connect_ipc: failed to connect to daemon after {} attempts",
+            max_retries
+        );
+        Err(E_UNEXPECTED.into())
+    }
+
+    /// 向 daemon 查询当前的 scheme 和 theme 设置，并更新 ServiceInner，
+    /// 使托盘菜单能勾选正确的选项。
+    fn sync_settings_from_daemon(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(ref mut conn) = inner.ipc_conn {
+            let request = IpcRequest::GetSettings;
+            if super::super::ipc::send_request(&mut conn.writer, &request).is_ok() {
+                if let Ok(IpcResponse::Settings { scheme_id, theme }) =
+                    super::super::ipc::read_response(&mut conn.reader)
+                {
+                    inner.current_scheme = scheme_id;
+                    inner.current_theme = theme;
+                    tracing::info!(
+                        "Synced settings from daemon: scheme={:?}, theme={:?}",
+                        scheme_id,
+                        theme
+                    );
+                }
+            }
+        }
+    }
+
+    /// Disconnect from the daemon IPC server and clean up state.
+    fn disconnect_ipc(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.ipc_conn = None;
+        inner.composition = None;
+        inner.active = false;
+    }
+
+    /// Send a UI command to the daemon via IPC.
+    fn send_ui_command(&self, cmd: UiCommand) {
+        send_ui_command_inner(&self.inner, cmd);
+    }
+
+    /// Send Reset to the engine and cancel any active composition.
+    fn send_reset(&self) {
+        let (ctx_opt, client_id) = {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(ref mut conn) = inner.ipc_conn {
+                let request = super::super::ipc::IpcRequest::Reset;
+                let _ = super::super::ipc::send_request(&mut conn.writer, &request);
+                let _ = super::super::ipc::read_response(&mut conn.reader);
+            }
+            (inner.context.clone(), inner.client_id)
+        };
+
+        if let Some(ctx) = ctx_opt {
+            let session = super::commit::CancelCompositionEditSession {
+                inner_arc: self.inner.clone(),
+            };
+            let edit_session: ITfEditSession = session.into();
+            let _ = unsafe {
+                ctx.RequestEditSession(client_id, &edit_session, TF_ES_SYNC | TF_ES_READWRITE)
+            };
+        }
+
+        self.send_ui_command(UiCommand::HideCandidates);
+    }
+
+    /// Check whether an active composition exists.
+    fn is_composing(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        match &inner.composition {
+            None => false,
+            Some(c) => unsafe { c.GetRange().is_ok() },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ITfTextInputProcessor
+// ---------------------------------------------------------------------------
+
+impl ITfTextInputProcessor_Impl for BlackholeTextService_Impl {
+    fn Activate(&self, ptim: Ref<'_, ITfThreadMgr>, tid: u32) -> windows_core::Result<()> {
+        tracing::info!("BlackholeTextService::Activate called tid={}", tid);
+        let mut inner = self.inner.lock().unwrap();
+        inner.thread_mgr = ptim.to_owned();
+        inner.client_id = tid;
+        inner.active = true;
+        drop(inner);
+
+        let tm = ptim.to_owned().ok_or(E_UNEXPECTED)?;
+        if let Ok(keystroke_mgr) = tm.cast::<ITfKeystrokeMgr>() {
+            let sink = BlackholeTextService::new_for_sink(self.inner.clone());
+            let sink_iface: ITfKeyEventSink = sink.into();
+            unsafe { keystroke_mgr.AdviseKeyEventSink(tid, &sink_iface, true) }?;
+        }
+
+        if let Ok(source) = tm.cast::<ITfSource>() {
+            let sink = BlackholeTextService::new_for_sink(self.inner.clone());
+            let sink_iface: ITfThreadMgrEventSink = sink.into();
+            if let Ok(cookie) = unsafe {
+                source.AdviseSink(&<ITfThreadMgrEventSink as Interface>::IID, &sink_iface)
+            } {
+                let mut inner = self.inner.lock().unwrap();
+                inner.thread_mgr_event_sink_cookie = Some(cookie);
+            }
+        }
+
+        // 注册语言栏项（任务栏输入法指示器左侧的专属托盘）
+        match tm.cast::<ITfLangBarItemMgr>() {
+            Ok(langbar_mgr) => {
+                let item = super::langbar::BlackholeLangBarItem::new(self.inner.clone());
+                let item_iface: ITfLangBarItem = item.into();
+                match unsafe { langbar_mgr.AddItem(&item_iface) } {
+                    Ok(()) => {
+                        let mut inner = self.inner.lock().unwrap();
+                        inner.langbar_item = Some(item_iface);
+                        tracing::info!("Language bar item registered");
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to add language bar item: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to obtain ITfLangBarItemMgr: {}", e);
+            }
+        }
+
+        self.connect_ipc()?;
+
+        // 连接成功后，向 daemon 查询当前设置，确保托盘菜单勾选正确。
+        self.sync_settings_from_daemon();
+
+        Ok(())
+    }
+
+    fn Deactivate(&self) -> windows_core::Result<()> {
+        // 先取出需要注销所需的数据，避免在持有 inner 锁时调用 COM 方法。
+        // COM 方法可能回调到同一线程的其它接口方法（如 UnadviseSink），
+        // 导致 std::sync::Mutex 重入死锁。
+        let (thread_mgr, client_id, thread_mgr_event_cookie, langbar_item) = {
+            let inner = self.inner.lock().unwrap();
+            (
+                inner.thread_mgr.clone(),
+                inner.client_id,
+                inner.thread_mgr_event_sink_cookie,
+                inner.langbar_item.clone(),
+            )
+        };
+
+        if let Some(ref tm) = thread_mgr
+            && let Ok(keystroke_mgr) = tm.cast::<ITfKeystrokeMgr>()
+        {
+            let _ = unsafe { keystroke_mgr.UnadviseKeyEventSink(client_id) };
+        }
+        if let Some(ref tm) = thread_mgr
+            && let Ok(source) = tm.cast::<ITfSource>()
+            && let Some(cookie) = thread_mgr_event_cookie
+        {
+            let _ = unsafe { source.UnadviseSink(cookie) };
+        }
+        if let Some(ref tm) = thread_mgr
+            && let Ok(langbar_mgr) = tm.cast::<ITfLangBarItemMgr>()
+            && let Some(ref item) = langbar_item
+        {
+            let _ = unsafe { langbar_mgr.RemoveItem(item) };
+            tracing::info!("Language bar item removed");
+        }
+
+        self.send_reset();
+        self.disconnect_ipc();
+        let mut inner = self.inner.lock().unwrap();
+        inner.context = None;
+        inner.thread_mgr = None;
+        inner.client_id = 0;
+        inner.thread_mgr_event_sink_cookie = None;
+        inner.langbar_item = None;
+        inner.langbar_item_sink = None;
+        inner.langbar_item_sink_cookie = 0;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ITfKeyEventSink
+// ---------------------------------------------------------------------------
+
+impl ITfKeyEventSink_Impl for BlackholeTextService_Impl {
+    fn OnSetFocus(&self, fforeground: BOOL) -> windows_core::Result<()> {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.last_caret_pos = None;
+        }
+        if !fforeground.as_bool() {
+            self.send_reset();
+        }
+        Ok(())
+    }
+
+    fn OnTestKeyDown(
+        &self,
+        _pic: Ref<'_, ITfContext>,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> windows_core::Result<BOOL> {
+        let vk = windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(wparam.0 as u16);
+        if let Some(evt) =
+            super::key_event::virtual_key_to_key_event(vk, wparam, lparam, KeyState::Press)
+        {
+            let is_composing = self.is_composing();
+            let is_input_char = evt.key.len() == 1 && {
+                let ch = evt.key.chars().next().unwrap();
+                ch.is_ascii_alphanumeric() || ch.is_ascii_punctuation()
+            };
+            let intercept = if is_composing {
+                matches!(
+                    evt.key.as_str(),
+                    "Backspace"
+                        | "Enter"
+                        | "Space"
+                        | "ArrowLeft"
+                        | "ArrowRight"
+                        | "ArrowUp"
+                        | "ArrowDown"
+                ) || is_input_char
+            } else {
+                is_input_char
+            };
+
+            if intercept {
+                let mut inner = self.inner.lock().unwrap();
+                inner.last_key_event = Some((wparam, lparam, evt));
+                return Ok(BOOL(1));
+            }
+        }
+        let mut inner = self.inner.lock().unwrap();
+        inner.last_key_event = None;
+        Ok(BOOL(0))
+    }
+
+    fn OnTestKeyUp(
+        &self,
+        _pic: Ref<'_, ITfContext>,
+        _wparam: WPARAM,
+        _lparam: LPARAM,
+    ) -> windows_core::Result<BOOL> {
+        Ok(BOOL(0))
+    }
+
+    fn OnKeyDown(
+        &self,
+        pic: Ref<'_, ITfContext>,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> windows_core::Result<BOOL> {
+        let cached_event = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.last_key_event.take().and_then(|(cw, cl, evt)| {
+                if cw.0 == wparam.0 && cl.0 == lparam.0 {
+                    Some(evt)
+                } else {
+                    None
+                }
+            })
+        };
+
+        let key_event = match cached_event {
+            Some(evt) => evt,
+            None => {
+                let vk = windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(wparam.0 as u16);
+                match super::key_event::virtual_key_to_key_event(
+                    vk,
+                    wparam,
+                    lparam,
+                    KeyState::Press,
+                ) {
+                    Some(evt) => evt,
+                    None => return Ok(BOOL(0)),
+                }
+            }
+        };
+
+        let composing = self.is_composing();
+        if !composing {
+            let is_input_char = key_event.key.len() == 1 && {
+                let ch = key_event.key.chars().next().unwrap();
+                ch.is_ascii_alphanumeric() || ch.is_ascii_punctuation()
+            };
+            if !is_input_char {
+                return Ok(BOOL(0));
+            }
+        }
+
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.context = pic.to_owned();
+        }
+
+        let session = super::key_event::KeyHandlerEditSession {
+            service: self.inner.clone(),
+            key_event,
+        };
+        let edit_session: ITfEditSession = session.into();
+
+        let inner = self.inner.lock().unwrap();
+        let client_id = inner.client_id;
+        drop(inner);
+
+        let ctx = pic.to_owned().ok_or(E_UNEXPECTED)?;
+        let hr = unsafe {
+            ctx.RequestEditSession(client_id, &edit_session, TF_ES_SYNC | TF_ES_READWRITE)?
+        };
+
+        if hr.is_ok() { Ok(BOOL(1)) } else { Ok(BOOL(0)) }
+    }
+
+    fn OnKeyUp(
+        &self,
+        _pic: Ref<'_, ITfContext>,
+        _wparam: WPARAM,
+        _lparam: LPARAM,
+    ) -> windows_core::Result<BOOL> {
+        Ok(BOOL(0))
+    }
+
+    fn OnPreservedKey(
+        &self,
+        _pic: Ref<'_, ITfContext>,
+        _rguid: *const GUID,
+    ) -> windows_core::Result<BOOL> {
+        Ok(BOOL(0))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ITfCompositionSink
+// ---------------------------------------------------------------------------
+
+impl ITfCompositionSink_Impl for BlackholeTextService_Impl {
+    fn OnCompositionTerminated(
+        &self,
+        _ecwrite: u32,
+        _pcomposition: Ref<'_, ITfComposition>,
+    ) -> windows_core::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.composition = None;
+        if let Some(cookie) = inner.layout_sink_cookie.take()
+            && let Some(ref ctx) = inner.context
+            && let Ok(source) = ctx.cast::<ITfSource>()
+        {
+            let _ = unsafe { source.UnadviseSink(cookie) };
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ITfTextLayoutSink
+// ---------------------------------------------------------------------------
+
+impl ITfTextLayoutSink_Impl for BlackholeTextService_Impl {
+    fn OnLayoutChange(
+        &self,
+        pic: Ref<'_, ITfContext>,
+        lcode: TfLayoutCode,
+        _pview: Ref<'_, ITfContextView>,
+    ) -> windows_core::Result<()> {
+        if lcode != TF_LC_CHANGE {
+            return Ok(());
+        }
+
+        {
+            let inner = self.inner.lock().unwrap();
+            let current_ctx = match &inner.context {
+                Some(c) => c,
+                None => return Ok(()),
+            };
+            if let Some(pic_ctx) = pic.to_owned() {
+                if pic_ctx.as_raw() != current_ctx.as_raw() {
+                    return Ok(());
+                }
+            } else {
+                return Ok(());
+            }
+        }
+
+        let session = super::caret::LayoutChangeEditSession {
+            inner_arc: self.inner.clone(),
+        };
+        let edit_session: ITfEditSession = session.into();
+
+        let inner = self.inner.lock().unwrap();
+        let client_id = inner.client_id;
+        drop(inner);
+
+        let ctx = pic.to_owned().ok_or(E_UNEXPECTED)?;
+        let _ =
+            unsafe { ctx.RequestEditSession(client_id, &edit_session, TF_ES_SYNC | TF_ES_READ) };
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ITfThreadMgrEventSink
+// ---------------------------------------------------------------------------
+
+impl ITfThreadMgrEventSink_Impl for BlackholeTextService_Impl {
+    fn OnInitDocumentMgr(&self, _pdocmgr: Ref<'_, ITfDocumentMgr>) -> windows_core::Result<()> {
+        Ok(())
+    }
+
+    fn OnUninitDocumentMgr(&self, _pdocmgr: Ref<'_, ITfDocumentMgr>) -> windows_core::Result<()> {
+        Ok(())
+    }
+
+    fn OnSetFocus(
+        &self,
+        _pdocmgrfocus: Ref<'_, ITfDocumentMgr>,
+        _pdocmgrprevfocus: Ref<'_, ITfDocumentMgr>,
+    ) -> windows_core::Result<()> {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.last_caret_pos = None;
+        }
+        self.send_reset();
+        Ok(())
+    }
+
+    fn OnPushContext(&self, _pic: Ref<'_, ITfContext>) -> windows_core::Result<()> {
+        Ok(())
+    }
+
+    fn OnPopContext(&self, _pic: Ref<'_, ITfContext>) -> windows_core::Result<()> {
+        Ok(())
+    }
+}

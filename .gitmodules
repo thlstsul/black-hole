@@ -1,0 +1,3 @@
+[submodule "assets/dicts"]
+	path = assets/dicts
+	url = https://gitee.com/thelostsoul/rime-ice.git

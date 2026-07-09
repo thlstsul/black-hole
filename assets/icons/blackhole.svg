@@ -1,0 +1,78 @@
+<svg
+    xmlns="http://www.w3.org/2000/svg"
+    viewBox="0 0 256 256"
+    width="256"
+    height="256"
+>
+  <defs>
+    <!-- 背景光晕渐变 -->
+    <radialGradient id="bgGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="60%" stop-color="#ffffff" stop-opacity="0" />
+      <stop offset="78%" stop-color="#ddeeff" stop-opacity="0.12" />
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0" />
+    </radialGradient>
+    <!-- 中心辉光 -->
+    <radialGradient id="centerGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.80" />
+      <stop offset="30%" stop-color="#ffffff" stop-opacity="0.40" />
+      <stop offset="60%" stop-color="#ffffff" stop-opacity="0.10" />
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+
+  <!-- 纯黑背景 -->
+  <rect width="256" height="256" rx="48" ry="48" fill="#050505" />
+
+  <!-- 背景光晕 -->
+  <circle cx="128" cy="128" r="120" fill="url(#bgGlow)" />
+
+  <!-- 光子环 - 半透明填充色块 -->
+  <circle cx="128" cy="128" r="92" fill="#ffffff" opacity="0.15" />
+  <circle cx="128" cy="128" r="76" fill="#050505" />
+
+  <!-- 吸积盘 - 大色块椭圆 -->
+  <ellipse
+        cx="128"
+        cy="128"
+        rx="78"
+        ry="28"
+        fill="#aaccff"
+        opacity="0.20"
+        transform="rotate(-12 128 128)"
+    />
+  <ellipse
+        cx="128"
+        cy="128"
+        rx="56"
+        ry="18"
+        fill="#ffffff"
+        opacity="0.30"
+        transform="rotate(-12 128 128)"
+    />
+
+  <!-- 中心辉光 -->
+  <circle cx="128" cy="128" r="50" fill="url(#centerGlow)" />
+
+  <!-- 事件视界（暗核） -->
+  <circle cx="128" cy="128" r="16" fill="#111111" />
+
+  <!-- 光标 I-beam - 大色块 -->
+  <g transform="translate(128, 128)">
+    <!-- 光标背景衬底 -->
+    <rect
+            x="-28"
+            y="-36"
+            width="56"
+            height="72"
+            rx="10"
+            fill="#ffffff"
+            opacity="0.10"
+        />
+    <!-- 竖线 -->
+    <rect x="-9" y="-30" width="18" height="60" rx="4" fill="#ffffff" />
+    <!-- 上横线 -->
+    <rect x="-24" y="-30" width="48" height="14" rx="4" fill="#ffffff" />
+    <!-- 下横线 -->
+    <rect x="-24" y="16" width="48" height="14" rx="4" fill="#ffffff" />
+  </g>
+</svg>

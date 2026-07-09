@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<component>
+  <name>org.freedesktop.IBus.Blackhole</name>
+  <description>Blackhole IME</description>
+  <exec>/usr/local/bin/blackhole --ibus</exec>
+  <version>0.1.0</version>
+  <author>Blackhole IME Team</author>
+  <license>MIT</license>
+  <homepage>https://github.com/blackhole/ime</homepage>
+  <textdomain>blackhole</textdomain>
+  <engines>
+    <engine>
+      <name>blackhole</name>
+      <language>zh</language>
+      <license>MIT</license>
+      <author>Blackhole IME Team</author>
+      <icon>/usr/share/ibus-blackhole/icons/blackhole.svg</icon>
+      <layout>us</layout>
+      <longname>Blackhole</longname>
+      <description>Blackhole IME with Pinyin, Blackhole and Wubi support</description>
+      <rank>99</rank>
+      <symbol>CJ</symbol>
+    </engine>
+  </engines>
+</component>

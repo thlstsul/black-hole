@@ -1,0 +1,9 @@
+[package]
+name = "icon-gen"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+resvg = ">=0.43, <1"
