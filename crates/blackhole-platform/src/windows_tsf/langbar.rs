@@ -8,12 +8,19 @@
 use super::ServiceInner;
 use blackhole_shared::{SchemeId, Theme, UiCommand};
 use std::sync::{Arc, Mutex};
-use windows::Win32::Foundation::{COLORREF, E_FAIL, E_UNEXPECTED, POINT, RECT, TRUE};
+use windows::Win32::Foundation::{
+    COLORREF, E_FAIL, E_UNEXPECTED, FreeLibrary, HMODULE, POINT, RECT, TRUE,
+};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateCompatibleDC, CreateDIBSection,
     DEFAULT_GUI_FONT, DIB_RGB_COLORS, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject,
     DrawTextW, GetDC, GetStockObject, HBITMAP, HGDIOBJ, ReleaseDC, SelectObject, SetBkMode,
     SetTextColor, TRANSPARENT,
+};
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::Win32::System::Registry::{
+    HKEY_CURRENT_USER, KEY_READ, REG_DWORD, REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW,
+    RegQueryValueExW,
 };
 use windows::Win32::UI::TextServices::{
     GUID_LBI_INPUTMODE, ITfLangBarItem, ITfLangBarItem_Impl, ITfLangBarItemButton,
@@ -27,7 +34,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ICONINFO, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, TPM_NONOTIFY,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
 };
-use windows_core::{BOOL, BSTR, GUID, Interface, PCWSTR, Ref, implement, w};
+use windows_core::{BOOL, BSTR, GUID, Interface, PCSTR, PCWSTR, Ref, implement, w};
 
 // ---------------------------------------------------------------------------
 // 菜单命令 ID
@@ -40,6 +47,113 @@ const MENU_ID_LIGHT: u32 = 4;
 const MENU_ID_DARK: u32 = 5;
 const MENU_ID_SYSTEM: u32 = 6;
 const MENU_ID_EXIT: u32 = 7;
+
+// ---------------------------------------------------------------------------
+// 菜单暗色主题支持
+// ---------------------------------------------------------------------------
+
+const PREFERRED_APP_MODE_FORCE_DARK: i32 = 2;
+const PREFERRED_APP_MODE_FORCE_LIGHT: i32 = 3;
+
+type SetPreferredAppModeFn = unsafe extern "system" fn(i32) -> i32;
+type FlushMenuThemesFn = unsafe extern "system" fn();
+
+/// 通过 `uxtheme.dll` 的未公开导出函数设置进程级菜单主题偏好，
+/// 并在 Drop 时恢复到之前的状态。
+struct PreferredAppModeGuard {
+    _module: HMODULE,
+    set: SetPreferredAppModeFn,
+    flush: FlushMenuThemesFn,
+    previous: i32,
+}
+
+impl PreferredAppModeGuard {
+    /// 尝试将当前进程的应用主题模式设置为 `mode`。
+    fn set(mode: i32) -> Option<Self> {
+        unsafe {
+            let module = LoadLibraryW(w!("uxtheme.dll")).ok()?;
+            let set = GetProcAddress(module, PCSTR(135 as *const u8))?;
+            let flush = GetProcAddress(module, PCSTR(136 as *const u8))?;
+            let set: SetPreferredAppModeFn = std::mem::transmute(set);
+            let flush: FlushMenuThemesFn = std::mem::transmute(flush);
+            let previous = set(mode);
+            flush();
+            tracing::debug!("SetPreferredAppMode mode={} previous={}", mode, previous);
+            Some(Self {
+                _module: module,
+                set,
+                flush,
+                previous,
+            })
+        }
+    }
+}
+
+impl Drop for PreferredAppModeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = (self.set)(self.previous);
+            (self.flush)();
+            let _ = FreeLibrary(self._module);
+            tracing::debug!("Restored PreferredAppMode to {}", self.previous);
+        }
+    }
+}
+
+fn preferred_app_mode_for_theme(theme: Theme) -> i32 {
+    match theme {
+        Theme::Light => PREFERRED_APP_MODE_FORCE_LIGHT,
+        Theme::Dark => PREFERRED_APP_MODE_FORCE_DARK,
+        Theme::System => {
+            if system_uses_dark_mode() {
+                PREFERRED_APP_MODE_FORCE_DARK
+            } else {
+                PREFERRED_APP_MODE_FORCE_LIGHT
+            }
+        }
+    }
+}
+
+/// 读取注册表判断系统是否处于暗色模式。
+fn system_uses_dark_mode() -> bool {
+    unsafe {
+        let path: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let value: Vec<u16> = "AppsUseLightTheme".encode_utf16().chain(Some(0)).collect();
+        let mut hkey = std::mem::zeroed();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(path.as_ptr()),
+            Some(0),
+            KEY_READ,
+            &mut hkey,
+        )
+        .is_err()
+        {
+            return false;
+        }
+
+        let mut data: u32 = 0;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let mut ty = REG_VALUE_TYPE(0);
+        let is_dark = RegQueryValueExW(
+            hkey,
+            PCWSTR(value.as_ptr()),
+            None,
+            Some(&mut ty),
+            Some(&mut data as *mut _ as *mut u8),
+            Some(&mut size),
+        )
+        .is_ok()
+            && ty == REG_DWORD
+            && data == 0;
+
+        let _ = RegCloseKey(hkey);
+        is_dark
+    }
+}
 
 // ---------------------------------------------------------------------------
 // COM 对象：BlackholeLangBarItem
@@ -196,6 +310,14 @@ impl BlackholeLangBarItem {
             let _ = AppendMenuW(root, MF_STRING, MENU_ID_EXIT as usize, w!("退出"));
 
             let hwnd = GetForegroundWindow();
+
+            // 设置进程级菜单主题偏好，菜单关闭后自动恢复。
+            let mode = preferred_app_mode_for_theme(theme);
+            let theme_guard = PreferredAppModeGuard::set(mode);
+            if theme_guard.is_none() {
+                tracing::warn!("Failed to set preferred app mode for menu theme {}", mode);
+            }
+
             let cmd = TrackPopupMenu(
                 root,
                 TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,

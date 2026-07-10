@@ -11,6 +11,13 @@ pub use settings_manager::SettingsManager;
 pub mod settings_panel;
 pub use settings_panel::run_settings_panel;
 
+pub fn theme_visuals(theme: Theme) -> egui::Visuals {
+    match theme {
+        Theme::Dark | Theme::System => egui::Visuals::dark(),
+        _ => egui::Visuals::light(),
+    }
+}
+
 /// 配置 egui 中文字体（加载系统字体作为 fallback）
 pub fn configure_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
@@ -141,13 +148,6 @@ mod candidate_window_cross {
         }
     }
 
-    fn theme_visuals(theme: Theme) -> egui::Visuals {
-        match theme {
-            Theme::Dark | Theme::System => egui::Visuals::dark(),
-            _ => egui::Visuals::light(),
-        }
-    }
-
     pub struct ImeUiApp {
         state: Arc<Mutex<AppState>>,
         win_style_applied: bool,
@@ -236,7 +236,7 @@ mod candidate_window_cross {
                     highlight_color,
                     label_color,
                 } = theme_colors(state.theme);
-                ctx.set_visuals(theme_visuals(state.theme));
+                ctx.set_visuals(crate::theme_visuals(state.theme));
 
                 egui::Frame::new()
                     .fill(bg_color)

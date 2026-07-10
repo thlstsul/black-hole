@@ -1,6 +1,7 @@
 use blackhole_shared::{SchemeId, Theme};
 
 use crate::settings_manager::SettingsManager;
+use crate::theme_visuals;
 
 #[derive(Debug, Clone)]
 pub enum SettingsEvent {
@@ -11,13 +12,16 @@ pub enum SettingsEvent {
 pub struct SettingsPanelApp {
     settings_mgr: SettingsManager,
     dirty: bool,
+    last_theme: Theme,
 }
 
 impl SettingsPanelApp {
     pub fn new(settings_mgr: SettingsManager) -> Self {
+        let last_theme = settings_mgr.settings().theme;
         Self {
             settings_mgr,
             dirty: false,
+            last_theme,
         }
     }
 
@@ -33,6 +37,12 @@ impl SettingsPanelApp {
 impl eframe::App for SettingsPanelApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        let current_theme = self.settings_mgr.settings().theme;
+        if current_theme != self.last_theme {
+            ctx.set_visuals(theme_visuals(current_theme));
+            self.last_theme = current_theme;
+        }
 
         ui.heading("Blackhole Settings");
         ui.add_space(16.0);
@@ -146,6 +156,8 @@ pub fn run_settings_panel(settings_mgr: SettingsManager) {
         options,
         Box::new(|cc| {
             crate::configure_fonts(&cc.egui_ctx);
+            cc.egui_ctx
+                .set_visuals(theme_visuals(settings_mgr.settings().theme));
             Ok(Box::new(SettingsPanelApp::new(settings_mgr)))
         }),
     );
