@@ -86,6 +86,13 @@ impl PinyinScheme {
         if code.is_empty() || text == code {
             return;
         }
+        // 仅当 text 与当前编码精确匹配时才记录用户词频。
+        // 否则用户从前缀匹配结果中选择一个不完全匹配当前编码的词（如输入 shu 选择 shuo 的“说”）
+        // 会被错误地学习为 code -> text 映射，导致下次输入同一编码时首选错误的词。
+        let exact_match = self.dictionary.lookup(&code).iter().any(|c| c.text == text);
+        if !exact_match {
+            return;
+        }
         if let Some(ref ud) = self.user_dict_ref() {
             let _ = ud
                 .lock()

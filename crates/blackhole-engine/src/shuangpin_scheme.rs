@@ -73,6 +73,13 @@ impl ShuangpinScheme {
         if code.is_empty() || text == code {
             return;
         }
+        // 仅当 text 与当前编码精确匹配时才记录用户词频。
+        // 否则用户从前缀匹配结果中选择一个不完全匹配当前编码的词（如输入 shu 选择 shuo 的“说”）
+        // 会被错误地学习为 code -> text 映射，导致下次输入同一编码时首选错误的词。
+        let exact_match = self.dictionary.lookup(&code).iter().any(|c| c.text == text);
+        if !exact_match {
+            return;
+        }
         if let Some(ref ud) = self.user_dict_ref() {
             let _ = ud
                 .lock()
@@ -709,6 +716,45 @@ mod tests {
             pinyin_first, shuangpin_first,
             "拼音和双拼使用同一外部词典时，'le' 的首个候选应一致: pinyin={:?}, shuangpin={:?}",
             pinyin_first, shuangpin_first
+        );
+    }
+
+    #[test]
+    fn test_shuangpin_user_dict_no_partial_learn() {
+        // 模拟词典：shu -> 书（高频），shuo -> 说（低频）
+        let mut dict = SqliteDictionary::in_memory();
+        dict.insert("shu", "书", 200);
+        dict.insert("shuo", "说", 100);
+
+        let user_dict = Arc::new(Mutex::new(UserDictionary::open_in_memory().unwrap()));
+        let mut scheme = ShuangpinScheme::with_dictionary(Box::new(dict))
+            .with_user_dict(user_dict.clone());
+        let ctx = InputContext {
+            caret_x: 0,
+            caret_y: 0,
+            caret_h: 20,
+        };
+
+        // 第一次输入 uu -> shu
+        for ch in ["u", "u"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+
+        // 模拟用户从前缀匹配中选择了“说”（其真实编码是 shuo，不是 shu）
+        scheme.record_user_commit("说");
+        scheme.codec.reset();
+
+        // 再次输入 uu
+        for ch in ["u", "u"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+
+        let candidates = scheme.current_candidates();
+        let first = candidates.first().map(|c| c.text.as_str()).unwrap_or("");
+        assert_eq!(
+            first, "书",
+            "不精确匹配的用户选择不应污染当前编码的首选；实际首选为 '{}'，候选: {:?}",
+            first, candidates
         );
     }
 }
