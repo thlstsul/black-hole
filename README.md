@@ -1,4 +1,4 @@
-# Blackhole IME
+# 黑洞输入法
 
 跨平台中文输入法，基于 Rust 构建，支持 Windows（TSF）和 Linux（IBus）。
 
@@ -146,4 +146,4 @@ sudo dpkg -r blackhole-ime
 
 ## 许可
 
-MIT License
+Apache License

@@ -17,7 +17,7 @@ pub mod user_dict;
 
 pub use builder::EngineBuilder;
 pub use dictionary::{RimeDictError, SqliteDictionary};
-pub use graph_decoder::{DecodeResult, GraphDecoder};
+pub use graph_decoder::{DecodeResult, GraphDecoder, ScoringConfig, ScoringConfigBuilder};
 pub use language_model::LanguageModel;
 pub use pinyin::PinyinCodec;
 pub use pinyin_preprocessor::PinyinPreprocessor;

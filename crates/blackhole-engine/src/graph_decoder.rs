@@ -43,6 +43,92 @@ impl ViterbiState {
     }
 }
 
+/// 评分配置参数
+#[derive(Debug, Clone)]
+pub struct ScoringConfig {
+    /// 多字词偏好系数（每个音节）
+    pub word_preference_factor: f64,
+    /// 完整覆盖整句的多字词奖励
+    pub coverage_bonus: f64,
+    /// 混合拼接回退惩罚
+    pub hybrid_penalty: f64,
+    /// 未覆盖音节惩罚系数（每个音节）
+    pub uncovered_penalty_factor: f64,
+    /// 最终保底回退惩罚
+    pub final_fallback_penalty: f64,
+    /// 长词奖励系数（每个音节，仅在无语言模型时使用）
+    pub long_word_bonus: f64,
+    /// 用户词频奖励系数
+    pub user_freq_factor: f64,
+}
+
+impl Default for ScoringConfig {
+    fn default() -> Self {
+        Self {
+            word_preference_factor: 15.0,
+            coverage_bonus: 80.0,
+            hybrid_penalty: 3.0,
+            uncovered_penalty_factor: 0.5,
+            final_fallback_penalty: 5.0,
+            long_word_bonus: 1.0,
+            user_freq_factor: 3.0,
+        }
+    }
+}
+
+/// 评分配置构建器
+#[derive(Debug, Default)]
+pub struct ScoringConfigBuilder {
+    config: ScoringConfig,
+}
+
+impl ScoringConfigBuilder {
+    pub fn word_preference_factor(mut self, v: f64) -> Self {
+        self.config.word_preference_factor = v;
+        self
+    }
+
+    pub fn coverage_bonus(mut self, v: f64) -> Self {
+        self.config.coverage_bonus = v;
+        self
+    }
+
+    pub fn hybrid_penalty(mut self, v: f64) -> Self {
+        self.config.hybrid_penalty = v;
+        self
+    }
+
+    pub fn uncovered_penalty_factor(mut self, v: f64) -> Self {
+        self.config.uncovered_penalty_factor = v;
+        self
+    }
+
+    pub fn final_fallback_penalty(mut self, v: f64) -> Self {
+        self.config.final_fallback_penalty = v;
+        self
+    }
+
+    pub fn long_word_bonus(mut self, v: f64) -> Self {
+        self.config.long_word_bonus = v;
+        self
+    }
+
+    pub fn user_freq_factor(mut self, v: f64) -> Self {
+        self.config.user_freq_factor = v;
+        self
+    }
+
+    pub fn build(self) -> ScoringConfig {
+        self.config
+    }
+}
+
+impl ScoringConfig {
+    pub fn builder() -> ScoringConfigBuilder {
+        ScoringConfigBuilder::default()
+    }
+}
+
 /// 词图构建器与维特比解码器
 pub struct GraphDecoder<'a> {
     dict: &'a dyn Dictionary,
@@ -50,7 +136,7 @@ pub struct GraphDecoder<'a> {
     user_freqs: Option<&'a HashMap<String, i64>>,
     beam_width: usize,
     max_word_syllables: usize,
-    long_word_bonus: f64,
+    config: ScoringConfig,
 }
 
 impl<'a> GraphDecoder<'a> {
@@ -61,7 +147,7 @@ impl<'a> GraphDecoder<'a> {
             user_freqs: None,
             beam_width: 10,
             max_word_syllables: 4,
-            long_word_bonus: 1.0,
+            config: ScoringConfig::default(),
         }
     }
 
@@ -80,6 +166,11 @@ impl<'a> GraphDecoder<'a> {
         self
     }
 
+    pub fn with_scoring_config(mut self, config: ScoringConfig) -> Self {
+        self.config = config;
+        self
+    }
+
     /// 对音节图执行维特比解码，返回候选整句列表
     pub fn decode(&self, graph: &SyllableGraph) -> Vec<DecodeResult> {
         let word_edges = self.build_word_edges(graph);
@@ -91,7 +182,19 @@ impl<'a> GraphDecoder<'a> {
             word_edges.iter().map(|v| v.len()).sum::<usize>()
         );
 
-        // dp[i] = 到达音节位置 i 的 top-k 最优前缀路径
+        let dp = self.run_viterbi_decode(&word_edges, n);
+
+        let mut results = self.collect_full_coverage_results(&dp, n);
+        if results.is_empty() {
+            results = self.fallback_hybrid_assembly(&dp, graph, n);
+        }
+
+        self.sort_and_dedup_results(&mut results);
+        results
+    }
+
+    /// 执行维特比 DP 解码，返回每个音节位置的最优路径集合。
+    fn run_viterbi_decode(&self, word_edges: &[Vec<WordEdge>], n: usize) -> Vec<Vec<ViterbiState>> {
         let mut dp: Vec<Vec<ViterbiState>> = vec![Vec::new(); n + 1];
         dp[0].push(ViterbiState {
             score: 0.0,
@@ -100,7 +203,6 @@ impl<'a> GraphDecoder<'a> {
         });
 
         for i in 0..=n {
-            // 剪枝：每个位置只保留 beam_width 条最优路径
             if dp[i].len() > self.beam_width {
                 dp[i].sort_by(|a, b| b.score.total_cmp(&a.score));
                 dp[i].truncate(self.beam_width);
@@ -113,55 +215,75 @@ impl<'a> GraphDecoder<'a> {
             let states = dp[i].clone();
             for edge in &word_edges[i] {
                 for state in &states {
-                    let last_word = state.words.last().unwrap();
-                    let lm_score = if let Some(lm) = self.lm {
-                        lm.score_transition(last_word, &edge.text, edge.syllable_count)
-                    } else {
-                        edge.syllable_count as f64 * self.long_word_bonus
-                    };
-                    let user_bonus = self.user_bonus(&edge.text);
-
-                    // 对 base_score 做 log 变换，避免高频单字压倒多字词
-                    let base_score = (edge.base_score + 1.0).ln();
-                    // 对多字词给予持续的词偏好奖励（即使只是前缀的一部分），
-                    // 防止长词作为中间前缀时 score 骤降，被单字拼接超越。
-                    // 系数 15 经过实测校准：确保高频单字拼接的 ln 之和不会超过长词。
-                    let word_preference = if edge.syllable_count >= 2 {
-                        edge.syllable_count as f64 * 15.0
-                    } else {
-                        0.0
-                    };
-                    // 完整覆盖整句的多字词给予额外 bonus
-                    let coverage_bonus = if i == 0 && edge.end_pos == n && edge.syllable_count >= 2
-                    {
-                        80.0
-                    } else {
-                        0.0
-                    };
-                    let new_score = state.score
-                        + lm_score
-                        + base_score
-                        + word_preference
-                        + coverage_bonus
-                        + user_bonus;
-                    let mut new_text = String::with_capacity(state.text.len() + edge.text.len());
-                    new_text.push_str(&state.text);
-                    new_text.push_str(&edge.text);
-
-                    let mut new_words = Vec::with_capacity(state.words.len() + 1);
-                    new_words.clone_from(&state.words);
-                    new_words.push(edge.text.clone());
-
-                    dp[edge.end_pos].push(ViterbiState {
-                        score: new_score,
-                        text: new_text,
-                        words: new_words,
-                    });
+                    let new_score = self.calculate_edge_score(state, edge, i, n);
+                    self.extend_state(&mut dp[edge.end_pos], state, edge, new_score);
                 }
             }
         }
 
-        // 收集完整覆盖到 n 的结果
+        dp
+    }
+
+    /// 计算从当前状态经 word_edge 转移后的新分数。
+    fn calculate_edge_score(
+        &self,
+        state: &ViterbiState,
+        edge: &WordEdge,
+        start_pos: usize,
+        total_len: usize,
+    ) -> f64 {
+        let last_word = state.words.last().unwrap();
+        let lm_score = if let Some(lm) = self.lm {
+            lm.score_transition(last_word, &edge.text, edge.syllable_count)
+        } else {
+            edge.syllable_count as f64 * self.config.long_word_bonus
+        };
+        let user_bonus = self.user_bonus(&edge.text);
+        let base_score = (edge.base_score + 1.0).ln();
+        let word_preference = if edge.syllable_count >= 2 {
+            edge.syllable_count as f64 * self.config.word_preference_factor
+        } else {
+            0.0
+        };
+        let coverage_bonus =
+            if start_pos == 0 && edge.end_pos == total_len && edge.syllable_count >= 2 {
+                self.config.coverage_bonus
+            } else {
+                0.0
+            };
+
+        state.score + lm_score + base_score + word_preference + coverage_bonus + user_bonus
+    }
+
+    /// 将新状态加入 DP 表对应位置。
+    fn extend_state(
+        &self,
+        dp_entry: &mut Vec<ViterbiState>,
+        state: &ViterbiState,
+        edge: &WordEdge,
+        new_score: f64,
+    ) {
+        let mut new_text = String::with_capacity(state.text.len() + edge.text.len());
+        new_text.push_str(&state.text);
+        new_text.push_str(&edge.text);
+
+        let mut new_words = Vec::with_capacity(state.words.len() + 1);
+        new_words.clone_from(&state.words);
+        new_words.push(edge.text.clone());
+
+        dp_entry.push(ViterbiState {
+            score: new_score,
+            text: new_text,
+            words: new_words,
+        });
+    }
+
+    /// 收集完整覆盖到音节末尾的结果。
+    fn collect_full_coverage_results(
+        &self,
+        dp: &[Vec<ViterbiState>],
+        n: usize,
+    ) -> Vec<DecodeResult> {
         let mut results = Vec::new();
         if let Some(final_states) = dp.get(n) {
             for state in final_states {
@@ -173,62 +295,76 @@ impl<'a> GraphDecoder<'a> {
             results.len(),
             results.iter().map(|r| &r.text).collect::<Vec<_>>()
         );
+        results
+    }
 
-        // 如果无完整覆盖，回退到混合拼接：最长前缀 + 单字后缀
-        if results.is_empty() {
-            tracing::debug!("decode: no full coverage, falling back to hybrid");
-            let mut hybrid_results = Vec::new();
-            for end in (1..=n).rev() {
-                let Some(states) = dp.get(end) else { continue };
-                if states.is_empty() {
-                    continue;
-                }
+    /// 无完整覆盖时，回退到混合拼接：最长前缀 + 单字后缀。
+    fn fallback_hybrid_assembly(
+        &self,
+        dp: &[Vec<ViterbiState>],
+        graph: &SyllableGraph,
+        n: usize,
+    ) -> Vec<DecodeResult> {
+        tracing::debug!("decode: no full coverage, falling back to hybrid");
 
-                let fallback_suffixes = self.fallback_for_range(graph, end, n);
-                if fallback_suffixes.is_empty() {
-                    continue;
-                }
-
-                // 剩余未覆盖音节越多，惩罚越大（鼓励使用更长的已匹配前缀）
-                let uncovered_penalty = (n - end) as f64 * 0.5;
-
-                for state in states.iter().take(self.beam_width) {
-                    for (suffix_text, suffix_score) in &fallback_suffixes {
-                        let text = state.text.clone() + suffix_text;
-                        let score = state.score + suffix_score - 3.0 - uncovered_penalty;
-                        hybrid_results.push(DecodeResult {
-                            text,
-                            score,
-                            words: Vec::new(),
-                            is_partial: true,
-                        });
-                    }
-                }
-                break; // 只取 end 最大的可达位置，避免短前缀单字组合干扰
+        for end in (1..=n).rev() {
+            let Some(states) = dp.get(end) else { continue };
+            if states.is_empty() {
+                continue;
             }
 
-            tracing::debug!(
-                "decode hybrid results: count={}, texts={:?}",
-                hybrid_results.len(),
-                hybrid_results.iter().map(|r| &r.text).collect::<Vec<_>>()
-            );
+            let fallback_suffixes = self.fallback_for_range(graph, end, n);
+            if fallback_suffixes.is_empty() {
+                continue;
+            }
+
+            let uncovered_penalty = (n - end) as f64 * self.config.uncovered_penalty_factor;
+            let mut hybrid_results = Vec::new();
+
+            for state in states.iter().take(self.beam_width) {
+                for (suffix_text, suffix_score) in &fallback_suffixes {
+                    let text = state.text.clone() + suffix_text;
+                    let score =
+                        state.score + suffix_score - self.config.hybrid_penalty - uncovered_penalty;
+                    hybrid_results.push(DecodeResult {
+                        text,
+                        score,
+                        words: Vec::new(),
+                        is_partial: true,
+                    });
+                }
+            }
 
             if !hybrid_results.is_empty() {
-                results = hybrid_results;
-            } else {
-                // 最终保底：回退到最长前缀
-                for end in (1..=n).rev() {
-                    if let Some(states) = dp.get(end)
-                        && let Some(best) = states.first()
-                    {
-                        results.push(best.clone().into_decode_result(5.0, true));
-                        break;
-                    }
-                }
+                tracing::debug!(
+                    "decode hybrid results: count={}, texts={:?}",
+                    hybrid_results.len(),
+                    hybrid_results.iter().map(|r| &r.text).collect::<Vec<_>>()
+                );
+                return hybrid_results;
             }
         }
 
-        // 去重并按分数降序排列
+        self.fallback_to_longest_prefix(dp, n)
+    }
+
+    /// 最终保底：返回可达的最长前缀作为部分结果。
+    fn fallback_to_longest_prefix(&self, dp: &[Vec<ViterbiState>], n: usize) -> Vec<DecodeResult> {
+        for end in (1..=n).rev() {
+            if let Some(states) = dp.get(end)
+                && let Some(best) = states.first()
+            {
+                return vec![
+                    best.clone()
+                        .into_decode_result(self.config.final_fallback_penalty, true),
+                ];
+            }
+        }
+        Vec::new()
+    }
+
+    /// 对结果按分数降序排列并去重。
+    fn sort_and_dedup_results(&self, results: &mut Vec<DecodeResult>) {
         results.sort_by(|a, b| b.score.total_cmp(&a.score));
         results.dedup_by(|a, b| a.text == b.text);
 
@@ -241,8 +377,6 @@ impl<'a> GraphDecoder<'a> {
                 .map(|r| (&r.text, r.score, r.is_partial))
                 .collect::<Vec<_>>()
         );
-
-        results
     }
 
     // ------------------------------------------------------------------
@@ -299,7 +433,7 @@ impl<'a> GraphDecoder<'a> {
     fn user_bonus(&self, text: &str) -> f64 {
         self.user_freqs
             .and_then(|m| m.get(text))
-            .map(|&freq| (freq as f64 + 1.0).ln() * 3.0)
+            .map(|&freq| (freq as f64 + 1.0).ln() * self.config.user_freq_factor)
             .unwrap_or(0.0)
     }
 

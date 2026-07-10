@@ -32,6 +32,7 @@ windows = { workspace = true, features = [
     "Win32_UI_Shell",
     "Win32_UI_TextServices",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
 ] }
 windows-core = "0.62"
 
