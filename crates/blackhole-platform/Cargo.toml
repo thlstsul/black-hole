@@ -36,5 +36,5 @@ windows = { workspace = true, features = [
 windows-core = "0.62"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-pollster = "0.4"
+pollster = "1.0"
 zbus = "5.5"
