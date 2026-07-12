@@ -41,6 +41,7 @@ depends = ["ibus"]
 [package.metadata.packager.appimage]
 
 [dependencies]
+clap = { workspace = true }
 blackhole-engine = { workspace = true }
 blackhole-platform = { workspace = true }
 blackhole-shared = { workspace = true }

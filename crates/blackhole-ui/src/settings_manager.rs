@@ -27,13 +27,28 @@ impl SettingsManager {
         &mut self.settings
     }
 
-    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(parent) = self.config_path.parent() {
-            fs::create_dir_all(parent)?;
+    /// 保存当前设置到磁盘，失败时记录错误
+    pub fn save(&mut self) -> bool {
+        let path = &self.config_path;
+        if let Some(parent) = path.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                tracing::error!("Failed to create config directory {:?}: {}", parent, e);
+                return false;
+            }
         }
-        let json = serde_json::to_string_pretty(&self.settings)?;
-        fs::write(&self.config_path, json)?;
-        Ok(())
+        let json = match serde_json::to_string_pretty(&self.settings) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::error!("Failed to serialize settings: {}", e);
+                return false;
+            }
+        };
+        if let Err(e) = fs::write(path, json) {
+            tracing::error!("Failed to write settings to {:?}: {}", path, e);
+            return false;
+        }
+        tracing::info!("Settings saved to {:?}", path);
+        true
     }
 
     pub fn reset_to_default(&mut self) {
@@ -41,10 +56,30 @@ impl SettingsManager {
     }
 
     fn load_from_disk(path: &PathBuf) -> Settings {
-        if let Ok(content) = fs::read_to_string(path)
-            && let Ok(settings) = serde_json::from_str::<Settings>(&content)
-        {
-            return settings;
+        match fs::read_to_string(path) {
+            Ok(content) => match serde_json::from_str::<Settings>(&content) {
+                Ok(settings) => {
+                    tracing::info!("Loaded settings from {:?}", path);
+                    return settings;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse settings file {:?}: {}, using defaults",
+                        path,
+                        e
+                    );
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::info!("No settings file found at {:?}, using defaults", path);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read settings file {:?}: {}, using defaults",
+                    path,
+                    e
+                );
+            }
         }
         Settings::default()
     }
@@ -52,7 +87,7 @@ impl SettingsManager {
     fn config_dir() -> PathBuf {
         directories::ProjectDirs::from("com", "blackhole", "ime")
             .map(|dirs| dirs.config_dir().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."))
+            .expect("Unable to determine config directory")
     }
 }
 

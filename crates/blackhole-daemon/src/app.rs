@@ -1,8 +1,9 @@
-use crate::args::parse_args;
+use crate::args::DaemonArgs;
 use blackhole_engine::{Engine, EngineBuilder};
 use blackhole_platform::PlatformIme;
 use blackhole_shared::{EngineCommand, InputContext, SchemeId, SchemeResult, Theme, UiCommand};
 use blackhole_ui::SettingsManager;
+use clap::Parser;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use tracing_subscriber::layer::SubscriberExt;
@@ -22,7 +23,7 @@ impl App {
         let _tracing_guard = Self::init_tracing();
         tracing::info!("Blackhole IME daemon starting...");
 
-        let args = parse_args();
+        let args = DaemonArgs::parse();
 
         #[cfg(target_os = "windows")]
         Self::ensure_ime_registered();
@@ -32,9 +33,15 @@ impl App {
             Self::ensure_ime_registered();
         }
         let settings_mgr = SettingsManager::new();
-        let default_scheme = args
-            .scheme
-            .unwrap_or_else(|| settings_mgr.settings().default_scheme);
+        let settings_scheme = settings_mgr.settings().default_scheme;
+        let default_scheme = args.scheme.unwrap_or(settings_scheme);
+
+        tracing::info!(
+            "resolved scheme: CLI={:?}, settings={:?}, effective={:?}",
+            args.scheme,
+            settings_scheme,
+            default_scheme,
+        );
 
         let dict_path = args.dict_path.or_else(|| {
             std::env::current_exe()
@@ -263,14 +270,16 @@ impl App {
             UiCommand::SwitchScheme(scheme_id) => {
                 tracing::info!("UI dispatch: switch to {:?}", scheme_id);
                 let _ = engine_tx.send(EngineCommand::SwitchScheme(scheme_id));
+                // 持久化到设置，使重启后保持本次选择
+                let mut settings_mgr = SettingsManager::new();
+                settings_mgr.settings_mut().default_scheme = scheme_id;
+                settings_mgr.save();
             }
             UiCommand::SetTheme(theme) => {
                 tracing::info!("UI dispatch: set theme to {:?}", theme);
                 let mut settings_mgr = SettingsManager::new();
                 settings_mgr.settings_mut().theme = theme;
-                if let Err(e) = settings_mgr.save() {
-                    tracing::warn!("Failed to save settings: {}", e);
-                }
+                settings_mgr.save();
                 let _ = ui_render_tx.send(UiCommand::SetTheme(theme));
             }
             UiCommand::Exit => {

@@ -3,16 +3,11 @@ use blackhole_shared::{SchemeId, Theme};
 use crate::settings_manager::SettingsManager;
 use crate::theme_visuals;
 
-#[derive(Debug, Clone)]
-pub enum SettingsEvent {
-    UpdateSettings(blackhole_shared::Settings),
-    Close,
-}
-
 pub struct SettingsPanelApp {
     settings_mgr: SettingsManager,
-    dirty: bool,
     last_theme: Theme,
+    feedback: Option<String>,
+    feedback_timer: f64,
 }
 
 impl SettingsPanelApp {
@@ -20,8 +15,9 @@ impl SettingsPanelApp {
         let last_theme = settings_mgr.settings().theme;
         Self {
             settings_mgr,
-            dirty: false,
             last_theme,
+            feedback: None,
+            feedback_timer: 0.0,
         }
     }
 
@@ -29,8 +25,10 @@ impl SettingsPanelApp {
         self.settings_mgr.settings()
     }
 
-    pub fn save_settings(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.settings_mgr.save()
+    fn show_feedback(&mut self, msg: impl Into<String>, ok: bool) {
+        let icon = if ok { "✓" } else { "✗" };
+        self.feedback = Some(format!("{} {}", icon, msg.into()));
+        self.feedback_timer = 3.0; // 显示 3 秒
     }
 }
 
@@ -126,17 +124,37 @@ impl eframe::App for SettingsPanelApp {
 
         ui.horizontal(|ui| {
             if ui.button("Save").clicked() {
-                let _ = self.save_settings();
-                self.dirty = false;
+                if self.settings_mgr.save() {
+                    self.show_feedback("Settings saved", true);
+                } else {
+                    self.show_feedback("Failed to save settings (see log)", false);
+                }
             }
             if ui.button("Reset to Default").clicked() {
                 self.settings_mgr.reset_to_default();
-                self.dirty = true;
+                self.show_feedback("Reset to defaults (click Save to persist)", true);
             }
         });
 
+        // 显示反馈信息（3 秒自动消失）
+        if let Some(msg) = &self.feedback {
+            ui.add_space(8.0);
+            ui.label(msg);
+            // egui 的 RequestRepaint 确保动画持续刷新
+            ctx.request_repaint();
+        }
+        self.feedback_timer -= ui.input(|i| i.unstable_dt) as f64;
+        if self.feedback_timer <= 0.0 {
+            self.feedback = None;
+        }
+
+        // 关闭窗口时自动保存
         if ctx.input(|i| i.viewport().close_requested()) {
-            let _ = self.settings_mgr.save();
+            if self.settings_mgr.save() {
+                tracing::info!("Settings saved on window close");
+            } else {
+                tracing::error!("Failed to save settings on window close");
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
