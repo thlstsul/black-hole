@@ -186,16 +186,25 @@ pub(crate) fn send_ui_command_inner(inner_arc: &Arc<Mutex<ServiceInner>>, cmd: U
 use super::{PlatformError, PlatformIme};
 
 pub struct WindowsTsfIme {
-    default_scheme: SchemeId,
-    default_theme: Theme,
+    /// 运行时方案/主题状态，daemon 每次切换方案/主题时同步更新
+    current: Arc<Mutex<(SchemeId, Theme)>>,
 }
 
 impl WindowsTsfIme {
-    pub fn new(default_scheme: SchemeId, default_theme: Theme) -> Self {
+    /// 使用共享状态创建。`current` 会被 daemon 在每次方案/主题切换时自动更新。
+    pub fn new(current: Arc<Mutex<(SchemeId, Theme)>>) -> Self {
+        Self { current }
+    }
+
+    /// 创建时指定初始值（内部创建共享状态）。
+    pub fn new_with_values(default_scheme: SchemeId, default_theme: Theme) -> Self {
         Self {
-            default_scheme,
-            default_theme,
+            current: Arc::new(Mutex::new((default_scheme, default_theme))),
         }
+    }
+
+    pub fn current(&self) -> &Arc<Mutex<(SchemeId, Theme)>> {
+        &self.current
     }
 }
 
@@ -226,17 +235,11 @@ impl PlatformIme for WindowsTsfIme {
                     let engine_tx = engine_tx.clone();
                     let platform_rx = Arc::clone(&platform_rx);
                     let ui_tx = ui_tx.clone();
-                    let default_scheme = self.default_scheme;
-                    let default_theme = self.default_theme;
+                    let current = Arc::clone(&self.current);
                     std::thread::spawn(move || {
-                        if let Err(e) = handle_ipc_client(
-                            stream,
-                            engine_tx,
-                            platform_rx,
-                            ui_tx,
-                            default_scheme,
-                            default_theme,
-                        ) {
+                        if let Err(e) =
+                            handle_ipc_client(stream, engine_tx, platform_rx, ui_tx, current)
+                        {
                             tracing::error!("IPC client error: {}", e);
                         }
                     });
@@ -256,8 +259,7 @@ fn handle_ipc_client(
     engine_tx: Sender<EngineCommand>,
     platform_rx: Arc<Mutex<Receiver<SchemeResult>>>,
     ui_tx: Sender<UiCommand>,
-    default_scheme: SchemeId,
-    default_theme: Theme,
+    current: Arc<Mutex<(SchemeId, Theme)>>,
 ) -> std::io::Result<()> {
     use std::io::{BufRead, Write};
 
@@ -311,10 +313,8 @@ fn handle_ipc_client(
                 let _ = ui_tx.send(ui_cmd);
             }
             super::ipc::IpcRequest::GetSettings => {
-                let response = super::ipc::IpcResponse::Settings {
-                    scheme_id: default_scheme,
-                    theme: default_theme,
-                };
+                let (scheme_id, theme) = *current.lock().unwrap();
+                let response = super::ipc::IpcResponse::Settings { scheme_id, theme };
                 let json = serde_json::to_string(&response)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
                 writeln!(writer, "{}", json)?;

@@ -67,6 +67,10 @@ impl App {
 
         let default_theme = settings_mgr.settings().theme;
 
+        // 运行时方案/主题状态，平台线程通过 IPC GetSettings 读取，dispatch 时同步更新
+        let current_settings: Arc<Mutex<(SchemeId, Theme)>> =
+            Arc::new(Mutex::new((default_scheme, default_theme)));
+
         // UI 渲染线程（只处理候选窗相关命令）
         let (ui_render_tx, ui_render_rx) = mpsc::channel::<UiCommand>();
         let ui_handle = std::thread::spawn(move || {
@@ -80,20 +84,17 @@ impl App {
             Self::run_engine_thread(engine_clone, engine_rx, platform_tx, ui_tx_clone);
         });
 
-        // 为 UI 命令分发和平台线程预先 clone 通道
+        // 为 UI 命令分发和平台线程预先 clone 通道 / 共享状态
         let engine_tx_for_ui_dispatch = engine_tx.clone();
         let ui_render_tx_for_shutdown = ui_render_tx.clone();
         let ui_tx_for_platform = ui_tx.clone();
+        let current_for_dispatch = Arc::clone(&current_settings);
 
         // 平台线程（后台运行，避免阻塞主线程）
         let _platform_handle = std::thread::spawn(move || {
-            if let Err(e) = run_platform(
-                engine_tx,
-                platform_rx,
-                ui_tx_for_platform,
-                default_scheme,
-                default_theme,
-            ) {
+            if let Err(e) =
+                run_platform(engine_tx, platform_rx, ui_tx_for_platform, current_settings)
+            {
                 tracing::error!("Platform IME error: {}", e);
             }
         });
@@ -101,7 +102,12 @@ impl App {
         // 主线程：分发 UI 命令并等待退出信号（Ctrl+C 或语言栏 Exit）
         while !SHOULD_EXIT.load(Ordering::Relaxed) {
             while let Ok(cmd) = ui_rx.try_recv() {
-                Self::dispatch_ui_command(cmd, &engine_tx_for_ui_dispatch, &ui_render_tx);
+                Self::dispatch_ui_command(
+                    cmd,
+                    &engine_tx_for_ui_dispatch,
+                    &ui_render_tx,
+                    &current_for_dispatch,
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
@@ -258,6 +264,7 @@ impl App {
         cmd: UiCommand,
         engine_tx: &mpsc::Sender<EngineCommand>,
         ui_render_tx: &mpsc::Sender<UiCommand>,
+        current_settings: &Arc<Mutex<(SchemeId, Theme)>>,
     ) {
         match cmd {
             UiCommand::ShowSettings => {
@@ -274,12 +281,22 @@ impl App {
                 let mut settings_mgr = SettingsManager::new();
                 settings_mgr.settings_mut().default_scheme = scheme_id;
                 settings_mgr.save();
+                // 同步共享状态，使平台线程（IPC GetSettings）返回最新值
+                {
+                    let mut cur = current_settings.lock().unwrap();
+                    cur.0 = scheme_id;
+                }
             }
             UiCommand::SetTheme(theme) => {
                 tracing::info!("UI dispatch: set theme to {:?}", theme);
                 let mut settings_mgr = SettingsManager::new();
                 settings_mgr.settings_mut().theme = theme;
                 settings_mgr.save();
+                // 同步共享状态
+                {
+                    let mut cur = current_settings.lock().unwrap();
+                    cur.1 = theme;
+                }
                 let _ = ui_render_tx.send(UiCommand::SetTheme(theme));
             }
             UiCommand::Exit => {
@@ -397,10 +414,9 @@ fn run_platform(
     engine_tx: mpsc::Sender<EngineCommand>,
     platform_rx: mpsc::Receiver<SchemeResult>,
     ui_tx: mpsc::Sender<UiCommand>,
-    default_scheme: SchemeId,
-    default_theme: Theme,
+    current_settings: Arc<Mutex<(SchemeId, Theme)>>,
 ) -> Result<(), blackhole_platform::PlatformError> {
-    let mut platform = blackhole_platform::WindowsTsfIme::new(default_scheme, default_theme);
+    let mut platform = blackhole_platform::WindowsTsfIme::new(current_settings);
     platform.run(engine_tx, platform_rx, ui_tx)?;
     Ok(())
 }
@@ -410,8 +426,7 @@ fn run_platform(
     engine_tx: mpsc::Sender<EngineCommand>,
     platform_rx: mpsc::Receiver<SchemeResult>,
     ui_tx: mpsc::Sender<UiCommand>,
-    _default_scheme: SchemeId,
-    _default_theme: Theme,
+    _current_settings: Arc<Mutex<(SchemeId, Theme)>>,
 ) -> Result<(), blackhole_platform::PlatformError> {
     let mut platform = blackhole_platform::LinuxIbusIme::new();
     platform.run(engine_tx, platform_rx, ui_tx)?;
