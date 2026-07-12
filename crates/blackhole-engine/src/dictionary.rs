@@ -2,7 +2,8 @@ use crate::Dictionary;
 use blackhole_shared::Candidate;
 use pinyin::ToPinyin;
 use rusqlite::{Connection, ToSql, params};
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// RIME 词库加载错误
@@ -48,11 +49,27 @@ impl RimeDictHeader {
 }
 
 /// 基于 SQLite 的词典实现，显著降低内存占用
+///
+/// 运行时缓存说明：
+/// - 小容量最近使用缓存，避免一次会话内重复查询同个编码。
+/// - 缓存上限很小，内存开销可忽略。
+/// - 主词典运行期间只读，缓存不会过期失效。
+/// - 冷启动依靠 SQLite 自身页面缓存 + mmap 加速。
+const LOOKUP_CACHE_LIMIT: usize = 50;
+const PREFIX_CACHE_LIMIT: usize = 30;
+const SYLLABLE_CACHE_LIMIT: usize = 30;
+
 pub struct SqliteDictionary {
     conn: Connection,
     db_path: PathBuf,
     /// 为 true 时不删除底层数据库文件（用于缓存数据库）
     is_persistent: bool,
+    /// 精确查询缓存 (code -> candidates)，极小容量，仅兜住一次会话内重复前缀
+    lookup_cache: RefCell<HashMap<String, Vec<Candidate>>>,
+    /// 前缀查询缓存
+    prefix_cache: RefCell<HashMap<String, Vec<Candidate>>>,
+    /// 音节匹配缓存
+    syllable_cache: RefCell<HashMap<String, Vec<Candidate>>>,
 }
 
 impl Default for SqliteDictionary {
@@ -69,15 +86,30 @@ impl SqliteDictionary {
         Self::init_db(conn, PathBuf::from(":memory:"))
     }
 
-    /// 初始化数据库表结构
-    fn init_db(conn: Connection, db_path: PathBuf) -> Self {
+    /// 打开文件型数据库并应用性能配置
+    fn open_with_perf(path: &Path) -> Result<Connection, rusqlite::Error> {
+        let conn = Connection::open(path)?;
+        Self::apply_perf_pragmas(&conn);
+        Ok(conn)
+    }
+
+    /// 对 SQLite 连接应用读性能优化的 PRAGMA 配置
+    fn apply_perf_pragmas(conn: &Connection) {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
-             PRAGMA cache_size=2000;
+             PRAGMA cache_size=-65536;
              PRAGMA temp_store=MEMORY;
+             PRAGMA mmap_size=268435456;",
+        )
+        .expect("Failed to apply performance pragmas");
+    }
 
-             CREATE TABLE IF NOT EXISTS entries (
+    /// 初始化数据库表结构
+    fn init_db(conn: Connection, db_path: PathBuf) -> Self {
+        Self::apply_perf_pragmas(&conn);
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS entries (
                  code TEXT NOT NULL,
                  text TEXT NOT NULL,
                  score INTEGER NOT NULL DEFAULT 0
@@ -91,6 +123,9 @@ impl SqliteDictionary {
             conn,
             db_path,
             is_persistent: false,
+            lookup_cache: RefCell::new(HashMap::with_capacity(16)),
+            prefix_cache: RefCell::new(HashMap::with_capacity(16)),
+            syllable_cache: RefCell::new(HashMap::with_capacity(16)),
         }
     }
 
@@ -179,12 +214,15 @@ impl SqliteDictionary {
 
         if Self::cache_is_valid(&cache_path, src_path) {
             tracing::info!("Using cached dictionary: {}", cache_path.display());
-            let conn = Connection::open(&cache_path)
+            let conn = Self::open_with_perf(&cache_path)
                 .map_err(|e| RimeDictError::Io(std::io::Error::other(e.to_string())))?;
             return Ok(Self {
                 conn,
                 db_path: cache_path,
                 is_persistent: true,
+                lookup_cache: RefCell::new(HashMap::with_capacity(16)),
+                prefix_cache: RefCell::new(HashMap::with_capacity(16)),
+                syllable_cache: RefCell::new(HashMap::with_capacity(16)),
             });
         }
 
@@ -198,12 +236,15 @@ impl SqliteDictionary {
 
         // 重新打开缓存文件，使 db_path 指向缓存（避免 Drop 时删除缓存）
         if cache_path.exists() {
-            let conn = Connection::open(&cache_path)
+            let conn = Self::open_with_perf(&cache_path)
                 .map_err(|e| RimeDictError::Io(std::io::Error::other(e.to_string())))?;
             return Ok(Self {
                 conn,
                 db_path: cache_path,
                 is_persistent: true,
+                lookup_cache: RefCell::new(HashMap::with_capacity(16)),
+                prefix_cache: RefCell::new(HashMap::with_capacity(16)),
+                syllable_cache: RefCell::new(HashMap::with_capacity(16)),
             });
         }
 
@@ -683,11 +724,24 @@ fn prefix_upper_bound(prefix: &str) -> String {
 
 impl Dictionary for SqliteDictionary {
     fn lookup(&self, code: &str) -> Vec<Candidate> {
-        tracing::debug!("lookup start: code='{}'", code);
+        // 查缓存
+        if let Some(cached) = self.lookup_cache.borrow().get(code) {
+            tracing::trace!("lookup cache hit: code='{}'", code);
+            return cached.clone();
+        }
+
+        tracing::debug!("lookup miss: code='{}'", code);
         let candidates = self.query_candidates(
             "SELECT text, score FROM entries WHERE code = ?1 ORDER BY score DESC",
             &[&code],
         );
+
+        // 写入缓存，超过上限时整体清空
+        let mut cache = self.lookup_cache.borrow_mut();
+        if cache.len() >= LOOKUP_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(code.to_string(), candidates.clone());
 
         tracing::debug!(
             "lookup end: code='{}', candidates={}",
@@ -703,13 +757,26 @@ impl Dictionary for SqliteDictionary {
             return Vec::new();
         }
 
-        tracing::debug!("prefix_lookup start: code='{}'", code);
+        // 查缓存
+        if let Some(cached) = self.prefix_cache.borrow().get(code) {
+            tracing::trace!("prefix_lookup cache hit: code='{}'", code);
+            return cached.clone();
+        }
+
+        tracing::debug!("prefix_lookup miss: code='{}'", code);
         // 使用范围查询替代 LIKE，确保 SQLite 能利用 code 列的索引
         let upper = prefix_upper_bound(code);
         let candidates = self.query_candidates(
             "SELECT text, score FROM entries WHERE code >= ?1 AND code < ?2 ORDER BY score DESC LIMIT 100",
             &[&code, &upper],
         );
+
+        // 写入缓存，超过上限时整体清空
+        let mut cache = self.prefix_cache.borrow_mut();
+        if cache.len() >= PREFIX_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(code.to_string(), candidates.clone());
 
         tracing::debug!(
             "prefix_lookup end: code='{}', candidates={}",
@@ -725,12 +792,18 @@ impl Dictionary for SqliteDictionary {
             return Vec::new();
         }
 
-        // 单音节情况（不含空格）与 prefix_lookup 语义等价，直接复用已优化的范围查询
+        // 单音节情况（不含空格）与 prefix_lookup 语义等价，直接走前缀缓存
         if !pattern.contains(' ') {
             return self.prefix_lookup(pattern);
         }
 
-        tracing::debug!("syllable_match start: pattern='{}'", pattern);
+        // 查缓存
+        if let Some(cached) = self.syllable_cache.borrow().get(pattern) {
+            tracing::trace!("syllable_match cache hit: pattern='{}'", pattern);
+            return cached.clone();
+        }
+
+        tracing::debug!("syllable_match miss: pattern='{}'", pattern);
         // 将空格分隔的音节模式转换为 SQL LIKE 模式
         // 例如："zhong wen" -> "zhong%wen%"
         let like_pattern: String = pattern
@@ -742,6 +815,13 @@ impl Dictionary for SqliteDictionary {
             "SELECT text, score FROM entries WHERE code LIKE ?1 ORDER BY score DESC LIMIT 100",
             &[&like_pattern],
         );
+
+        // 写入缓存，超过上限时整体清空
+        let mut cache = self.syllable_cache.borrow_mut();
+        if cache.len() >= SYLLABLE_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(pattern.to_string(), candidates.clone());
 
         tracing::debug!(
             "syllable_match end: pattern='{}', candidates={}",
