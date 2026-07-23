@@ -92,6 +92,7 @@ impl ShuangpinScheme {
     fn current_candidates(&mut self) -> Vec<Candidate> {
         let full_code = self.codec.full_code();
         let spaced_code = self.codec.spaced_code();
+        let has_pending = self.codec.has_pending();
 
         let mut candidates: Vec<Candidate> = Vec::new();
         let mut seen_texts = std::collections::HashSet::new();
@@ -102,33 +103,24 @@ impl ShuangpinScheme {
             let decoder =
                 GraphDecoder::new(&*self.dictionary).with_user_freqs(&self.user_freq_cache);
             let decode_results = decoder.decode(&graph);
-            tracing::debug!(
-                "shuangpin decode_results: count={}, top5={:?}",
-                decode_results.len(),
-                decode_results
-                    .iter()
-                    .take(5)
-                    .map(|r| (&r.text, r.score, r.is_partial))
-                    .collect::<Vec<_>>()
-            );
-
             for result in decode_results {
                 if seen_texts.insert(result.text.clone()) {
-                    let comment = if result.is_partial {
-                        Some("组合".to_string())
-                    } else {
-                        Some("整句".to_string())
-                    };
+                    // 有 pending 时音节图只覆盖了部分输入，标记为"组合"
+                    let is_partial = result.is_partial || has_pending;
                     candidates.push(Candidate {
                         text: result.text,
-                        comment,
+                        comment: if is_partial {
+                            Some("组合".to_string())
+                        } else {
+                            Some("整句".to_string())
+                        },
                         score: (result.score * 100.0) as i64,
                     });
                 }
             }
         }
 
-        // === 补充：前缀匹配（空格分隔 + 连续全拼）===
+        // === 前缀匹配（空格分隔 + 连续全拼）===
         for query in [&spaced_code, &full_code] {
             if !query.is_empty() {
                 for cand in self.dictionary.prefix_lookup(query) {
@@ -140,6 +132,24 @@ impl ShuangpinScheme {
                     {
                         existing.score = cand.score;
                     }
+                }
+            }
+        }
+
+        // === 挂起字符声母前缀匹配 ===
+        // 当有 pending 时，用 "[已有音节] [pending声母]" 格式查找双字词。
+        // 例如 "uuy" → "shu y" 匹配 "shu yao" / "shu ye" / "shu yu" 等。
+        if let Some(pending_query) = self.codec.spaced_code_with_pending_initial() {
+            for cand in self.dictionary.prefix_lookup(&pending_query) {
+                if seen_texts.insert(cand.text.clone()) {
+                    candidates.push(Candidate {
+                        text: cand.text.clone(),
+                        comment: Some("整句".to_string()),
+                        score: cand.score + 5000,
+                    });
+                } else if let Some(existing) = candidates.iter_mut().find(|c| c.text == cand.text) {
+                    existing.score += 5000;
+                    existing.comment = Some("整句".to_string());
                 }
             }
         }
@@ -164,17 +174,26 @@ impl ShuangpinScheme {
             }
         }
 
-        // 当输入恰好被完整切分为音节时，优先将字数等于音节数的候选排在前面
+        // === 排序 ===
+        // 当刚好完整切分时，字数等于音节数的候选优先。
+        // 有 pending 时（如 "uuy" 的 'y'→下一字声母），有效音节数含 pending 音节，
+        // 使双字词获得字数匹配优先。且此时跳过 ranker（ranker 按分数排序会打乱层序）。
         let syllable_count = spaced_code.split_whitespace().count();
         let is_fully_segmented =
             !spaced_code.is_empty() && full_code == spaced_code.replace(" ", "");
+        let eff_syl_count = if has_pending {
+            syllable_count + 1
+        } else {
+            syllable_count
+        };
 
-        // 排序：用户词 > 整句精确匹配 > 组合 > 前缀匹配 > 简拼匹配
-        // 输入完整切分时，字数等于音节数的候选额外优先
-        crate::sort_candidates(&mut candidates, syllable_count, is_fully_segmented);
+        crate::sort_candidates(
+            &mut candidates,
+            eff_syl_count,
+            is_fully_segmented || has_pending,
+        );
 
-        // 输入完整切分时已按字数优先排序，不再用 ranker 覆盖
-        if !candidates.is_empty() && !is_fully_segmented {
+        if !candidates.is_empty() && !is_fully_segmented && !has_pending {
             self.ranker.rank(&full_code, &mut candidates);
         }
         candidates
@@ -467,6 +486,12 @@ impl InputScheme for ShuangpinScheme {
                 expanded: false,
             };
         }
+        // 编码为空时分号键直接输出中文分号（避免被当作双拼编码键"ing"）
+        if self.codec.code().is_empty() && ch == ';' {
+            return SchemeResult::Committed {
+                text: "；".to_string(),
+            };
+        }
         match self.codec.push(ch) {
             CodecState::Accepted | CodecState::Complete => {
                 let code = self.codec.code().to_string();
@@ -727,8 +752,8 @@ mod tests {
         dict.insert("shuo", "说", 100);
 
         let user_dict = Arc::new(Mutex::new(UserDictionary::open_in_memory().unwrap()));
-        let mut scheme = ShuangpinScheme::with_dictionary(Box::new(dict))
-            .with_user_dict(user_dict.clone());
+        let mut scheme =
+            ShuangpinScheme::with_dictionary(Box::new(dict)).with_user_dict(user_dict.clone());
         let ctx = InputContext {
             caret_x: 0,
             caret_y: 0,

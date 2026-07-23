@@ -60,6 +60,26 @@ impl ShuangpinCodec {
         self.syllables.join(" ")
     }
 
+    /// 是否有未完成的挂起字符
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// 以空格分隔的已有音节 + pending 字符的拼音声母
+    ///
+    /// 例如 "uuy" 输入中，已解析音节为 ["shu"]，pending 为 "y"
+    /// 小鹤双拼中 'y' 键映射为声母 "y"，返回 "shu y"。
+    /// 用于在词典中前缀查找 "shu yao" / "shu ye" / "shu yu" 等双字词。
+    pub fn spaced_code_with_pending_initial(&self) -> Option<String> {
+        let ch = self.pending.chars().next()?;
+        let initial = initial_to_pinyin(ch)?;
+        let spaced = self.spaced_code();
+        if spaced.is_empty() {
+            return None;
+        }
+        Some(format!("{} {}", spaced, initial))
+    }
+
     /// 返回音节切分图（DAG），用于整句解码
     pub fn syllable_graph(&self) -> SyllableGraph {
         SyllableGraph::from_single_segmentation(&self.syllables)
@@ -495,5 +515,65 @@ mod tests {
             codec.push(ch);
         }
         assert_eq!(codec.syllables(), &["chuai"]);
+    }
+
+    #[test]
+    fn test_spaced_code_with_pending_initial() {
+        // "uuy": ["shu"] + pending "y" → 声母 'y' → "shu y"
+        let mut codec = ShuangpinCodec::new();
+        for ch in "uuy".chars() {
+            codec.push(ch);
+        }
+        assert_eq!(codec.syllables(), &["shu"]);
+        assert_eq!(codec.pending, "y");
+        assert!(codec.has_pending());
+        assert_eq!(
+            codec.spaced_code_with_pending_initial(),
+            Some("shu y".to_string())
+        );
+    }
+
+    #[test]
+    fn test_spaced_code_with_pending_initial_no_pending() {
+        // "uu": 偶数个字符，无 pending，不产生查询串
+        let mut codec = ShuangpinCodec::new();
+        for ch in "uu".chars() {
+            codec.push(ch);
+        }
+        assert!(!codec.has_pending());
+        assert!(codec.spaced_code_with_pending_initial().is_none());
+    }
+
+    #[test]
+    fn test_spaced_code_with_pending_initial_zero_initial() {
+        // "aae": ["a"] + pending 'e'
+        // initial_to_pinyin('e') 返回 None（拼音无声母 e），所以不产生查询串
+        let mut codec = ShuangpinCodec::new();
+        for ch in "aae".chars() {
+            codec.push(ch);
+        }
+        assert_eq!(codec.syllables(), &["a"]);
+        assert!(codec.has_pending());
+        assert!(
+            codec.spaced_code_with_pending_initial().is_none(),
+            "'e' is not a valid initial, should return None"
+        );
+    }
+
+    #[test]
+    fn test_spaced_code_with_pending_initial_multi() {
+        // "vskk" 是4个字符偶数个，无 pending。
+        // 改用 "vskkk": ["zhong", "kuai"] + pending "k"
+        // initial_to_pinyin('k') = Some("k") → "zhong kuai k"
+        let mut codec = ShuangpinCodec::new();
+        for ch in "vskkk".chars() {
+            codec.push(ch);
+        }
+        assert_eq!(codec.syllables(), &["zhong", "kuai"]);
+        assert!(codec.has_pending());
+        assert_eq!(
+            codec.spaced_code_with_pending_initial(),
+            Some("zhong kuai k".to_string())
+        );
     }
 }
