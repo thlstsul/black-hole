@@ -30,12 +30,13 @@ impl SettingsManager {
     /// 保存当前设置到磁盘，失败时记录错误
     pub fn save(&mut self) -> bool {
         let path = &self.config_path;
-        if let Some(parent) = path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                tracing::error!("Failed to create config directory {:?}: {}", parent, e);
-                return false;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            tracing::error!("Failed to create config directory {:?}: {}", parent, e);
+            return false;
         }
+
         let json = match serde_json::to_string_pretty(&self.settings) {
             Ok(j) => j,
             Err(e) => {

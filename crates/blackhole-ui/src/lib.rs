@@ -88,6 +88,13 @@ pub trait SettingsPanel {
 // ---------------------------------------------------------------------------
 mod candidate_window_cross {
     use super::*;
+    use eframe::WgpuConfiguration;
+    use eframe::egui_wgpu::{WgpuSetup, WgpuSetupCreateNew};
+    use eframe::wgpu::wgt::DeviceDescriptor;
+    use eframe::wgpu::{
+        BackendOptions, Backends, InstanceDescriptor, InstanceFlags, MemoryBudgetThresholds,
+        MemoryHints, PowerPreference,
+    };
     use egui::{Color32, Margin, Pos2, Vec2};
     use std::sync::mpsc::Receiver;
     use std::sync::{Arc, Mutex};
@@ -598,6 +605,28 @@ mod candidate_window_cross {
                 .with_taskbar(false)
                 .with_inner_size([320.0, 40.0]),
             event_loop_builder,
+            wgpu_options: WgpuConfiguration {
+                wgpu_setup: WgpuSetup::CreateNew(WgpuSetupCreateNew {
+                    instance_descriptor: InstanceDescriptor {
+                        flags: InstanceFlags::empty(),
+                        backends: Backends::PRIMARY,
+                        memory_budget_thresholds: MemoryBudgetThresholds::default(),
+                        backend_options: BackendOptions::default(),
+                        display: None, // 关键：禁用所有 debug/validation
+                    },
+                    device_descriptor: Arc::new(|_adapter| DeviceDescriptor {
+                        memory_hints: MemoryHints::Manual {
+                            suballocated_device_memory_block_size: 4 * 1024 * 1024
+                                ..16 * 1024 * 1024,
+                        },
+                        ..Default::default()
+                    }),
+                    display_handle: None,
+                    power_preference: PowerPreference::None,
+                    native_adapter_selector: None,
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
