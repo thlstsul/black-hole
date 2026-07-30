@@ -1,6 +1,6 @@
 use crate::{
     Codec, CodecState, Dictionary, GraphDecoder, InputScheme, LanguageModel, PinyinCodec,
-    PinyinPreprocessor, SqliteDictionary, UserDictionary, global_user_dict,
+    PinyinPreprocessor, RimeDict, UserDictionary, global_user_dict,
 };
 use blackhole_shared::candidate_layout::{
     EXPANDED_AVAILABLE_WIDTH, GridDirection, digit_to_candidate_index_excluding,
@@ -38,7 +38,7 @@ impl Default for PinyinScheme {
 
 impl PinyinScheme {
     pub fn new() -> Self {
-        let dict = SqliteDictionary::from_builtin();
+        let dict = RimeDict::from_builtin();
         let lm = dict.build_language_model();
         Self {
             codec: PinyinCodec::new(),
@@ -54,7 +54,7 @@ impl PinyinScheme {
         }
     }
 
-    pub fn with_dictionary(dict: SqliteDictionary) -> Self {
+    pub fn with_dictionary(dict: Arc<RimeDict>) -> Self {
         let lm = dict.build_language_model();
         Self {
             codec: PinyinCodec::new(),
@@ -94,8 +94,7 @@ impl PinyinScheme {
             return;
         }
         if let Some(ref ud) = self.user_dict_ref() {
-            let _ = ud
-                .lock()
+            ud.lock()
                 .unwrap()
                 .record_commit(SchemeId::Pinyin, &code, text);
             // 刷新缓存，下次查询时重新加载
@@ -204,9 +203,8 @@ impl PinyinScheme {
         }
 
         // === 用户词典查询：将用户高频词合并到候选列表 ===
-        if let Some(ref ud) = self.user_dict_ref()
-            && let Ok(user_cands) = ud.lock().unwrap().lookup(SchemeId::Pinyin, &spaced_code)
-        {
+        if let Some(ref ud) = self.user_dict_ref() {
+            let user_cands = ud.lock().unwrap().lookup(SchemeId::Pinyin, &spaced_code);
             for cand in user_cands {
                 // 更新词频缓存，供 GraphDecoder 的 user_bonus 使用
                 self.user_freq_cache.insert(cand.text.clone(), cand.score);
@@ -617,15 +615,32 @@ mod tests {
         }
     }
 
-    fn build_dict_with_spaced_code() -> SqliteDictionary {
-        let mut dict = SqliteDictionary::in_memory();
+    /// 从 (code, text, weight) 三元组构建测试词典
+    fn build_dict(entries: &[(&str, &str, i64)]) -> Arc<RimeDict> {
+        Arc::new(
+            RimeDict::from_entries(
+                entries
+                    .iter()
+                    .map(|(code, text, weight)| crate::RawEntry {
+                        code: code.to_string(),
+                        text: text.to_string(),
+                        weight: Some(*weight as f32),
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn build_dict_with_spaced_code() -> Arc<RimeDict> {
         // RIME 词库格式：text, code, weight，code 带空格分隔
-        dict.insert("zhong", "中", 100);
-        dict.insert("zhong wen", "中文", 100);
-        dict.insert("zhong guo", "中国", 90);
-        dict.insert("a", "啊", 100);
-        dict.insert("a ba fu", "阿爸父", 100);
-        dict
+        build_dict(&[
+            ("zhong", "中", 100),
+            ("zhong wen", "中文", 100),
+            ("zhong guo", "中国", 90),
+            ("a", "啊", 100),
+            ("a ba fu", "阿爸父", 100),
+        ])
     }
 
     #[test]
@@ -730,12 +745,13 @@ mod tests {
 
     #[test]
     fn test_pinyin_scheme_multiple_segmentations() {
-        let mut dict = SqliteDictionary::in_memory();
         // 添加多种切分可能的词条
-        dict.insert("zhong wen", "中文", 100);
-        dict.insert("zhong", "中", 90);
-        dict.insert("wen", "文", 80);
-        dict.insert("zhu ang", " Zhuang", 70);
+        let dict = build_dict(&[
+            ("zhong wen", "中文", 100),
+            ("zhong", "中", 90),
+            ("wen", "文", 80),
+            ("zhu ang", " Zhuang", 70),
+        ]);
 
         let mut scheme = PinyinScheme::with_dictionary(dict);
         let ctx = InputContext {
@@ -761,10 +777,8 @@ mod tests {
 
     #[test]
     fn test_pinyin_scheme_abbreviated_match() {
-        let mut dict = SqliteDictionary::in_memory();
         // 添加简拼匹配的词条
-        dict.insert("zw", "中文", 50);
-        dict.insert("zhong wen", "中文", 100);
+        let dict = build_dict(&[("zw", "中文", 50), ("zhong wen", "中文", 100)]);
 
         let mut scheme = PinyinScheme::with_dictionary(dict);
         let ctx = InputContext {
@@ -791,19 +805,19 @@ mod tests {
         }
     }
 
-    fn build_dict_for_sentence_tests() -> SqliteDictionary {
-        let mut dict = SqliteDictionary::in_memory();
-        // 单字
-        dict.insert("zhong", "中", 50);
-        dict.insert("guo", "国", 50);
-        dict.insert("ren", "人", 50);
-        dict.insert("min", "民", 50);
-        dict.insert("wen", "文", 50);
-        // 词组（score 更高，模拟常用词）
-        dict.insert("zhong guo", "中国", 120);
-        dict.insert("ren min", "人民", 120);
-        dict.insert("zhong wen", "中文", 120);
-        dict
+    fn build_dict_for_sentence_tests() -> Arc<RimeDict> {
+        build_dict(&[
+            // 单字
+            ("zhong", "中", 50),
+            ("guo", "国", 50),
+            ("ren", "人", 50),
+            ("min", "民", 50),
+            ("wen", "文", 50),
+            // 词组（score 更高，模拟常用词）
+            ("zhong guo", "中国", 120),
+            ("ren min", "人民", 120),
+            ("zhong wen", "中文", 120),
+        ])
     }
 
     #[test]
@@ -889,12 +903,13 @@ mod tests {
 
     #[test]
     fn test_single_syllable_single_char_first() {
-        let mut dict = SqliteDictionary::in_memory();
         // 单字 score 低于多字词，模拟实际词库场景
-        dict.insert("zhong", "中", 50);
-        dict.insert("zhong", "种", 40);
-        dict.insert("zhong guo", "中国", 100);
-        dict.insert("zhong wen", "中文", 90);
+        let dict = build_dict(&[
+            ("zhong", "中", 50),
+            ("zhong", "种", 40),
+            ("zhong guo", "中国", 100),
+            ("zhong wen", "中文", 90),
+        ]);
 
         let mut scheme = PinyinScheme::with_dictionary(dict);
         let ctx = InputContext {
@@ -930,12 +945,13 @@ mod tests {
     fn test_single_syllable_no_decode_single_char_first() {
         // 模拟 decode 结果为空的情况：词库中没有 code="zhong" 的单字，
         // 只有 code="zhong guo" 和 code="zhong wen" 的多字词
-        let mut dict = SqliteDictionary::in_memory();
-        dict.insert("zhong guo", "中国", 100);
-        dict.insert("zhong wen", "中文", 90);
         // 单字只存在于前缀匹配中（score 低于多字词）
-        dict.insert("zhong", "中", 30);
-        dict.insert("zhong", "种", 20);
+        let dict = build_dict(&[
+            ("zhong guo", "中国", 100),
+            ("zhong wen", "中文", 90),
+            ("zhong", "中", 30),
+            ("zhong", "种", 20),
+        ]);
 
         let mut scheme = PinyinScheme::with_dictionary(dict);
         let ctx = InputContext {
@@ -977,7 +993,7 @@ mod tests {
         }
 
         let dict =
-            SqliteDictionary::from_rime_dict_cached(dict_path, std::env::temp_dir()).unwrap();
+            Arc::new(RimeDict::from_rime_dict_cached(dict_path, std::env::temp_dir()).unwrap());
         let mut scheme = PinyinScheme::with_dictionary(dict);
         let ctx = InputContext {
             caret_x: 0,
@@ -1010,14 +1026,15 @@ mod tests {
 
     #[test]
     fn test_two_syllable_two_char_first() {
-        let mut dict = SqliteDictionary::in_memory();
-        // 单字 score 低
-        dict.insert("zhong", "中", 50);
-        dict.insert("guo", "国", 50);
-        // 两字词 score 中等
-        dict.insert("zhong guo", "中国", 120);
-        // 三字词 score 最高（模拟更常用的长词）
-        dict.insert("zhong guo ren", "中国人", 200);
+        let dict = build_dict(&[
+            // 单字 score 低
+            ("zhong", "中", 50),
+            ("guo", "国", 50),
+            // 两字词 score 中等
+            ("zhong guo", "中国", 120),
+            // 三字词 score 最高（模拟更常用的长词）
+            ("zhong guo ren", "中国人", 200),
+        ]);
 
         let mut scheme = PinyinScheme::with_dictionary(dict);
         let ctx = InputContext {
@@ -1051,15 +1068,16 @@ mod tests {
 
     #[test]
     fn test_three_syllable_three_char_first() {
-        let mut dict = SqliteDictionary::in_memory();
-        // 单字 score 低
-        dict.insert("a", "啊", 50);
-        // 两字词 score 中等
-        dict.insert("a ba", "阿爸", 120);
-        // 三字词 score 较高
-        dict.insert("a ba fu", "阿爸父", 150);
-        // 四字词 score 最高（模拟更常用的长词）
-        dict.insert("a ba fu qin", "阿爸父亲", 250);
+        let dict = build_dict(&[
+            // 单字 score 低
+            ("a", "啊", 50),
+            // 两字词 score 中等
+            ("a ba", "阿爸", 120),
+            // 三字词 score 较高
+            ("a ba fu", "阿爸父", 150),
+            // 四字词 score 最高（模拟更常用的长词）
+            ("a ba fu qin", "阿爸父亲", 250),
+        ]);
 
         let mut scheme = PinyinScheme::with_dictionary(dict);
         let ctx = InputContext {

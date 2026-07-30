@@ -78,6 +78,59 @@ impl SchemeResult {
     }
 }
 
+/// 中英文输入模式切换状态机（Ctrl 键触发）
+///
+/// 按下 Ctrl 时标记切换候选；按住 Ctrl 期间按下任意其他键则取消候选；
+/// 松开 Ctrl 时若候选仍有效则切换模式。由平台层持有并驱动，
+/// 模式状态保留在平台层（不经过引擎），英文模式下平台层直接放行按键。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct InputModeSwitch {
+    english: bool,
+    ctrl_pending: bool,
+}
+
+impl InputModeSwitch {
+    /// 当前是否为英文输入模式
+    pub fn is_english(&self) -> bool {
+        self.english
+    }
+
+    /// Ctrl 键按下
+    pub fn ctrl_pressed(&mut self) {
+        self.ctrl_pending = true;
+    }
+
+    /// 其他键按下；`ctrl_held` 表示 Ctrl 仍处于按住状态
+    pub fn other_key_pressed(&mut self, ctrl_held: bool) {
+        if ctrl_held {
+            self.ctrl_pending = false;
+        }
+    }
+
+    /// Ctrl 键松开；返回 `Some(english)` 表示发生了模式切换
+    pub fn ctrl_released(&mut self) -> Option<bool> {
+        if self.ctrl_pending {
+            self.ctrl_pending = false;
+            self.english = !self.english;
+            Some(self.english)
+        } else {
+            None
+        }
+    }
+
+    /// 直接设置模式（如系统面板点击属性触发）；
+    /// 返回 `Some(english)` 表示发生了模式切换
+    pub fn set_english(&mut self, english: bool) -> Option<bool> {
+        self.ctrl_pending = false;
+        if self.english != english {
+            self.english = english;
+            Some(english)
+        } else {
+            None
+        }
+    }
+}
+
 /// 平台适配层 → 引擎的命令
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EngineCommand {
@@ -174,5 +227,74 @@ impl Default for KeyBindings {
             cancel: "Escape".to_string(),
             switch_scheme: "Ctrl+Shift+F12".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_press_release_toggles_mode() {
+        let mut sw = InputModeSwitch::default();
+        assert!(!sw.is_english());
+
+        sw.ctrl_pressed();
+        assert_eq!(sw.ctrl_released(), Some(true));
+        assert!(sw.is_english());
+
+        sw.ctrl_pressed();
+        assert_eq!(sw.ctrl_released(), Some(false));
+        assert!(!sw.is_english());
+    }
+
+    #[test]
+    fn ctrl_combo_does_not_toggle() {
+        let mut sw = InputModeSwitch::default();
+
+        // Ctrl+C：按住 Ctrl 期间按下其他键，松开 Ctrl 不应切换
+        sw.ctrl_pressed();
+        sw.other_key_pressed(true);
+        assert_eq!(sw.ctrl_released(), None);
+        assert!(!sw.is_english());
+
+        // Ctrl+Shift（系统切换布局快捷键）同样不应触发切换
+        sw.ctrl_pressed();
+        sw.other_key_pressed(true);
+        assert_eq!(sw.ctrl_released(), None);
+        assert!(!sw.is_english());
+    }
+
+    #[test]
+    fn other_key_without_ctrl_does_not_affect_pending_toggle() {
+        let mut sw = InputModeSwitch::default();
+
+        // 未按住 Ctrl 时的普通按键不影响状态
+        sw.other_key_pressed(false);
+        sw.ctrl_pressed();
+        assert_eq!(sw.ctrl_released(), Some(true));
+    }
+
+    #[test]
+    fn release_without_press_does_not_toggle() {
+        let mut sw = InputModeSwitch::default();
+        assert_eq!(sw.ctrl_released(), None);
+        assert!(!sw.is_english());
+    }
+
+    #[test]
+    fn set_english_reports_only_actual_changes() {
+        let mut sw = InputModeSwitch::default();
+
+        // 与当前模式相同则不产生切换
+        assert_eq!(sw.set_english(false), None);
+        // 切换到英文并清除 Ctrl 候选状态
+        sw.ctrl_pressed();
+        assert_eq!(sw.set_english(true), Some(true));
+        assert!(sw.is_english());
+        assert_eq!(sw.ctrl_released(), None);
+        // 切回中文
+        assert_eq!(sw.set_english(false), Some(false));
+        assert!(!sw.is_english());
     }
 }

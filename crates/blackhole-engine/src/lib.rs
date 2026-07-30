@@ -1,7 +1,6 @@
 use blackhole_shared::{Candidate, EngineCommand, InputContext, KeyEvent, SchemeId, SchemeResult};
 
 pub mod builder;
-pub mod dictionary;
 pub mod graph_decoder;
 pub mod language_model;
 pub mod pinyin;
@@ -9,6 +8,7 @@ pub mod pinyin_preprocessor;
 pub mod pinyin_scheme;
 pub mod punctuation;
 pub mod ranker;
+pub mod rime_dict;
 pub mod scheme_registry;
 pub mod shuangpin;
 pub mod shuangpin_scheme;
@@ -16,7 +16,6 @@ pub mod syllable_graph;
 pub mod user_dict;
 
 pub use builder::EngineBuilder;
-pub use dictionary::{RimeDictError, SqliteDictionary};
 pub use graph_decoder::{DecodeResult, GraphDecoder, ScoringConfig, ScoringConfigBuilder};
 pub use language_model::LanguageModel;
 pub use pinyin::PinyinCodec;
@@ -24,12 +23,13 @@ pub use pinyin_preprocessor::PinyinPreprocessor;
 pub use pinyin_scheme::PinyinScheme;
 pub use punctuation::convert_punctuation;
 pub use ranker::{SimpleRanker, UserAwareRanker};
+pub use rime_dict::{RawEntry, RimeDict, RimeDictError};
 pub use scheme_registry::SchemeRegistry;
 pub use shuangpin::ShuangpinCodec;
 pub use shuangpin_scheme::ShuangpinScheme;
 pub use syllable_graph::SyllableGraph;
 pub use user_dict::{
-    UserDictionary, default_user_dict_path, global_user_dict, init_global_user_dict,
+    UserDictionary, default_user_dict_dir, global_user_dict, init_global_user_dict,
 };
 
 /// 输入方案顶层 trait

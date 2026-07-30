@@ -4,9 +4,12 @@
 //! channel 与引擎线程通信处理按键，并通过 `blackhole_ui` 显示候选窗口。
 
 use blackhole_shared::{
-    EngineCommand, InputContext, KeyEvent, KeyState, Modifiers, SchemeResult, UiCommand,
+    EngineCommand, InputContext, InputModeSwitch, KeyEvent, KeyState, Modifiers, SchemeResult,
+    UiCommand,
 };
+use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender};
+use zbus::zvariant::{Array, Dict, StructureBuilder, Type, Value};
 use zbus::{Connection, interface};
 
 use super::{PlatformError, PlatformIme};
@@ -51,6 +54,7 @@ impl LinuxIbusIme {
             platform_rx: Mutex::new(platform_rx),
             ui_tx: Mutex::new(ui_tx),
             context: Mutex::new(InputContext::default()),
+            mode_switch: Mutex::new(InputModeSwitch::default()),
             conn: conn.clone(),
         };
 
@@ -72,7 +76,36 @@ struct IbusEngine {
     platform_rx: Mutex<Receiver<SchemeResult>>,
     ui_tx: Mutex<Sender<UiCommand>>,
     context: Mutex<InputContext>,
+    /// 中英文模式切换状态机（Ctrl 键触发）
+    mode_switch: Mutex<InputModeSwitch>,
     conn: Connection,
+}
+
+impl IbusEngine {
+    /// 模式切换后的收尾：重置引擎并向面板广播新的 InputMode 属性。
+    async fn apply_mode_change(&self, english: bool) {
+        // 取消未完成的输入并重置引擎（幂等）。
+        // daemon 处理 Reset 时会自行隐藏候选窗。
+        let sent = {
+            let engine_tx = self.engine_tx.lock().unwrap();
+            engine_tx.send(EngineCommand::Reset).is_ok()
+        };
+        if sent {
+            let platform_rx = self.platform_rx.lock().unwrap();
+            let _ = platform_rx.recv();
+        }
+        // 更新 InputMode 属性，供面板/桌面 shell 感知中英文状态。
+        let _ = self
+            .conn
+            .emit_signal(
+                None::<&str>,
+                "/org/freedesktop/IBus/Engine/Blackhole",
+                "org.freedesktop.IBus.Engine",
+                "UpdateProperty",
+                &input_mode_property(english),
+            )
+            .await;
+    }
 }
 
 #[interface(name = "org.freedesktop.IBus.Engine")]
@@ -80,6 +113,43 @@ impl IbusEngine {
     /// 处理按键事件
     /// 返回 true 表示按键被消费，false 表示转发给应用
     async fn process_key_event(&self, keyval: u32, _keycode: u32, state: u32) -> bool {
+        const RELEASE_MASK: u32 = 1 << 30;
+        const CONTROL_MASK: u32 = 1 << 2;
+        // XK_Control_L / XK_Control_R
+        const CONTROL_L: u32 = 0xFFE3;
+        const CONTROL_R: u32 = 0xFFE4;
+
+        // Ctrl 键：按下标记候选，松开切换中英文模式；不消费按键本身。
+        if keyval == CONTROL_L || keyval == CONTROL_R {
+            let toggled = {
+                let mut mode = self.mode_switch.lock().unwrap();
+                if state & RELEASE_MASK != 0 {
+                    mode.ctrl_released()
+                } else {
+                    mode.ctrl_pressed();
+                    None
+                }
+            };
+            if let Some(english) = toggled {
+                tracing::info!(
+                    "Input mode toggled: {}",
+                    if english { "英文" } else { "中文" }
+                );
+                self.apply_mode_change(english).await;
+            }
+            return false;
+        }
+
+        // 按住 Ctrl 期间按下其他键（如 Ctrl+C），取消切换候选。
+        if state & CONTROL_MASK != 0 {
+            self.mode_switch.lock().unwrap().other_key_pressed(true);
+        }
+
+        // 英文模式下不消费任何按键。
+        if self.mode_switch.lock().unwrap().is_english() {
+            return false;
+        }
+
         let key = convert_keyval(keyval, state);
         let Some(key) = key else { return false };
 
@@ -168,7 +238,20 @@ impl IbusEngine {
         let _ = platform_rx.recv();
     }
 
-    async fn enable(&self) {}
+    async fn enable(&self) {
+        // 注册 InputMode 属性，使面板/桌面 shell 能显示并跟踪中英文状态。
+        let english = self.mode_switch.lock().unwrap().is_english();
+        let _ = self
+            .conn
+            .emit_signal(
+                None::<&str>,
+                "/org/freedesktop/IBus/Engine/Blackhole",
+                "org.freedesktop.IBus.Engine",
+                "RegisterProperties",
+                &input_mode_prop_list(english),
+            )
+            .await;
+    }
     async fn disable(&self) {}
     async fn set_capabilities(&self, _caps: u32) {}
     async fn page_up(&self) -> bool {
@@ -183,7 +266,24 @@ impl IbusEngine {
     async fn cursor_down(&self) -> bool {
         false
     }
-    async fn property_activate(&self, _prop_name: String, _prop_state: i32) {}
+    async fn property_activate(&self, prop_name: String, prop_state: i32) {
+        if prop_name != INPUT_MODE_PROP_KEY {
+            return;
+        }
+        // 面板点击 InputMode 属性：CHECKED=中文，UNCHECKED=英文
+        let toggled = self
+            .mode_switch
+            .lock()
+            .unwrap()
+            .set_english(prop_state == PROP_STATE_UNCHECKED as i32);
+        if let Some(english) = toggled {
+            tracing::info!(
+                "Input mode toggled via property: {}",
+                if english { "英文" } else { "中文" }
+            );
+            self.apply_mode_change(english).await;
+        }
+    }
     async fn candidate_clicked(&self, _index: u32, _button: u32, _state: u32) {}
 }
 
@@ -222,4 +322,102 @@ fn convert_keyval(keyval: u32, state: u32) -> Option<KeyEvent> {
         },
         state: KeyState::Press,
     })
+}
+
+// ---------------------------------------------------------------------------
+// IBus 属性序列化（与 libibus 的 GVariant 格式逐字段一致）
+//
+// libibus 将 IBusSerializable 序列化为 tuple：首元素为类型名（如
+// "IBusProperty"），随后是 attachments（a{sv}，恒为空），再按各子类
+// 定义顺序追加字段。RegisterProperties / UpdateProperty 信号参数均为
+// 包裹该 tuple 的 variant（见 ibus 源码 ibusserializable.c /
+// ibusproperty.c / ibustext.c / ibusattrlist.c / ibusproplist.c /
+// ibusengine.c）。
+// ---------------------------------------------------------------------------
+
+/// IBus 属性类型/状态常量（见 ibus 源码 ibustypes.h）
+const PROP_TYPE_TOGGLE: u32 = 1;
+const PROP_STATE_UNCHECKED: u32 = 0;
+const PROP_STATE_CHECKED: u32 = 1;
+
+/// 供面板/桌面 shell 感知中英文模式的属性 key
+const INPUT_MODE_PROP_KEY: &str = "InputMode";
+
+/// 空 attachments（a{sv}）
+fn empty_attachments() -> Value<'static> {
+    Value::Dict(Dict::new(<&str>::SIGNATURE, <Value>::SIGNATURE))
+}
+
+/// 序列化空的 IBusAttrList / IBusPropList：(s 类型名, a{sv}, av)
+fn empty_named_container(class_name: &'static str) -> Value<'static> {
+    Value::Structure(
+        StructureBuilder::new()
+            .add_field(class_name)
+            .append_field(empty_attachments())
+            .append_field(Value::Array(Array::new(<Value>::SIGNATURE)))
+            .build()
+            .expect("non-empty structure"),
+    )
+}
+
+/// 序列化 IBusText：(s "IBusText", a{sv}, s text, v IBusAttrList)
+fn ibus_text(text: &'static str) -> Value<'static> {
+    Value::Structure(
+        StructureBuilder::new()
+            .add_field("IBusText")
+            .append_field(empty_attachments())
+            .add_field(text)
+            .append_field(Value::Value(Box::new(empty_named_container(
+                "IBusAttrList",
+            ))))
+            .build()
+            .expect("non-empty structure"),
+    )
+}
+
+/// 序列化 InputMode 属性并以 variant 包裹（UpdateProperty 信号参数）。
+///
+/// IBusProperty 字段顺序：key(s) type(u) label(v) icon(s) tooltip(v)
+/// sensitive(b) visible(b) state(u) sub_props(v) symbol(v)。
+/// 约定：中文=CHECKED（label "中"），英文=UNCHECKED（label "英"）。
+fn input_mode_property(english: bool) -> Value<'static> {
+    let (label, tooltip, state) = if english {
+        ("英", "英文输入模式", PROP_STATE_UNCHECKED)
+    } else {
+        ("中", "中文输入模式", PROP_STATE_CHECKED)
+    };
+    let prop = StructureBuilder::new()
+        .add_field("IBusProperty")
+        .append_field(empty_attachments())
+        .add_field(INPUT_MODE_PROP_KEY)
+        .add_field(PROP_TYPE_TOGGLE)
+        .append_field(Value::Value(Box::new(ibus_text(label))))
+        .add_field("")
+        .append_field(Value::Value(Box::new(ibus_text(tooltip))))
+        .add_field(true)
+        .add_field(true)
+        .add_field(state)
+        .append_field(Value::Value(Box::new(empty_named_container(
+            "IBusPropList",
+        ))))
+        .append_field(Value::Value(Box::new(ibus_text(label))))
+        .build()
+        .expect("non-empty structure");
+    Value::Value(Box::new(Value::Structure(prop)))
+}
+
+/// 序列化仅含 InputMode 属性的 IBusPropList 并以 variant 包裹
+/// （RegisterProperties 信号参数）。列表元素同样是 variant 包裹的属性。
+fn input_mode_prop_list(english: bool) -> Value<'static> {
+    let mut props = Array::new(<Value>::SIGNATURE);
+    props
+        .append(input_mode_property(english))
+        .expect("element signature matches");
+    let list = StructureBuilder::new()
+        .add_field("IBusPropList")
+        .append_field(empty_attachments())
+        .append_field(Value::Array(props))
+        .build()
+        .expect("non-empty structure");
+    Value::Value(Box::new(Value::Structure(list)))
 }

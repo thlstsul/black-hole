@@ -329,9 +329,10 @@ mod candidate_window_cross {
                                                                 });
                                                             });
                                                         if is_selected {
-                                                            response.response.scroll_to_me(Some(
-                                                                egui::Align::Center,
-                                                            ));
+                                                            // 仅在选中项滚出可视区时做
+                                                            // 最小滚动，避免上下导航时
+                                                            // 整个表格反复居中跳动
+                                                            response.response.scroll_to_me(None);
                                                         }
                                                     }
                                                 });

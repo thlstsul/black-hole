@@ -20,7 +20,9 @@ use windows::Win32::UI::TextServices::{
 };
 use windows_core::{GUID, PCWSTR, w};
 
-use blackhole_shared::{EngineCommand, KeyEvent, SchemeId, SchemeResult, Theme, UiCommand};
+use blackhole_shared::{
+    EngineCommand, InputModeSwitch, KeyEvent, SchemeId, SchemeResult, Theme, UiCommand,
+};
 
 pub mod auto_register;
 pub(crate) mod caret;
@@ -137,6 +139,8 @@ pub(crate) struct ServiceInner {
     pub(crate) current_scheme: SchemeId,
     /// Current theme tracked by the language bar menu.
     pub(crate) current_theme: Theme,
+    /// 中英文模式切换状态机（Ctrl 键触发，按线程独立维护）。
+    pub(crate) mode_switch: InputModeSwitch,
 }
 
 impl ServiceInner {
@@ -157,6 +161,7 @@ impl ServiceInner {
             langbar_item_sink_cookie: 0,
             current_scheme: SchemeId::Pinyin,
             current_theme: Theme::Light,
+            mode_switch: InputModeSwitch::default(),
         }
     }
 }

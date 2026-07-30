@@ -1,6 +1,6 @@
 use crate::{
-    CandidateRanker, Codec, CodecState, Dictionary, GraphDecoder, InputScheme, ShuangpinCodec,
-    SimpleRanker, SqliteDictionary, UserDictionary, global_user_dict,
+    CandidateRanker, Codec, CodecState, Dictionary, GraphDecoder, InputScheme, RimeDict,
+    ShuangpinCodec, SimpleRanker, UserDictionary, global_user_dict,
 };
 use blackhole_shared::candidate_layout::{
     EXPANDED_AVAILABLE_WIDTH, GridDirection, digit_to_candidate_index_excluding,
@@ -18,6 +18,8 @@ pub struct ShuangpinScheme {
     user_dict: Option<Arc<Mutex<UserDictionary>>>,
     /// 缓存用户词频（避免每次查询 SQLite）
     user_freq_cache: HashMap<String, i64>,
+    /// 缓存最近一次查询结果（导航期间复用，保证候选顺序稳定）
+    last_query: Option<(String, Vec<Candidate>)>,
     expanded: bool,
     selected_index: usize,
     /// 临时英文输入缓冲（大写字母开头时进入）
@@ -34,10 +36,11 @@ impl ShuangpinScheme {
     pub fn new() -> Self {
         Self {
             codec: ShuangpinCodec::new(),
-            dictionary: Box::new(SqliteDictionary::from_builtin()),
+            dictionary: Box::new(RimeDict::from_builtin()),
             ranker: Box::new(SimpleRanker::new()),
             user_dict: None,
             user_freq_cache: HashMap::new(),
+            last_query: None,
             expanded: false,
             selected_index: 0,
             english_buffer: None,
@@ -51,6 +54,7 @@ impl ShuangpinScheme {
             ranker: Box::new(SimpleRanker::new()),
             user_dict: None,
             user_freq_cache: HashMap::new(),
+            last_query: None,
             expanded: false,
             selected_index: 0,
             english_buffer: None,
@@ -81,8 +85,7 @@ impl ShuangpinScheme {
             return;
         }
         if let Some(ref ud) = self.user_dict_ref() {
-            let _ = ud
-                .lock()
+            ud.lock()
                 .unwrap()
                 .record_commit(SchemeId::Shuangpin, &code, text);
             self.user_freq_cache.remove(text);
@@ -90,9 +93,18 @@ impl ShuangpinScheme {
     }
 
     fn current_candidates(&mut self) -> Vec<Candidate> {
+        let started = std::time::Instant::now();
         let full_code = self.codec.full_code();
         let spaced_code = self.codec.spaced_code();
         let has_pending = self.codec.has_pending();
+
+        // 缓存：同一原始输入直接复用结果，避免导航期间重复查询导致候选顺序抖动
+        let input_code = self.codec.code().to_string();
+        if let Some((cached_code, cached_candidates)) = &self.last_query
+            && cached_code == &input_code
+        {
+            return cached_candidates.clone();
+        }
 
         let mut candidates: Vec<Candidate> = Vec::new();
         let mut seen_texts = std::collections::HashSet::new();
@@ -119,26 +131,36 @@ impl ShuangpinScheme {
                 }
             }
         }
+        let decode_elapsed = started.elapsed();
 
         // === 前缀匹配（空格分隔 + 连续全拼）===
-        for query in [&spaced_code, &full_code] {
-            if !query.is_empty() {
-                for cand in self.dictionary.prefix_lookup(query) {
-                    if seen_texts.insert(cand.text.clone()) {
-                        candidates.push(cand);
-                    } else if let Some(existing) =
-                        candidates.iter_mut().find(|c| c.text == cand.text)
-                        && cand.score > existing.score
-                    {
-                        existing.score = cand.score;
-                    }
+        // 单音节时 spaced 与 full 相同（如 "niang"），只查一次
+        let t = std::time::Instant::now();
+        let queries: Vec<&String> = if spaced_code == full_code {
+            vec![&spaced_code]
+        } else {
+            vec![&spaced_code, &full_code]
+        };
+        for query in queries {
+            if query.is_empty() {
+                continue;
+            }
+            for cand in self.dictionary.prefix_lookup(query) {
+                if seen_texts.insert(cand.text.clone()) {
+                    candidates.push(cand);
+                } else if let Some(existing) = candidates.iter_mut().find(|c| c.text == cand.text)
+                    && cand.score > existing.score
+                {
+                    existing.score = cand.score;
                 }
             }
         }
+        let prefix_elapsed = t.elapsed();
 
         // === 挂起字符声母前缀匹配 ===
         // 当有 pending 时，用 "[已有音节] [pending声母]" 格式查找双字词。
         // 例如 "uuy" → "shu y" 匹配 "shu yao" / "shu ye" / "shu yu" 等。
+        let t = std::time::Instant::now();
         if let Some(pending_query) = self.codec.spaced_code_with_pending_initial() {
             for cand in self.dictionary.prefix_lookup(&pending_query) {
                 if seen_texts.insert(cand.text.clone()) {
@@ -153,11 +175,12 @@ impl ShuangpinScheme {
                 }
             }
         }
+        let pending_prefix_elapsed = t.elapsed();
 
         // === 用户词典查询 ===
-        if let Some(ref ud) = self.user_dict_ref()
-            && let Ok(user_cands) = ud.lock().unwrap().lookup(SchemeId::Shuangpin, &spaced_code)
-        {
+        let t = std::time::Instant::now();
+        if let Some(ref ud) = self.user_dict_ref() {
+            let user_cands = ud.lock().unwrap().lookup(SchemeId::Shuangpin, &spaced_code);
             for cand in user_cands {
                 self.user_freq_cache.insert(cand.text.clone(), cand.score);
                 let user_boost = (cand.score * 50).min(3000) + 500;
@@ -173,11 +196,13 @@ impl ShuangpinScheme {
                 }
             }
         }
+        let userdb_elapsed = t.elapsed();
 
         // === 排序 ===
         // 当刚好完整切分时，字数等于音节数的候选优先。
         // 有 pending 时（如 "uuy" 的 'y'→下一字声母），有效音节数含 pending 音节，
         // 使双字词获得字数匹配优先。且此时跳过 ranker（ranker 按分数排序会打乱层序）。
+        let t = std::time::Instant::now();
         let syllable_count = spaced_code.split_whitespace().count();
         let is_fully_segmented =
             !spaced_code.is_empty() && full_code == spaced_code.replace(" ", "");
@@ -196,6 +221,23 @@ impl ShuangpinScheme {
         if !candidates.is_empty() && !is_fully_segmented && !has_pending {
             self.ranker.rank(&full_code, &mut candidates);
         }
+        let sort_elapsed = t.elapsed();
+
+        tracing::debug!(
+            "shuangpin candidates: full='{}', spaced='{}', pending={}, n={}, decode_us={}, prefix_us={}, pending_prefix_us={}, userdb_us={}, sort_us={}, total_us={}",
+            full_code,
+            spaced_code,
+            has_pending,
+            candidates.len(),
+            decode_elapsed.as_micros(),
+            prefix_elapsed.as_micros(),
+            pending_prefix_elapsed.as_micros(),
+            userdb_elapsed.as_micros(),
+            sort_elapsed.as_micros(),
+            started.elapsed().as_micros()
+        );
+
+        self.last_query = Some((input_code, candidates.clone()));
         candidates
     }
 
@@ -212,6 +254,7 @@ impl ShuangpinScheme {
         self.codec.reset();
         self.expanded = false;
         self.selected_index = 0;
+        self.last_query = None;
         text
     }
 }
@@ -319,6 +362,7 @@ impl InputScheme for ShuangpinScheme {
                 self.codec.reset();
                 self.expanded = false;
                 self.selected_index = 0;
+                self.last_query = None;
                 return SchemeResult::Committed { text };
             }
             "Enter" => {
@@ -534,11 +578,13 @@ impl InputScheme for ShuangpinScheme {
         self.codec.reset();
         self.expanded = false;
         self.selected_index = 0;
+        self.last_query = None;
         Some(SchemeResult::Committed { text })
     }
 
     fn reset(&mut self) {
         self.codec.reset();
+        self.last_query = None;
         self.expanded = false;
         self.selected_index = 0;
         self.english_buffer = None;
@@ -564,12 +610,25 @@ mod tests {
         }
     }
 
+    /// 从 (code, text, weight) 三元组构建测试词典
+    fn build_dict(entries: &[(&str, &str, i64)]) -> RimeDict {
+        RimeDict::from_entries(
+            entries
+                .iter()
+                .map(|(code, text, weight)| crate::RawEntry {
+                    code: code.to_string(),
+                    text: text.to_string(),
+                    weight: Some(*weight as f32),
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn test_shuangpin_le_not_leng() {
-        let mut dict = SqliteDictionary::in_memory();
         // 模拟 RIME 词库：le -> 了，leng -> 冷
-        dict.insert("le", "了", 100);
-        dict.insert("leng", "冷", 200);
+        let dict = build_dict(&[("le", "了", 100), ("leng", "冷", 200)]);
 
         let mut scheme = ShuangpinScheme::with_dictionary(Box::new(dict));
         let ctx = InputContext {
@@ -630,8 +689,7 @@ mod tests {
             return;
         }
 
-        let dict =
-            SqliteDictionary::from_rime_dict_cached(dict_path, std::env::temp_dir()).unwrap();
+        let dict = RimeDict::from_rime_dict_cached(dict_path, std::env::temp_dir()).unwrap();
         let mut scheme = ShuangpinScheme::with_dictionary(Box::new(dict));
         let ctx = InputContext {
             caret_x: 0,
@@ -657,10 +715,8 @@ mod tests {
     #[test]
     fn test_shuangpin_le_no_exact_match() {
         // 模拟词典中没有 code="le" 精确匹配的情况
-        let mut dict = SqliteDictionary::in_memory();
         // 只插入 "leng"，不插入 "le"
-        dict.insert("leng", "冷", 200);
-        dict.insert("lei", "类", 150);
+        let dict = build_dict(&[("leng", "冷", 200), ("lei", "类", 150)]);
 
         let mut scheme = ShuangpinScheme::with_dictionary(Box::new(dict));
         let ctx = InputContext {
@@ -685,7 +741,7 @@ mod tests {
 
     #[test]
     fn test_engine_switch_scheme_shares_dict() {
-        use crate::{Engine, PinyinScheme, ShuangpinScheme, SqliteDictionary};
+        use crate::{Engine, PinyinScheme, ShuangpinScheme};
         use blackhole_shared::{EngineCommand, SchemeResult};
 
         let dict_path = std::path::Path::new("../../temp/dicts/rime_ice.dict.yaml");
@@ -702,10 +758,11 @@ mod tests {
 
         // 手动加载外部词典，分别构建拼音和双拼引擎（避免用户词典干扰）
         let cache_dir = std::env::temp_dir();
-        let pinyin_dict = SqliteDictionary::from_rime_dict_cached(dict_path, &cache_dir)
-            .expect("加载外部词典失败");
-        let shuangpin_dict = SqliteDictionary::from_rime_dict_cached(dict_path, &cache_dir)
-            .expect("加载外部词典失败");
+        let pinyin_dict = std::sync::Arc::new(
+            RimeDict::from_rime_dict_cached(dict_path, &cache_dir).expect("加载外部词典失败"),
+        );
+        let shuangpin_dict =
+            RimeDict::from_rime_dict_cached(dict_path, &cache_dir).expect("加载外部词典失败");
 
         // 拼音模式下输入 "le"
         let mut pinyin_engine = Engine::new(Box::new(PinyinScheme::with_dictionary(pinyin_dict)));
@@ -747,11 +804,9 @@ mod tests {
     #[test]
     fn test_shuangpin_user_dict_no_partial_learn() {
         // 模拟词典：shu -> 书（高频），shuo -> 说（低频）
-        let mut dict = SqliteDictionary::in_memory();
-        dict.insert("shu", "书", 200);
-        dict.insert("shuo", "说", 100);
+        let dict = build_dict(&[("shu", "书", 200), ("shuo", "说", 100)]);
 
-        let user_dict = Arc::new(Mutex::new(UserDictionary::open_in_memory().unwrap()));
+        let user_dict = Arc::new(Mutex::new(UserDictionary::open_in_memory()));
         let mut scheme =
             ShuangpinScheme::with_dictionary(Box::new(dict)).with_user_dict(user_dict.clone());
         let ctx = InputContext {
@@ -781,5 +836,68 @@ mod tests {
             "不精确匹配的用户选择不应污染当前编码的首选；实际首选为 '{}'，候选: {:?}",
             first, candidates
         );
+    }
+
+    #[test]
+    fn test_shuangpin_navigation_keeps_candidate_order() {
+        // 多个同权重候选：前缀查询去重曾依赖 HashMap 迭代顺序（随机），
+        // 且双拼方案此前每次导航都重新查询，导致候选顺序在上下导航时抖动
+        let dict = build_dict(&[
+            ("ni", "你", 100),
+            ("ni", "尼", 100),
+            ("ni", "泥", 100),
+            ("ni", "逆", 100),
+            ("ni", "匿", 100),
+            ("ni", "腻", 100),
+            ("ni", "妮", 100),
+            ("ni", "霓", 100),
+            ("ni", "倪", 100),
+            ("ni", "坭", 100),
+            ("ni", "猊", 100),
+            ("ni", "怩", 100),
+            ("ni", "拟", 100),
+            ("ni", "溺", 100),
+            ("ni", "昵", 100),
+            ("ni", "鲵", 100),
+            ("ni", "旎", 100),
+            ("ni", "睨", 100),
+            ("ni", "铌", 100),
+            ("ni", "嫟", 100),
+        ]);
+        let mut scheme = ShuangpinScheme::with_dictionary(Box::new(dict));
+        let ctx = InputContext {
+            caret_x: 0,
+            caret_y: 0,
+            caret_h: 20,
+        };
+
+        for ch in ["n", "i"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+
+        let SchemeResult::Composing {
+            candidates: initial,
+            ..
+        } = scheme.handle_key(&key_event("ArrowDown"), &ctx)
+        else {
+            panic!("输入 ni 后按 ArrowDown 应处于 Composing 状态");
+        };
+        assert!(initial.len() >= 20, "候选数量应覆盖全部同权重字");
+
+        let initial_texts: Vec<&str> = initial.iter().map(|c| c.text.as_str()).collect();
+        // 连续多次上下导航，候选列表顺序必须保持冻结
+        for key in ["ArrowDown", "ArrowDown", "ArrowUp", "ArrowDown", "ArrowUp"] {
+            let SchemeResult::Composing { candidates, .. } =
+                scheme.handle_key(&key_event(key), &ctx)
+            else {
+                panic!("导航 {} 应处于 Composing 状态", key);
+            };
+            let texts: Vec<&str> = candidates.iter().map(|c| c.text.as_str()).collect();
+            assert_eq!(
+                initial_texts, texts,
+                "导航 {} 后候选顺序发生变动",
+                key
+            );
+        }
     }
 }

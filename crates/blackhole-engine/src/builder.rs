@@ -1,4 +1,4 @@
-use crate::{Engine, SchemeRegistry, default_user_dict_path, init_global_user_dict};
+use crate::{Engine, SchemeRegistry, default_user_dict_dir, init_global_user_dict};
 use blackhole_shared::SchemeId;
 
 /// 引擎构建器
@@ -55,14 +55,11 @@ impl EngineBuilder {
     /// 构建引擎实例
     pub fn build(self) -> Engine {
         // 初始化全局用户词典
-        let user_dict_path = default_user_dict_path();
-        if let Some(parent) = user_dict_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Err(e) = init_global_user_dict(&user_dict_path) {
+        let user_dict_dir = default_user_dict_dir();
+        if let Err(e) = init_global_user_dict(&user_dict_dir) {
             tracing::warn!(
                 "Failed to initialize user dictionary at {:?}: {}",
-                user_dict_path,
+                user_dict_dir,
                 e
             );
         }

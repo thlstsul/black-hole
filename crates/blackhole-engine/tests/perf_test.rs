@@ -1,11 +1,11 @@
-// 性能测试：比较 SQLite 词典的内存占用
+// 性能测试：比较 rime-dict 词典的内存占用
 use blackhole_engine::Dictionary;
 use std::fs::File;
 use std::io::Write;
 use std::time::Instant;
 
 fn main() {
-    println!("=== SQLite Dictionary Performance Test ===\n");
+    println!("=== rime-dict Dictionary Performance Test ===\n");
 
     // 创建一个大词库测试文件
     let test_dir = std::env::temp_dir().join("blackhole_perf_test");
@@ -35,7 +35,7 @@ fn main() {
     println!("Loading dictionary...");
     let start = Instant::now();
 
-    match blackhole_engine::SqliteDictionary::from_rime_dict(&dict_path) {
+    match blackhole_engine::RimeDict::from_rime_dict(&dict_path) {
         Ok(dict) => {
             let load_time = start.elapsed();
             println!("Dictionary loaded in {:.2}s\n", load_time.as_secs_f64());

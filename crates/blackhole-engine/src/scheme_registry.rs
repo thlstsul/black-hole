@@ -1,9 +1,8 @@
 use crate::{
-    InputScheme, PinyinScheme, ShuangpinScheme, SqliteDictionary, default_user_dict_path,
-    global_user_dict,
+    InputScheme, PinyinScheme, RimeDict, ShuangpinScheme, default_user_dict_dir, global_user_dict,
 };
 use blackhole_shared::SchemeId;
-use std::path::PathBuf;
+use std::sync::Arc;
 
 /// 方案注册表：根据 SchemeId 创建对应的输入方案实例
 pub struct SchemeRegistry {
@@ -58,24 +57,15 @@ impl SchemeRegistry {
         ]
     }
 
-    fn load_dictionary(&self) -> Option<SqliteDictionary> {
+    /// 加载全局共享的 rime-dict 词典（同一词库路径进程内只编译/加载一次）
+    fn load_dictionary(&self) -> Option<Arc<RimeDict>> {
         let path = self.dict_path.as_ref()?;
-        let cache_dir = default_user_dict_path()
-            .parent()
-            .map(|p| p.join("cache"))
-            .unwrap_or_else(|| PathBuf::from("."));
+        let cache_dir = default_user_dict_dir().join("cache");
 
         tracing::info!("Loading RIME dictionary from: {}", path);
-        match SqliteDictionary::from_rime_dict_cached(path, &cache_dir) {
-            Ok(dict) => {
-                tracing::info!("RIME dictionary loaded successfully.");
-                Some(dict)
-            }
-            Err(e) => {
-                tracing::error!("Failed to load RIME dictionary: {}", e);
-                None
-            }
-        }
+        let dict = RimeDict::shared(path, &cache_dir)?;
+        tracing::info!("RIME dictionary loaded successfully.");
+        Some(dict)
     }
 }
 

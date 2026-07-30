@@ -187,6 +187,11 @@ impl BlackholeLangBarItem {
         inner.current_theme
     }
 
+    fn is_english_mode(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.mode_switch.is_english()
+    }
+
     fn set_scheme(&self, scheme: SchemeId) {
         let sink = {
             let mut inner = self.inner.lock().unwrap();
@@ -519,7 +524,11 @@ impl ITfLangBarItemButton_Impl for BlackholeLangBarItem_Impl {
 
     fn GetIcon(&self) -> windows_core::Result<HICON> {
         tracing::debug!("LangBarItem::GetIcon called");
-        render_scheme_icon(self.current_scheme(), self.current_theme())
+        render_scheme_icon(
+            self.current_scheme(),
+            self.current_theme(),
+            self.is_english_mode(),
+        )
     }
 
     fn GetText(&self) -> windows_core::Result<BSTR> {
@@ -613,7 +622,11 @@ fn add_submenu(menu: &ITfMenu, flags: u32, text: &str) -> windows_core::Result<I
 // 图标辅助函数
 // ---------------------------------------------------------------------------
 
-fn render_scheme_icon(scheme: SchemeId, theme: Theme) -> windows_core::Result<HICON> {
+fn render_scheme_icon(
+    scheme: SchemeId,
+    theme: Theme,
+    english: bool,
+) -> windows_core::Result<HICON> {
     const SIZE: i32 = 16;
     const PX_COUNT: usize = (SIZE * SIZE) as usize;
 
@@ -658,9 +671,13 @@ fn render_scheme_icon(scheme: SchemeId, theme: Theme) -> windows_core::Result<HI
         let old_bmp = SelectObject(mem_dc, HGDIOBJ(color_bmp.0));
 
         // 文字：白色、居中（白色仅作为亮度参考，后续会根据主题着色）。
-        let text = match scheme {
-            SchemeId::Pinyin => "全",
-            SchemeId::Shuangpin => "双",
+        let text = if english {
+            "英"
+        } else {
+            match scheme {
+                SchemeId::Pinyin => "全",
+                SchemeId::Shuangpin => "双",
+            }
         };
         let mut wide: Vec<u16> = text.encode_utf16().collect();
 

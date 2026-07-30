@@ -515,7 +515,7 @@ impl<'a> GraphDecoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LanguageModel, SqliteDictionary};
+    use crate::{LanguageModel, RawEntry, RimeDict};
     use blackhole_shared::Candidate;
 
     fn cand(text: &str, score: i64) -> Candidate {
@@ -526,15 +526,30 @@ mod tests {
         }
     }
 
-    fn build_test_dict() -> SqliteDictionary {
-        let mut dict = SqliteDictionary::in_memory();
-        dict.insert("zhong", "中", 50);
-        dict.insert("guo", "国", 50);
-        dict.insert("ren", "人", 50);
-        dict.insert("zhong guo", "中国", 120);
-        dict.insert("zhong guo ren", "中国人", 100);
-        dict.insert("ren min", "人民", 120);
-        dict
+    /// 从 (code, text, weight) 三元组构建测试词典
+    fn build_dict(entries: &[(&str, &str, i64)]) -> RimeDict {
+        RimeDict::from_entries(
+            entries
+                .iter()
+                .map(|(code, text, weight)| RawEntry {
+                    code: code.to_string(),
+                    text: text.to_string(),
+                    weight: Some(*weight as f32),
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn build_test_dict() -> RimeDict {
+        build_dict(&[
+            ("zhong", "中", 50),
+            ("guo", "国", 50),
+            ("ren", "人", 50),
+            ("zhong guo", "中国", 120),
+            ("zhong guo ren", "中国人", 100),
+            ("ren min", "人民", 120),
+        ])
     }
 
     fn build_test_lm() -> LanguageModel {
@@ -606,10 +621,8 @@ mod tests {
     fn test_partial_decode_with_single_char_fallback() {
         // 词库只有 "zhong guo" -> 中国和单字 "ren" -> 人，
         // 没有 "zhong guo ren" 整句，验证混合拼接回退
-        let mut dict = SqliteDictionary::in_memory();
-        dict.insert("zhong guo", "中国", 120);
-        dict.insert("ren", "人", 50);
         // 注意：不插入 "zhong"、"guo" 单字，确保只有词边能走到位置 8
+        let dict = build_dict(&[("zhong guo", "中国", 120), ("ren", "人", 50)]);
 
         let decoder = GraphDecoder::new(&dict);
 
@@ -633,8 +646,7 @@ mod tests {
     #[test]
     fn test_partial_decode_unknown_suffix() {
         // 词库只有 "zhong guo" -> 中国，没有 "ren" 的任何词条
-        let mut dict = SqliteDictionary::in_memory();
-        dict.insert("zhong guo", "中国", 120);
+        let dict = build_dict(&[("zhong guo", "中国", 120)]);
 
         let decoder = GraphDecoder::new(&dict);
 

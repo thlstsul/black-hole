@@ -1,6 +1,7 @@
 /// 性能测试：验证拼音输入卡顿问题是否已修复
-use blackhole_engine::{InputScheme, PinyinScheme, SqliteDictionary};
+use blackhole_engine::{InputScheme, PinyinScheme, RimeDict};
 use blackhole_shared::{InputContext, KeyEvent, KeyState, Modifiers};
+use std::sync::Arc;
 
 fn key_event(key: &str) -> KeyEvent {
     KeyEvent {
@@ -16,11 +17,14 @@ fn key_event(key: &str) -> KeyEvent {
     }
 }
 
+fn builtin_scheme() -> PinyinScheme {
+    PinyinScheme::with_dictionary(Arc::new(RimeDict::from_builtin()))
+}
+
 #[test]
 fn test_performance_si_input() {
     // 测试输入 "si" 时的性能
-    let dict = SqliteDictionary::from_builtin();
-    let mut scheme = PinyinScheme::with_dictionary(dict);
+    let mut scheme = builtin_scheme();
     let ctx = InputContext {
         caret_x: 0,
         caret_y: 0,
@@ -49,8 +53,7 @@ fn test_performance_si_input() {
 #[test]
 fn test_performance_shu_input() {
     // 测试输入 "shu" 时的性能
-    let dict = SqliteDictionary::from_builtin();
-    let mut scheme = PinyinScheme::with_dictionary(dict);
+    let mut scheme = builtin_scheme();
     let ctx = InputContext {
         caret_x: 0,
         caret_y: 0,
@@ -81,8 +84,7 @@ fn test_performance_shu_input() {
 #[test]
 fn test_performance_shi_input() {
     // 测试输入 "shi" 时的性能（这是一个特别容易卡顿的例子）
-    let dict = SqliteDictionary::from_builtin();
-    let mut scheme = PinyinScheme::with_dictionary(dict);
+    let mut scheme = builtin_scheme();
     let ctx = InputContext {
         caret_x: 0,
         caret_y: 0,
@@ -113,8 +115,7 @@ fn test_performance_shi_input() {
 #[test]
 fn test_performance_zhuang_input() {
     // 测试输入 "zhuang" 时的性能（6个字母，容易产生大量切分）
-    let dict = SqliteDictionary::from_builtin();
-    let mut scheme = PinyinScheme::with_dictionary(dict);
+    let mut scheme = builtin_scheme();
     let ctx = InputContext {
         caret_x: 0,
         caret_y: 0,
@@ -142,8 +143,7 @@ fn test_performance_zhuang_input() {
 #[test]
 fn test_performance_delete_si() {
     // 测试删除 "si" 的 "i" 时的性能
-    let dict = SqliteDictionary::from_builtin();
-    let mut scheme = PinyinScheme::with_dictionary(dict);
+    let mut scheme = builtin_scheme();
     let ctx = InputContext {
         caret_x: 0,
         caret_y: 0,
@@ -172,8 +172,7 @@ fn test_performance_delete_si() {
 #[test]
 fn test_performance_delete_shu() {
     // 测试删除 "shu" 的 "u" 时的性能
-    let dict = SqliteDictionary::from_builtin();
-    let mut scheme = PinyinScheme::with_dictionary(dict);
+    let mut scheme = builtin_scheme();
     let ctx = InputContext {
         caret_x: 0,
         caret_y: 0,
@@ -203,8 +202,7 @@ fn test_performance_delete_shu() {
 #[test]
 fn test_performance_delete_shi() {
     // 测试删除 "shi" 的 "i" 时的性能（特别容易卡顿的例子）
-    let dict = SqliteDictionary::from_builtin();
-    let mut scheme = PinyinScheme::with_dictionary(dict);
+    let mut scheme = builtin_scheme();
     let ctx = InputContext {
         caret_x: 0,
         caret_y: 0,

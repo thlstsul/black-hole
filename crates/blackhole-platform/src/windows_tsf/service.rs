@@ -3,13 +3,19 @@ use super::{ServiceInner, send_ui_command_inner};
 use blackhole_shared::{KeyState, UiCommand};
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{E_UNEXPECTED, LPARAM, WPARAM};
+use windows::Win32::System::Variant::{VARIANT, VT_I4};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL, VK_RCONTROL,
+};
 use windows::Win32::UI::TextServices::{
-    ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext, ITfContextView,
-    ITfDocumentMgr, ITfEditSession, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
-    ITfLangBarItem, ITfLangBarItemMgr, ITfSource, ITfTextInputProcessor,
+    GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
+    ITfCompartmentMgr, ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext,
+    ITfContextView, ITfDocumentMgr, ITfEditSession, ITfKeyEventSink, ITfKeyEventSink_Impl,
+    ITfKeystrokeMgr, ITfLangBarItem, ITfLangBarItemMgr, ITfSource, ITfTextInputProcessor,
     ITfTextInputProcessor_Impl, ITfTextLayoutSink, ITfTextLayoutSink_Impl, ITfThreadMgr,
-    ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC,
-    TF_LC_CHANGE, TfLayoutCode,
+    ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl, TF_CONVERSIONMODE_ALPHANUMERIC,
+    TF_CONVERSIONMODE_NATIVE, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC, TF_LBI_ICON, TF_LC_CHANGE,
+    TfLayoutCode,
 };
 use windows_core::{BOOL, GUID, Interface, Ref, implement};
 
@@ -182,6 +188,88 @@ impl BlackholeTextService {
             Some(c) => unsafe { c.GetRange().is_ok() },
         }
     }
+
+    /// 中英文模式切换后的收尾工作：取消进行中的 composition、
+    /// 重置引擎状态、同步系统输入法状态并刷新语言栏图标。
+    fn on_input_mode_toggled(&self, english: bool) {
+        tracing::info!(
+            "Input mode toggled: {}",
+            if english { "英文" } else { "中文" }
+        );
+        // 取消未完成的输入并重置引擎（两个方向均为幂等操作）。
+        self.send_reset();
+        // 写入系统键盘 compartment，供其它应用感知当前输入法状态。
+        self.sync_input_mode_compartments(english);
+        let sink = {
+            let inner = self.inner.lock().unwrap();
+            inner.langbar_item_sink.clone()
+        };
+        if let Some(sink) = sink {
+            let _ = unsafe { sink.OnUpdate(TF_LBI_ICON) };
+        }
+    }
+
+    /// 将当前中英文模式写入 TSF 键盘 compartment，使系统输入指示器及
+    /// 其它应用（通过 ITfCompartmentMgr / IMM 兼容层）能感知输入法状态：
+    /// - `GUID_COMPARTMENT_KEYBOARD_OPENCLOSE`：中文=1（打开），英文=0（关闭）
+    /// - `GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION`：
+    ///   中文=`TF_CONVERSIONMODE_NATIVE`，英文=`TF_CONVERSIONMODE_ALPHANUMERIC`
+    ///
+    /// compartment 按线程管理器独立维护，与 `mode_switch` 的线程级语义一致。
+    fn sync_input_mode_compartments(&self, english: bool) {
+        let (thread_mgr, client_id) = {
+            let inner = self.inner.lock().unwrap();
+            (inner.thread_mgr.clone(), inner.client_id)
+        };
+        let Some(tm) = thread_mgr else { return };
+        let Ok(mgr) = tm.cast::<ITfCompartmentMgr>() else {
+            return;
+        };
+
+        if let Ok(comp) = unsafe { mgr.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_OPENCLOSE) } {
+            let value = variant_i32(if english { 0 } else { 1 });
+            if let Err(e) = unsafe { comp.SetValue(client_id, &value) } {
+                tracing::warn!("Failed to set OPENCLOSE compartment: {}", e);
+            }
+        }
+
+        if let Ok(comp) =
+            unsafe { mgr.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION) }
+        {
+            let mode = if english {
+                TF_CONVERSIONMODE_ALPHANUMERIC
+            } else {
+                TF_CONVERSIONMODE_NATIVE
+            };
+            let value = variant_i32(mode as i32);
+            if let Err(e) = unsafe { comp.SetValue(client_id, &value) } {
+                tracing::warn!("Failed to set INPUTMODE_CONVERSION compartment: {}", e);
+            }
+        }
+    }
+}
+
+/// 构造 VT_I4 类型的 VARIANT（windows crate 的 Win32 VARIANT 未提供 From<i32>）
+fn variant_i32(v: i32) -> VARIANT {
+    use std::mem::ManuallyDrop;
+    use windows::Win32::System::Variant::{VARIANT_0, VARIANT_0_0, VARIANT_0_0_0};
+
+    VARIANT {
+        Anonymous: VARIANT_0 {
+            Anonymous: ManuallyDrop::new(VARIANT_0_0 {
+                vt: VT_I4,
+                wReserved1: 0,
+                wReserved2: 0,
+                wReserved3: 0,
+                Anonymous: VARIANT_0_0_0 { lVal: v },
+            }),
+        },
+    }
+}
+
+/// 判断虚拟键是否为 Ctrl（含左右键）。
+fn is_ctrl_key(vk: VIRTUAL_KEY) -> bool {
+    vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +328,11 @@ impl ITfTextInputProcessor_Impl for BlackholeTextService_Impl {
 
         // 连接成功后，向 daemon 查询当前设置，确保托盘菜单勾选正确。
         self.sync_settings_from_daemon();
+
+        // 同步初始中英文模式到系统键盘 compartment（默认中文），
+        // 使其它应用在 IME 激活后即可感知输入法状态。
+        let english = self.inner.lock().unwrap().mode_switch.is_english();
+        self.sync_input_mode_compartments(english);
 
         Ok(())
     }
@@ -313,7 +406,32 @@ impl ITfKeyEventSink_Impl for BlackholeTextService_Impl {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> windows_core::Result<BOOL> {
-        let vk = windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(wparam.0 as u16);
+        let vk = VIRTUAL_KEY(wparam.0 as u16);
+
+        // Ctrl 键：标记切换候选，松开时在 OnTestKeyUp 中切换中英文模式。
+        // 永远不拦截 Ctrl 本身，保证 Ctrl+C 等组合键正常工作。
+        if is_ctrl_key(vk) {
+            let mut inner = self.inner.lock().unwrap();
+            inner.mode_switch.ctrl_pressed();
+            inner.last_key_event = None;
+            return Ok(BOOL(0));
+        }
+
+        // 按住 Ctrl 期间按下其他键（如 Ctrl+C、Ctrl+Shift），取消切换候选。
+        if unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0 {
+            let mut inner = self.inner.lock().unwrap();
+            inner.mode_switch.other_key_pressed(true);
+        }
+
+        // 英文模式下不拦截任何按键。
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.mode_switch.is_english() {
+                inner.last_key_event = None;
+                return Ok(BOOL(0));
+            }
+        }
+
         if let Some(evt) =
             super::key_event::virtual_key_to_key_event(vk, wparam, lparam, KeyState::Press)
         {
@@ -351,9 +469,22 @@ impl ITfKeyEventSink_Impl for BlackholeTextService_Impl {
     fn OnTestKeyUp(
         &self,
         _pic: Ref<'_, ITfContext>,
-        _wparam: WPARAM,
+        wparam: WPARAM,
         _lparam: LPARAM,
     ) -> windows_core::Result<BOOL> {
+        // Ctrl 松开时切换中英文模式。切换逻辑放在 OnTestKeyUp 而非 OnKeyUp：
+        // 部分应用（如控制台宿主）只在 TestKeyUp 返回 TRUE 时才回调 OnKeyUp，
+        // 而 OnTestKeyUp 对每次真实松开都会被调用且仅一次。
+        let vk = VIRTUAL_KEY(wparam.0 as u16);
+        if is_ctrl_key(vk) {
+            let toggled = {
+                let mut inner = self.inner.lock().unwrap();
+                inner.mode_switch.ctrl_released()
+            };
+            if let Some(english) = toggled {
+                self.on_input_mode_toggled(english);
+            }
+        }
         Ok(BOOL(0))
     }
 
@@ -363,6 +494,14 @@ impl ITfKeyEventSink_Impl for BlackholeTextService_Impl {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> windows_core::Result<BOOL> {
+        // 英文模式下不处理任何按键。
+        {
+            let inner = self.inner.lock().unwrap();
+            if inner.mode_switch.is_english() {
+                return Ok(BOOL(0));
+            }
+        }
+
         let cached_event = {
             let mut inner = self.inner.lock().unwrap();
             inner.last_key_event.take().and_then(|(cw, cl, evt)| {
