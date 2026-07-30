@@ -26,11 +26,11 @@ fn main() {
     let svg_path = args
         .get(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| repo_root.join("assets/icons/blackhole.svg"));
+        .unwrap_or_else(|| repo_root.join("assets/icons/black-hole.svg"));
     let ico_path = args
         .get(2)
         .map(PathBuf::from)
-        .unwrap_or_else(|| repo_root.join("assets/icons/blackhole.ico"));
+        .unwrap_or_else(|| repo_root.join("assets/icons/black-hole.ico"));
 
     if let Err(e) = run(&svg_path, &ico_path) {
         eprintln!("[ERROR] {e}");

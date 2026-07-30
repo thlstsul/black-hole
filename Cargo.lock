@@ -369,13 +369,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
-name = "blackhole-daemon"
+name = "black-hole-daemon"
 version = "0.1.0"
 dependencies = [
- "blackhole-engine",
- "blackhole-platform",
- "blackhole-shared",
- "blackhole-ui",
+ "black-hole-engine",
+ "black-hole-platform",
+ "black-hole-shared",
+ "black-hole-ui",
  "clap",
  "ctrlc",
  "tracing",
@@ -385,10 +385,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "blackhole-engine"
+name = "black-hole-engine"
 version = "0.1.0"
 dependencies = [
- "blackhole-shared",
+ "black-hole-shared",
  "dirs",
  "pinyin",
  "rime-dict",
@@ -400,10 +400,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "blackhole-platform"
+name = "black-hole-platform"
 version = "0.1.0"
 dependencies = [
- "blackhole-shared",
+ "black-hole-shared",
  "pollster 1.0.1",
  "serde",
  "serde_json",
@@ -418,17 +418,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "blackhole-shared"
+name = "black-hole-shared"
 version = "0.1.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
-name = "blackhole-ui"
+name = "black-hole-ui"
 version = "0.1.0"
 dependencies = [
- "blackhole-shared",
+ "black-hole-shared",
  "directories",
  "eframe",
  "egui",

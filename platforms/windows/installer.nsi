@@ -1,5 +1,5 @@
 ; ============================================================================
-; Blackhole IME - NSIS 安装脚本（cargo-packager 自定义模板）
+; Black-Hole IME - NSIS 安装脚本（cargo-packager 自定义模板）
 ;
 ; 配合 Packager.toml 使用，扩展标准模板：
 ;   1. 安装后自动注册 IME DLL（regsvr32）
@@ -14,11 +14,11 @@ Unicode true
 ManifestDPIAware true
 
 ; --- 产品信息 ---
-!define PRODUCT_NAME     "BlackholeIME"
+!define PRODUCT_NAME     "BlackHoleIME"
 !define PRODUCT_VERSION  "0.1.0"
-!define PRODUCT_PUBLISHER "Blackhole IME Team"
-!define MAIN_EXE         "blackhole.exe"
-!define IME_DLL          "blackhole_platform.dll"
+!define PRODUCT_PUBLISHER "Black-Hole IME Team"
+!define MAIN_EXE         "black-hole.exe"
+!define IME_DLL          "black_hole_platform.dll"
 
 Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"
 OutFile "nsis-output.exe"

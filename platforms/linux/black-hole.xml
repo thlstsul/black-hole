@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<component>
+  <name>org.freedesktop.IBus.Black-Hole</name>
+  <description>Black-Hole IME</description>
+  <exec>/usr/local/bin/black-hole --ibus</exec>
+  <version>0.1.0</version>
+  <author>Black-Hole IME Team</author>
+  <license>MIT</license>
+  <homepage>https://github.com/black-hole/ime</homepage>
+  <textdomain>black-hole</textdomain>
+  <engines>
+    <engine>
+      <name>black-hole</name>
+      <language>zh</language>
+      <license>MIT</license>
+      <author>Black-Hole IME Team</author>
+      <icon>/usr/share/ibus-black-hole/icons/black-hole.svg</icon>
+      <layout>us</layout>
+      <longname>Black-Hole</longname>
+      <description>Black-Hole IME with Pinyin and Shuangpin support</description>
+      <rank>99</rank>
+      <symbol>CJ</symbol>
+    </engine>
+  </engines>
+</component>

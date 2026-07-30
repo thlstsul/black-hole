@@ -16,11 +16,11 @@
 
 ```
 crates/
-├── blackhole-shared/    # 共享数据类型：按键事件、候选词、UI 命令、设置
-├── blackhole-engine/    # 输入法引擎：拼音/双拼编码、词典、解码器、排序器
-├── blackhole-platform/  # 平台适配层：Windows TSF / Linux IBus
-├── blackhole-ui/        # UI 层：候选窗口、系统托盘、设置面板
-└── blackhole-daemon/    # 守护进程：组装各模块，协调引擎-平台-UI 线程通信
+├── black-hole-shared/    # 共享数据类型：按键事件、候选词、UI 命令、设置
+├── black-hole-engine/    # 输入法引擎：拼音/双拼编码、词典、解码器、排序器
+├── black-hole-platform/  # 平台适配层：Windows TSF / Linux IBus
+├── black-hole-ui/        # UI 层：候选窗口、系统托盘、设置面板
+└── black-hole-daemon/    # 守护进程：组装各模块，协调引擎-平台-UI 线程通信
 
 assets/
 ├── dicts/               # 词库文件（Rime 格式）
@@ -63,13 +63,13 @@ cargo install cargo-make --locked
 cargo make build-daemon build-platform
 
 # 或直接使用 cargo
-cargo build -p blackhole-daemon -p blackhole-platform
+cargo build -p black-hole-daemon -p black-hole-platform
 ```
 
 ### 发布构建
 
 ```bash
-cargo build --release -p blackhole-daemon -p blackhole-platform
+cargo build --release -p black-hole-daemon -p black-hole-platform
 ```
 
 ### 打包
@@ -87,31 +87,31 @@ cargo make clean
 ```
 
 打包产物输出到 `target/release/`：
-- Windows: `blackhole_0.1.0_x64-setup.exe`
-- Linux: `blackhole-ime_0.1.0_amd64.deb`, `blackhole-ime_0.1.0_amd64.AppImage`
+- Windows: `black-hole_0.1.0_x64-setup.exe`
+- Linux: `black-hole-ime_0.1.0_amd64.deb`, `black-hole-ime_0.1.0_amd64.AppImage`
 
-打包配置统一在 `crates/blackhole-daemon/Cargo.toml` 的 `[package.metadata.packager]` 中。
+打包配置统一在 `crates/black-hole-daemon/Cargo.toml` 的 `[package.metadata.packager]` 中。
 
 ## 安装
 
 ### Windows
 
-1. 运行安装包 `blackhole_0.1.0_x64-setup.exe`
+1. 运行安装包 `black-hole_0.1.0_x64-setup.exe`
 2. 以管理员身份安装，安装程序会自动注册 IME 组件
-3. 在系统输入法列表中选择 "Blackhole IME"
+3. 在系统输入法列表中选择 "Black-Hole IME"
 
 ### Linux
 
 ```bash
 # deb 包
-sudo dpkg -i blackhole-ime_0.1.0_amd64.deb
+sudo dpkg -i black-hole-ime_0.1.0_amd64.deb
 
 # 或 AppImage
-chmod +x blackhole-ime_0.1.0_amd64.AppImage
-./blackhole-ime_0.1.0_amd64.AppImage
+chmod +x black-hole-ime_0.1.0_amd64.AppImage
+./black-hole-ime_0.1.0_amd64.AppImage
 ```
 
-安装后重启 IBus (`ibus restart`)，在输入法列表中选择 "Blackhole"。
+安装后重启 IBus (`ibus restart`)，在输入法列表中选择 Black-Hole。
 
 ### 卸载
 
@@ -122,7 +122,7 @@ chmod +x blackhole-ime_0.1.0_amd64.AppImage
 
 **Linux**：
 ```bash
-sudo dpkg -r blackhole-ime
+sudo dpkg -r black-hole-ime
 ```
 
 ## 输入方案

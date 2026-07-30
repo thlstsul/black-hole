@@ -1,5 +1,5 @@
 # ===========================================================================
-# Blackhole IME - cargo-make 构建与打包任务
+# Black-Hole IME - cargo-make 构建与打包任务
 #
 # 用法:
 #   cargo make pack             # 自动检测平台并打包
@@ -14,7 +14,7 @@
 skip_core_tasks = true
 
 [env]
-PACKAGER_MANIFEST = "crates/blackhole-daemon/Cargo.toml"
+PACKAGER_MANIFEST = "crates/black-hole-daemon/Cargo.toml"
 
 # ===========================================================================
 # 图标生成
@@ -38,7 +38,7 @@ private = true
 category = "Build"
 description = "构建 daemon (release)"
 command = "cargo"
-args = ["build", "--release", "-p", "blackhole-daemon"]
+args = ["build", "--release", "-p", "black-hole-daemon"]
 
 [tasks.build-platform]
 workspace = false
@@ -46,7 +46,7 @@ private = true
 category = "Build"
 description = "构建 platform 库 (release)"
 command = "cargo"
-args = ["build", "--release", "-p", "blackhole-platform"]
+args = ["build", "--release", "-p", "black-hole-platform"]
 
 [tasks.build-all]
 workspace = false
@@ -76,10 +76,10 @@ script_extension = "ps1"
 script = '''
 Remove-Item -Recurse -Force target\packaging\staging -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path target\packaging\staging | Out-Null
-Copy-Item target\release\blackhole.exe -Destination target\packaging\staging\ -Force
-Write-Host "  [+] blackhole.exe"
-Copy-Item target\release\blackhole_platform.dll -Destination target\packaging\staging\ -Force
-Write-Host "  [+] blackhole_platform.dll"
+Copy-Item target\release\black-hole.exe -Destination target\packaging\staging\ -Force
+Write-Host "  [+] black-hole.exe"
+Copy-Item target\release\black-hole_platform.dll -Destination target\packaging\staging\ -Force
+Write-Host "  [+] black-hole_platform.dll"
 if (Test-Path assets\dicts) { Copy-Item assets\dicts -Destination target\packaging\staging\dicts -Recurse -Force; Write-Host "  [+] dicts/" } else { Write-Host "  [WARN] 未找到词库目录 assets\dicts" }
 Write-Host "[OK] staging: target\packaging\staging"
 '''
@@ -96,22 +96,22 @@ script = '''
 set -euo pipefail
 rm -rf target/packaging/staging
 mkdir -p target/packaging/staging
-cp target/release/blackhole target/packaging/staging/blackhole
-echo "  [+] blackhole"
+cp target/release/black-hole target/packaging/staging/black-hole
+echo "  [+] black-hole"
 if [ -d assets/dicts ]; then
     cp -r assets/dicts target/packaging/staging/dicts
     echo "  [+] dicts/"
 else
     echo "  [WARN] 未找到词库目录"
 fi
-if [ -f assets/icons/blackhole.svg ]; then
+if [ -f assets/icons/black-hole.svg ]; then
     mkdir -p target/packaging/staging/icons
-    cp assets/icons/blackhole.svg target/packaging/staging/icons/blackhole.svg
-    echo "  [+] icons/blackhole.svg"
+    cp assets/icons/black-hole.svg target/packaging/staging/icons/black-hole.svg
+    echo "  [+] icons/black-hole.svg"
 fi
-if [ -f platforms/linux/blackhole.xml ]; then
-    cp platforms/linux/blackhole.xml target/packaging/staging/blackhole.xml
-    echo "  [+] blackhole.xml"
+if [ -f platforms/linux/black-hole.xml ]; then
+    cp platforms/linux/black-hole.xml target/packaging/staging/black-hole.xml
+    echo "  [+] black-hole.xml"
 fi
 echo "[OK] staging: target/packaging/staging"
 '''

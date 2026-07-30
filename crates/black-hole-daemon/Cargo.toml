@@ -1,0 +1,52 @@
+[package]
+name = "black-hole-daemon"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "black-hole"
+path = "src/main.rs"
+
+
+[build-dependencies]
+winresource = "0.1"
+
+[package.metadata.packager]
+product-name = "BlackHoleIME"
+version = "0.1.0"
+identifier = "com.black-hole.ime"
+description = "Black-Hole IME - 跨平台中文输入法"
+publisher = "Black-Hole IME Team"
+copyright = "Copyright (c) 2026 Black-Hole IME Team"
+formats = ["nsis", "deb", "appimage"]
+icons = ["../../assets/icons/black-hole.ico", "../../assets/icons/black-hole.svg"]
+resources = ["../../assets/dicts/*"]
+
+[[package.metadata.packager.binaries]]
+path = "../../target/release/black-hole"
+main = true
+
+[package.metadata.packager.nsis]
+template = "../../platforms/windows/installer.nsi"
+compression = "lzma"
+installer_mode = "perMachine"
+languages = ["SimpChinese", "English"]
+display_language_selector = false
+
+[package.metadata.packager.deb]
+depends = ["ibus"]
+
+[package.metadata.packager.appimage]
+
+[dependencies]
+clap = { workspace = true }
+black-hole-engine = { workspace = true }
+black-hole-platform = { workspace = true }
+black-hole-shared = { workspace = true }
+black-hole-ui = { workspace = true }
+ctrlc = "3.4"
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
