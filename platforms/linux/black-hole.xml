@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8" ?>
 <component>
   <name>org.freedesktop.IBus.Black-Hole</name>
   <description>Black-Hole IME</description>
@@ -6,7 +6,7 @@
   <version>0.1.0</version>
   <author>Black-Hole IME Team</author>
   <license>MIT</license>
-  <homepage>https://github.com/black-hole/ime</homepage>
+  <homepage>https://gitee.com/thelostsoul/black-hole</homepage>
   <textdomain>black-hole</textdomain>
   <engines>
     <engine>
@@ -17,7 +17,8 @@
       <icon>/usr/share/ibus-black-hole/icons/black-hole.svg</icon>
       <layout>us</layout>
       <longname>Black-Hole</longname>
-      <description>Black-Hole IME with Pinyin and Shuangpin support</description>
+      <description
+            >Black-Hole IME with Pinyin and Shuangpin support</description>
       <rank>99</rank>
       <symbol>CJ</symbol>
     </engine>

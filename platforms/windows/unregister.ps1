@@ -1,10 +1,10 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Unregisters the blackhole TSF IME DLL from Windows.
+    Unregisters the black-hole TSF IME DLL from Windows.
 
 .DESCRIPTION
-    Unregisters the blackhole_platform.dll using regsvr32 /u.
+    Unregisters the black_hole_platform.dll using regsvr32 /u.
     This removes COM and CTF/TIP registry keys (including WOW6432Node).
     Must be run as Administrator.
 #>
@@ -23,14 +23,14 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $profile = if ($Release) { "release" } else { "debug" }
-$dllPath = Join-Path $repoRoot "target" $profile "blackhole_platform.dll"
+$dllPath = Join-Path $repoRoot "target" $profile "black_hole_platform.dll"
 
 if (-not (Test-Path $dllPath)) {
     Write-Error "DLL not found at $dllPath. Build the project first or specify -Release."
     exit 1
 }
 
-Write-Host "Unregistering blackhole IME DLL: $dllPath"
+Write-Host "Unregistering black-hole IME DLL: $dllPath"
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = "regsvr32"
 $psi.Arguments = "/u /s `"$dllPath`""
@@ -60,5 +60,5 @@ foreach ($key in $orphanedKeys) {
 }
 
 Write-Host "Unregistration successful."
-Write-Host "You may need to remove 'blackhole IME' manually from Settings > Time & language > Language & region > Keyboards if it is still listed."
+Write-Host "You may need to remove 'black-hole IME' manually from Settings > Time & language > Language & region > Keyboards if it is still listed."
 Write-Host "A restart of Explorer or your PC may be required for the change to take full effect."

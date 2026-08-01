@@ -1,10 +1,10 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Registers the blackhole TSF IME DLL so it appears in Windows Settings.
+    Registers the black-hole TSF IME DLL so it appears in Windows Settings.
 
 .DESCRIPTION
-    Builds the blackhole-platform crate as a cdylib (if needed) and registers
+    Builds the black-hole-platform crate as a cdylib (if needed) and registers
     the resulting DLL with regsvr32. Registration writes COM and CTF/TIP
     keys to the registry under HKEY_CLASSES_ROOT and HKEY_LOCAL_MACHINE.
     Must be run as Administrator.
@@ -26,7 +26,7 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $profile = if ($Release) { "release" } else { "debug" }
-$dllPath = Join-Path $repoRoot "target" $profile "blackhole_platform.dll"
+$dllPath = Join-Path $repoRoot "target" $profile "black_hole_platform.dll"
 
 # Build if missing or -Rebuild specified
 if ($Rebuild -or -not (Test-Path $dllPath)) {
@@ -36,7 +36,7 @@ if ($Rebuild -or -not (Test-Path $dllPath)) {
         Write-Host "DLL not found at $dllPath. Building now..."
     }
     Push-Location $repoRoot
-    $buildArgs = @("build", "-p", "blackhole-platform")
+    $buildArgs = @("build", "-p", "black-hole-platform")
     if ($Release) { $buildArgs += "--release" }
     & cargo @buildArgs
     Pop-Location
@@ -46,7 +46,7 @@ if ($Rebuild -or -not (Test-Path $dllPath)) {
     }
 }
 
-Write-Host "Registering blackhole IME DLL: $dllPath"
+Write-Host "Registering black-hole IME DLL: $dllPath"
 
 # Use non-silent mode first to capture any error dialog text
 $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -124,7 +124,7 @@ Write-Host "Next steps:"
 Write-Host "  1. Open Settings > Time & language > Language & region"
 Write-Host "  2. Click your language (e.g. 'Chinese (Simplified)') → 'Language options'"
 Write-Host "  3. Under 'Keyboards', click 'Add a keyboard'"
-Write-Host "  4. Look for 'blackhole IME' in the list"
+Write-Host "  4. Look for 'black-hole IME' in the list"
 Write-Host ""
 Write-Host "If it still does not appear:"
 Write-Host "  - Restart your PC (Windows 11 caches the input list)"
