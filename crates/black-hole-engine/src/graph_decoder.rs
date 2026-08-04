@@ -23,24 +23,17 @@ struct WordEdge {
     syllable_count: usize,
 }
 
-/// 维特比解码状态
+/// 维特比解码状态（回溯指针式）
+///
+/// 只保存最后一个词与父状态索引，不再逐边克隆整条 text/words，
+/// 整句在解码结束后沿回溯链重建。
 #[derive(Debug, Clone)]
 struct ViterbiState {
     score: f64,
-    text: String,
-    words: Vec<String>,
-}
-
-impl ViterbiState {
-    /// 将解码状态转换为 DecodeResult，去掉开头的 <s> 标记。
-    fn into_decode_result(self, penalty: f64, is_partial: bool) -> DecodeResult {
-        DecodeResult {
-            text: self.text,
-            score: self.score - penalty,
-            words: self.words.into_iter().skip(1).collect(),
-            is_partial,
-        }
-    }
+    /// 父状态位置 (音节位置, 该位置的状态索引)；起点（<s>）为 None
+    prev: Option<(usize, usize)>,
+    /// 到达本状态所用的词（即词边文本），回溯重建整句时使用
+    last_word: String,
 }
 
 /// 评分配置参数
@@ -198,8 +191,8 @@ impl<'a> GraphDecoder<'a> {
         let mut dp: Vec<Vec<ViterbiState>> = vec![Vec::new(); n + 1];
         dp[0].push(ViterbiState {
             score: 0.0,
-            text: String::new(),
-            words: vec!["<s>".to_string()],
+            prev: None,
+            last_word: "<s>".to_string(),
         });
 
         for i in 0..=n {
@@ -212,11 +205,17 @@ impl<'a> GraphDecoder<'a> {
                 continue;
             }
 
-            let states = dp[i].clone();
+            // 词边终点恒大于起点（音节边长度为正是前提），dp[i] 与目标槽位互不相交，
+            // 用 split_at_mut 同时拿到源状态与目标槽位，避免克隆整份状态列表。
+            let (before, after) = dp.split_at_mut(i + 1);
             for edge in &word_edges[i] {
-                for state in &states {
+                for (state_idx, state) in before[i].iter().enumerate() {
                     let new_score = self.calculate_edge_score(state, edge, i, n);
-                    self.extend_state(&mut dp[edge.end_pos], state, edge, new_score);
+                    after[edge.end_pos - i - 1].push(ViterbiState {
+                        score: new_score,
+                        prev: Some((i, state_idx)),
+                        last_word: edge.text.clone(),
+                    });
                 }
             }
         }
@@ -232,7 +231,7 @@ impl<'a> GraphDecoder<'a> {
         start_pos: usize,
         total_len: usize,
     ) -> f64 {
-        let last_word = state.words.last().unwrap();
+        let last_word = &state.last_word;
         let lm_score = if let Some(lm) = self.lm {
             lm.score_transition(last_word, &edge.text, edge.syllable_count)
         } else {
@@ -255,27 +254,30 @@ impl<'a> GraphDecoder<'a> {
         state.score + lm_score + base_score + word_preference + coverage_bonus + user_bonus
     }
 
-    /// 将新状态加入 DP 表对应位置。
-    fn extend_state(
+    /// 沿回溯指针重建 (完整文本, 分词列表)，words[0] 为 <s> 哨兵。
+    fn rebuild_path(
         &self,
-        dp_entry: &mut Vec<ViterbiState>,
-        state: &ViterbiState,
-        edge: &WordEdge,
-        new_score: f64,
-    ) {
-        let mut new_text = String::with_capacity(state.text.len() + edge.text.len());
-        new_text.push_str(&state.text);
-        new_text.push_str(&edge.text);
-
-        let mut new_words = Vec::with_capacity(state.words.len() + 1);
-        new_words.clone_from(&state.words);
-        new_words.push(edge.text.clone());
-
-        dp_entry.push(ViterbiState {
-            score: new_score,
-            text: new_text,
-            words: new_words,
-        });
+        dp: &[Vec<ViterbiState>],
+        pos: usize,
+        idx: usize,
+    ) -> (String, Vec<String>) {
+        let mut words_rev = Vec::new();
+        let (mut pos, mut idx) = (pos, idx);
+        loop {
+            let st = &dp[pos][idx];
+            words_rev.push(st.last_word.clone());
+            match st.prev {
+                Some((p, k)) => {
+                    pos = p;
+                    idx = k;
+                }
+                None => break,
+            }
+        }
+        words_rev.reverse();
+        let text = words_rev[1..].concat();
+        let words = words_rev[1..].to_vec();
+        (text, words)
     }
 
     /// 收集完整覆盖到音节末尾的结果。
@@ -286,8 +288,14 @@ impl<'a> GraphDecoder<'a> {
     ) -> Vec<DecodeResult> {
         let mut results = Vec::new();
         if let Some(final_states) = dp.get(n) {
-            for state in final_states {
-                results.push(state.clone().into_decode_result(0.0, false));
+            for (idx, state) in final_states.iter().enumerate() {
+                let (text, words) = self.rebuild_path(dp, n, idx);
+                results.push(DecodeResult {
+                    text,
+                    score: state.score,
+                    words,
+                    is_partial: false,
+                });
             }
         }
         tracing::debug!(
@@ -321,9 +329,10 @@ impl<'a> GraphDecoder<'a> {
             let uncovered_penalty = (n - end) as f64 * self.config.uncovered_penalty_factor;
             let mut hybrid_results = Vec::new();
 
-            for state in states.iter().take(self.beam_width) {
+            for (state_idx, state) in states.iter().enumerate().take(self.beam_width) {
+                let state_text = self.rebuild_path(dp, end, state_idx).0;
                 for (suffix_text, suffix_score) in &fallback_suffixes {
-                    let text = state.text.clone() + suffix_text;
+                    let text = state_text.clone() + suffix_text;
                     let score =
                         state.score + suffix_score - self.config.hybrid_penalty - uncovered_penalty;
                     hybrid_results.push(DecodeResult {
@@ -354,10 +363,13 @@ impl<'a> GraphDecoder<'a> {
             if let Some(states) = dp.get(end)
                 && let Some(best) = states.first()
             {
-                return vec![
-                    best.clone()
-                        .into_decode_result(self.config.final_fallback_penalty, true),
-                ];
+                let (text, words) = self.rebuild_path(dp, end, 0);
+                return vec![DecodeResult {
+                    text,
+                    score: best.score - self.config.final_fallback_penalty,
+                    words,
+                    is_partial: true,
+                }];
             }
         }
         Vec::new()

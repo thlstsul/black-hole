@@ -5,8 +5,8 @@ members = [
     "crates/black-hole-platform",
     "crates/black-hole-ui",
     "crates/black-hole-daemon",
-        "crates/icon-gen",
-    ]
+    "crates/icon-gen",
+]
 resolver = "3"
 
 [workspace.package]

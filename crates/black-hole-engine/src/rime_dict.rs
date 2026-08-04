@@ -26,11 +26,16 @@ pub use ::rime_dict::RawEntry;
 const ALPHABET: &str = "abcdefghijklmnopqrstuvwxyz";
 /// 前缀查询最终结果上限
 const PREFIX_RESULT_LIMIT: usize = 100;
+/// 前缀查询单次最多枚举的切分路径数（防长句输入组合爆炸）
+const MAX_SEGMENTATION_PATHS: usize = 32;
 /// 前缀查询缓存条目：`(text, score)` 列表
 type PrefixEntries = Vec<(String, i64)>;
 
 /// 首音节前缀缓存中每个音节的词条上限
 const PREFIX1_CACHE_LIMIT: usize = 100;
+
+/// 精确查询缓存上限，超出后整体清空（防御性，防编码前缀组合无限增长）
+const LOOKUP_CACHE_LIMIT: usize = 1024;
 
 /// `prefix_lookup` 性能统计（用于定位卡顿：枚举路径数 vs 实际表查询次数）
 #[derive(Default)]
@@ -67,6 +72,9 @@ pub struct RimeDict {
     /// 前缀查询缓存（音节 id 序列 → `(text, score)` 列表），惰性填充。
     /// 单音节前缀缓存 top N；多音节前缀结果天然较小，全量缓存。
     prefix_cache: Mutex<HashMap<Vec<SyllableId>, PrefixEntries>>,
+    /// 精确查询缓存（编码字符串 → 候选）。词典加载后只读，结果恒定；
+    /// 输入逐键增长时相邻按键共享前缀编码，命中率高。
+    lookup_cache: Mutex<HashMap<String, Vec<Candidate>>>,
     /// 语言模型（惰性构建，共享实例只建一次）
     lm: OnceLock<LanguageModel>,
 }
@@ -100,6 +108,7 @@ impl RimeDict {
             syllabary,
             syllable_to_id,
             prefix_cache: Mutex::new(HashMap::new()),
+            lookup_cache: Mutex::new(HashMap::new()),
             lm: OnceLock::new(),
         })
     }
@@ -330,16 +339,23 @@ impl RimeDict {
     }
 
     /// 音节字符串前缀扩展：`"zhon" → [zhong]`，`"w" → [wa, wai, ..., wu]`
+    ///
+    /// syllabary 有序（编译期 BTreeSet / 加载期音节表均排序），
+    /// 用二分定位前缀区间起点，再向后扫描到第一个不匹配项，
+    /// 从 O(音节总数) 降到 O(log N + 命中数)。
     fn expand_syllable_prefix(&self, prefix: &str) -> Vec<SyllableId> {
         if prefix.is_empty() {
             return Vec::new();
         }
-        self.syllabary
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.starts_with(prefix))
-            .map(|(i, _)| i as SyllableId)
-            .collect()
+        let lo = self.syllabary.partition_point(|s| s.as_str() < prefix);
+        let mut out = Vec::new();
+        for (i, s) in self.syllabary[lo..].iter().enumerate() {
+            if !s.starts_with(prefix) {
+                break;
+            }
+            out.push((lo + i) as SyllableId);
+        }
+        out
     }
 
     /// 对输入做全音节切分，返回所有 `(音节 id 路径, 已消费字节数)`。
@@ -351,12 +367,19 @@ impl RimeDict {
         };
         let bytes = input.as_bytes();
         let mut out: Vec<(Vec<SyllableId>, usize)> = Vec::new();
-        let mut seen: HashSet<(Vec<SyllableId>, usize)> = HashSet::new();
+        // 中间节点也去重：不同切分路径可能到达相同的 (pos, ids)，
+        // 若不去重会重复展开同一子树，枚举量随音节数组合爆炸。
+        let mut seen: HashSet<(usize, Vec<SyllableId>)> = HashSet::new();
         let mut stack: Vec<(usize, Vec<SyllableId>)> = vec![(0, Vec::new())];
+        seen.insert((0, Vec::new()));
 
         while let Some((pos, ids)) = stack.pop() {
+            if out.len() >= MAX_SEGMENTATION_PATHS {
+                // 路径上限：前缀查询只需 top-N 候选，截断枚举防止长句组合爆炸
+                break;
+            }
             if pos >= bytes.len() {
-                if !ids.is_empty() && seen.insert((ids.clone(), pos)) {
+                if !ids.is_empty() {
                     out.push((ids, pos));
                 }
                 continue;
@@ -364,9 +387,7 @@ impl RimeDict {
             let matches = prism.common_prefix_search_bytes(&bytes[pos..]);
             if matches.is_empty() {
                 // 死端：记录部分路径（含空路径，表示从头即不可切分）
-                if seen.insert((ids.clone(), pos)) {
-                    out.push((ids, pos));
-                }
+                out.push((ids, pos));
                 continue;
             }
             for m in matches {
@@ -374,7 +395,10 @@ impl RimeDict {
                     for s in spellings.flatten() {
                         let mut next_ids = ids.clone();
                         next_ids.push(s.syllable_id);
-                        stack.push((pos + m.length, next_ids));
+                        let key = (pos + m.length, next_ids.clone());
+                        if seen.insert(key) {
+                            stack.push((pos + m.length, next_ids));
+                        }
                     }
                 }
             }
@@ -438,22 +462,19 @@ impl RimeDict {
             })
             .collect();
         out.sort_by_key(|e| std::cmp::Reverse(e.1));
+        // 每路只保留 top N：最终 top-100 中的词条在其所在路径内的排名
+        // 必然不高于全局排名，按路径截断不会丢失最终 top-100
+        // （后续跨路径去重会取每个文本的最高分）。
+        out.truncate(PREFIX_RESULT_LIMIT);
         out
     }
-}
 
-impl Dictionary for RimeDict {
-    fn lookup(&self, code: &str) -> Vec<Candidate> {
-        let Some(ids) = self.code_to_ids(code) else {
-            return Vec::new();
-        };
-        if ids.is_empty() {
-            return Vec::new();
-        }
+    /// 精确查询（不缓存）：编码已拆分为音节 id
+    fn lookup_uncached(&self, ids: &[SyllableId]) -> Vec<Candidate> {
         let Ok(table) = self.table() else {
             return Vec::new();
         };
-        let Ok(accessor) = table.query_phrases(&ids) else {
+        let Ok(accessor) = table.query_phrases(ids) else {
             return Vec::new();
         };
 
@@ -477,6 +498,30 @@ impl Dictionary for RimeDict {
         }
         out.sort_by_key(|c| std::cmp::Reverse(c.score));
         out
+    }
+}
+
+impl Dictionary for RimeDict {
+    fn lookup(&self, code: &str) -> Vec<Candidate> {
+        // 精确查询结果只取决于编码与只读词典，按编码字符串缓存；
+        // 输入逐键增长时共享前缀命中率高，避免重复查表。
+        {
+            let cache = self.lookup_cache.lock().unwrap();
+            if let Some(cached) = cache.get(code) {
+                return cached.clone();
+            }
+        }
+        let candidates = match self.code_to_ids(code) {
+            Some(ids) if !ids.is_empty() => self.lookup_uncached(&ids),
+            _ => Vec::new(),
+        };
+        let mut cache = self.lookup_cache.lock().unwrap();
+        // 防御性清理：防止不同编码前缀组合随输入累积无限增长
+        if cache.len() > LOOKUP_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(code.to_string(), candidates.clone());
+        candidates
     }
 
     fn prefix_lookup(&self, code: &str) -> Vec<Candidate> {

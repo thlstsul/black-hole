@@ -893,11 +893,7 @@ mod tests {
                 panic!("导航 {} 应处于 Composing 状态", key);
             };
             let texts: Vec<&str> = candidates.iter().map(|c| c.text.as_str()).collect();
-            assert_eq!(
-                initial_texts, texts,
-                "导航 {} 后候选顺序发生变动",
-                key
-            );
+            assert_eq!(initial_texts, texts, "导航 {} 后候选顺序发生变动", key);
         }
     }
 }
