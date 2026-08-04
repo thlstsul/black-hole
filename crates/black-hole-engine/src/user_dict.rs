@@ -6,8 +6,14 @@
 
 use black_hole_shared::{Candidate, SchemeId};
 use rime_dict::UserDb;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
+
+/// 上屏落盘的防抖间隔：间隔内多次上屏只合并写一次全量文件，
+/// 避免每次上屏在 UI 线程同步写盘（写盘前可调用 `flush` 强制落盘）
+const SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// 全局用户词典实例
 static GLOBAL_USER_DICT: OnceLock<Arc<Mutex<UserDictionary>>> = OnceLock::new();
@@ -46,6 +52,11 @@ pub struct UserDictionary {
     shuangpin: UserDb,
     /// 持久化目录；`None` 表示内存模式（测试用，不落盘）
     dir: Option<PathBuf>,
+    /// 上次落盘时间（防抖用）
+    last_save: Option<Instant>,
+    /// 方案 → 编码 → 用户候选索引（UserDb 内存态的镜像，
+    /// 供 `lookup` 免全表扫描）
+    index: HashMap<SchemeId, HashMap<String, Vec<Candidate>>>,
 }
 
 impl UserDictionary {
@@ -57,6 +68,8 @@ impl UserDictionary {
             pinyin: UserDb::new(),
             shuangpin: UserDb::new(),
             dir: Some(dir),
+            last_save: None,
+            index: HashMap::new(),
         };
         dict.load(SchemeId::Pinyin);
         dict.load(SchemeId::Shuangpin);
@@ -69,6 +82,8 @@ impl UserDictionary {
             pinyin: UserDb::new(),
             shuangpin: UserDb::new(),
             dir: None,
+            last_save: None,
+            index: HashMap::new(),
         }
     }
 
@@ -96,6 +111,21 @@ impl UserDictionary {
         if let Err(e) = self.db_mut(scheme).import_txt(&txt) {
             tracing::warn!("Failed to parse user dict {:?}: {}", path, e);
         }
+        // 重建按编码索引，供 lookup 免全表扫描
+        self.rebuild_index(scheme);
+    }
+
+    /// 重建指定方案的编码索引（从 UserDb 全量镜像一次）
+    fn rebuild_index(&mut self, scheme: SchemeId) {
+        let mut by_code: HashMap<String, Vec<Candidate>> = HashMap::new();
+        for e in self.db(scheme).iter() {
+            by_code.entry(e.code).or_default().push(Candidate {
+                text: e.text,
+                comment: Some("user".to_string()),
+                score: e.count as i64,
+            });
+        }
+        self.index.insert(scheme, by_code);
     }
 
     /// 将指定方案的用户词频写回磁盘（写穿透）
@@ -107,24 +137,52 @@ impl UserDictionary {
         }
     }
 
-    /// 记录一次上屏事件，词频 +1 并落盘
+    /// 记录一次上屏事件，词频 +1；落盘按防抖间隔合并写
     pub fn record_commit(&mut self, scheme: SchemeId, code: &str, text: &str) {
         self.db_mut(scheme).update(code, text);
-        self.save(scheme);
+        // 同步更新索引，保持 lookup 免全表扫描
+        let entry = self
+            .index
+            .entry(scheme)
+            .or_default()
+            .entry(code.to_string())
+            .or_default();
+        if let Some(c) = entry.iter_mut().find(|c| c.text == text) {
+            c.score += 1;
+        } else {
+            entry.push(Candidate {
+                text: text.to_string(),
+                comment: Some("user".to_string()),
+                score: 1,
+            });
+        }
+        // 防抖：高频上屏时不每次都同步写全量文件，间隔到期才落盘
+        let now = Instant::now();
+        if self
+            .last_save
+            .is_none_or(|t| now.duration_since(t) >= SAVE_INTERVAL)
+        {
+            self.save(scheme);
+            self.last_save = Some(now);
+        }
+    }
+
+    /// 立即落盘（进程退出 / 切方案前调用，确保防抖期间的修改不丢失）
+    pub fn flush(&self) {
+        if self.dir.is_some() {
+            self.save(SchemeId::Pinyin);
+            self.save(SchemeId::Shuangpin);
+        }
     }
 
     /// 获取某个编码下的用户候选词（按词频降序）
     pub fn lookup(&self, scheme: SchemeId, code: &str) -> Vec<Candidate> {
         let mut candidates: Vec<Candidate> = self
-            .db(scheme)
-            .iter()
-            .filter(|e| e.code == code)
-            .map(|e| Candidate {
-                text: e.text,
-                comment: Some("user".to_string()),
-                score: e.count as i64,
-            })
-            .collect();
+            .index
+            .get(&scheme)
+            .and_then(|m| m.get(code))
+            .cloned()
+            .unwrap_or_default();
         candidates.sort_by(|a, b| b.score.cmp(&a.score).then(a.text.cmp(&b.text)));
         candidates
     }
@@ -170,6 +228,8 @@ mod tests {
             dict.record_commit(SchemeId::Pinyin, "ni hao", "你好");
             dict.record_commit(SchemeId::Pinyin, "ni hao", "你好");
             dict.record_commit(SchemeId::Shuangpin, "wo", "我");
+            // 落盘已改为防抖合并写，校验前先强制写盘
+            dict.flush();
         }
 
         // 重新打开后词频保留，且与 librime `.userdb.txt` 格式互通

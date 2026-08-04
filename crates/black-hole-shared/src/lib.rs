@@ -43,7 +43,7 @@ pub struct InputContext {
 }
 
 /// 输入方案标识
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SchemeId {
     Pinyin,
     Shuangpin,

@@ -14,8 +14,11 @@ const MAX_UNIGRAM_ENTRIES: usize = 20000;
 pub struct LanguageModel {
     /// 词语 -> log 概率
     unigram: HashMap<String, f64>,
-    /// (前词, 当前词) -> log 条件概率 P(当前词|前词)
-    bigram: HashMap<(String, String), f64>,
+    /// 前词 -> (当前词 -> log 条件概率 P(当前词|前词))
+    ///
+    /// 两级嵌套结构使 `score_bigram(prev, curr)` 可通过 `&str` 借入查询，
+    /// 避免原 `(String, String)` 键每次查询都要做两次堆分配。
+    bigram: HashMap<String, HashMap<String, f64>>,
     /// 未观测 bigram 的回退权重（乘到 unigram 上）
     backoff_weight: f64,
     /// 每个字节的额外 log 奖励（鼓励长词）
@@ -83,7 +86,10 @@ impl LanguageModel {
     /// pairs: (prev_word, curr_word, log_probability)
     pub fn load_bigram_pairs(&mut self, pairs: &[(String, String, f64)]) {
         for (prev, curr, log_prob) in pairs {
-            self.bigram.insert((prev.clone(), curr.clone()), *log_prob);
+            self.bigram
+                .entry(prev.clone())
+                .or_default()
+                .insert(curr.clone(), *log_prob);
         }
     }
 
@@ -115,7 +121,7 @@ impl LanguageModel {
                 && prev_count > 0
             {
                 let prob = count as f64 / prev_count as f64;
-                self.bigram.insert((prev, curr), prob.ln());
+                self.bigram.entry(prev).or_default().insert(curr, prob.ln());
             }
         }
     }
@@ -130,9 +136,7 @@ impl LanguageModel {
 
     /// 获取 Bigram 转移 log 概率 P(curr | prev)
     pub fn score_bigram(&self, prev: &str, curr: &str) -> Option<f64> {
-        self.bigram
-            .get(&(prev.to_string(), curr.to_string()))
-            .copied()
+        self.bigram.get(prev).and_then(|m| m.get(curr)).copied()
     }
 
     /// 综合转移评分：融合 Bigram / Unigram 回退 + 长词偏好
