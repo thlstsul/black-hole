@@ -28,6 +28,7 @@ pub mod auto_register;
 pub(crate) mod caret;
 pub(crate) mod commit;
 pub(crate) mod dll;
+pub(crate) mod hook;
 pub(crate) mod key_event;
 pub(crate) mod langbar;
 pub(crate) mod registry;

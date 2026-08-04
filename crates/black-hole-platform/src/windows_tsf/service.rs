@@ -3,10 +3,9 @@ use super::{ServiceInner, send_ui_command_inner};
 use black_hole_shared::{KeyState, UiCommand};
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{E_UNEXPECTED, LPARAM, WPARAM};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::System::Variant::{VARIANT, VT_I4};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL, VK_RCONTROL,
-};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VIRTUAL_KEY, VK_CONTROL};
 use windows::Win32::UI::TextServices::{
     GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
     ITfCompartmentMgr, ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext,
@@ -249,6 +248,13 @@ impl BlackHoleTextService {
     }
 }
 
+/// 语言栏菜单入口触发的模式切换收尾：与快捷键路径共用同一套逻辑
+/// （取消 composition、重置引擎、同步 compartment、刷新语言栏图标）。
+pub(crate) fn apply_input_mode_toggle(inner: &Arc<Mutex<ServiceInner>>, english: bool) {
+    let svc = BlackHoleTextService::new_for_sink(inner.clone());
+    svc.on_input_mode_toggled(english);
+}
+
 /// 构造 VT_I4 类型的 VARIANT（windows crate 的 Win32 VARIANT 未提供 From<i32>）
 fn variant_i32(v: i32) -> VARIANT {
     use std::mem::ManuallyDrop;
@@ -265,11 +271,6 @@ fn variant_i32(v: i32) -> VARIANT {
             }),
         },
     }
-}
-
-/// 判断虚拟键是否为 Ctrl（含左右键）。
-fn is_ctrl_key(vk: VIRTUAL_KEY) -> bool {
-    vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +327,10 @@ impl ITfTextInputProcessor_Impl for BlackHoleTextService_Impl {
 
         self.connect_ipc()?;
 
+        // 注册全局键盘钩子（Ctrl 切换用）：Chrome 等应用不把修饰键事件转发给
+        // TSF，需通过 WH_KEYBOARD_LL 直接监听物理按键。
+        super::hook::register_service(unsafe { GetCurrentThreadId() }, self.inner.clone());
+
         // 连接成功后，向 daemon 查询当前设置，确保托盘菜单勾选正确。
         self.sync_settings_from_daemon();
 
@@ -372,6 +377,7 @@ impl ITfTextInputProcessor_Impl for BlackHoleTextService_Impl {
 
         self.send_reset();
         self.disconnect_ipc();
+        super::hook::unregister_service(unsafe { GetCurrentThreadId() });
         let mut inner = self.inner.lock().unwrap();
         inner.context = None;
         inner.thread_mgr = None;
@@ -394,6 +400,13 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
             let mut inner = self.inner.lock().unwrap();
             inner.last_caret_pos = None;
         }
+        // 记录 TSF 输入焦点：WebView2 等多进程应用的 IME 承载进程与宿主窗口
+        // 进程不同，GetForegroundWindow 不可靠，钩子依赖此处的焦点状态判定前台。
+        if fforeground.as_bool() {
+            super::hook::set_foreground_thread(unsafe { GetCurrentThreadId() });
+        } else {
+            super::hook::clear_foreground_thread();
+        }
         if !fforeground.as_bool() {
             self.send_reset();
         }
@@ -407,21 +420,11 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         lparam: LPARAM,
     ) -> windows_core::Result<BOOL> {
         let vk = VIRTUAL_KEY(wparam.0 as u16);
-
-        // Ctrl 键：标记切换候选，松开时在 OnTestKeyUp 中切换中英文模式。
-        // 永远不拦截 Ctrl 本身，保证 Ctrl+C 等组合键正常工作。
-        if is_ctrl_key(vk) {
-            let mut inner = self.inner.lock().unwrap();
-            inner.mode_switch.ctrl_pressed();
-            inner.last_key_event = None;
-            return Ok(BOOL(0));
-        }
-
-        // 按住 Ctrl 期间按下其他键（如 Ctrl+C、Ctrl+Shift），取消切换候选。
-        if unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0 {
-            let mut inner = self.inner.lock().unwrap();
-            inner.mode_switch.other_key_pressed(true);
-        }
+        tracing::debug!(
+            "OnTestKeyDown: vk=0x{:04X} ctrl_held={}",
+            vk.0,
+            unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0
+        );
 
         // 英文模式下不拦截任何按键。
         {
@@ -472,19 +475,13 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         wparam: WPARAM,
         _lparam: LPARAM,
     ) -> windows_core::Result<BOOL> {
-        // Ctrl 松开时切换中英文模式。切换逻辑放在 OnTestKeyUp 而非 OnKeyUp：
-        // 部分应用（如控制台宿主）只在 TestKeyUp 返回 TRUE 时才回调 OnKeyUp，
-        // 而 OnTestKeyUp 对每次真实松开都会被调用且仅一次。
+        // Ctrl 切换已由全局键盘钩子（hook.rs）统一处理，这里不再处理按键松开。
         let vk = VIRTUAL_KEY(wparam.0 as u16);
-        if is_ctrl_key(vk) {
-            let toggled = {
-                let mut inner = self.inner.lock().unwrap();
-                inner.mode_switch.ctrl_released()
-            };
-            if let Some(english) = toggled {
-                self.on_input_mode_toggled(english);
-            }
-        }
+        tracing::debug!(
+            "OnTestKeyUp: vk=0x{:04X} ctrl_held={}",
+            vk.0,
+            unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0
+        );
         Ok(BOOL(0))
     }
 

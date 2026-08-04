@@ -9,7 +9,7 @@ use super::ServiceInner;
 use black_hole_shared::{SchemeId, Theme, UiCommand};
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{
-    COLORREF, E_FAIL, E_UNEXPECTED, FreeLibrary, HMODULE, POINT, RECT, TRUE,
+    COLORREF, E_FAIL, E_UNEXPECTED, FreeLibrary, HMODULE, LPARAM, POINT, RECT, TRUE, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateCompatibleDC, CreateDIBSection,
@@ -30,9 +30,10 @@ use windows::Win32::UI::TextServices::{
     TF_LBMENUF_SEPARATOR, TF_LBMENUF_SUBMENU, TfLBIClick,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyMenu, GetForegroundWindow, HICON,
-    ICONINFO, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow,
+    HICON, ICONINFO, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, PostMessageW,
+    SetForegroundWindow, TPM_LEFTBUTTON, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu,
+    WINDOW_EX_STYLE, WM_NULL, WS_POPUP,
 };
 use windows_core::{BOOL, BSTR, GUID, Interface, PCSTR, PCWSTR, Ref, implement, w};
 
@@ -47,6 +48,7 @@ const MENU_ID_LIGHT: u32 = 4;
 const MENU_ID_DARK: u32 = 5;
 const MENU_ID_SYSTEM: u32 = 6;
 const MENU_ID_EXIT: u32 = 7;
+const MENU_ID_ENGLISH: u32 = 8;
 
 // ---------------------------------------------------------------------------
 // 菜单暗色主题支持
@@ -192,6 +194,19 @@ impl BlackHoleLangBarItem {
         inner.mode_switch.is_english()
     }
 
+    /// 通过托盘菜单切换中英文模式（不依赖 Ctrl 键事件，
+    /// Chrome 等应用不把单独修饰键转发给 TSF，因此必须提供显式入口）。
+    fn toggle_input_mode(&self) {
+        let toggled = {
+            let mut inner = self.inner.lock().unwrap();
+            let next = !inner.mode_switch.is_english();
+            inner.mode_switch.set_english(next)
+        };
+        if let Some(english) = toggled {
+            super::service::apply_input_mode_toggle(&self.inner, english);
+        }
+    }
+
     fn set_scheme(&self, scheme: SchemeId) {
         let sink = {
             let mut inner = self.inner.lock().unwrap();
@@ -231,6 +246,20 @@ impl BlackHoleLangBarItem {
             };
 
             let _ = AppendMenuW(root, MF_STRING, MENU_ID_SETTINGS as usize, w!("设置"));
+
+            // 中英模式切换：Chrome 等应用不把单独的 Ctrl 按键事件转发给 TSF
+            // 键事件接收器，Ctrl 快捷切换在 Chrome 下失效，因此提供显式菜单入口。
+            let english_label: Vec<u16> = if self.is_english_mode() {
+                "切换到中文模式".encode_utf16().chain(Some(0)).collect()
+            } else {
+                "切换到英文模式".encode_utf16().chain(Some(0)).collect()
+            };
+            let _ = AppendMenuW(
+                root,
+                MF_STRING,
+                MENU_ID_ENGLISH as usize,
+                PCWSTR(english_label.as_ptr()),
+            );
             let _ = AppendMenuW(root, MF_SEPARATOR, 0, PCWSTR::null());
 
             // 输入方案子菜单
@@ -314,7 +343,31 @@ impl BlackHoleLangBarItem {
             let _ = AppendMenuW(root, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(root, MF_STRING, MENU_ID_EXIT as usize, w!("退出"));
 
-            let hwnd = GetForegroundWindow();
+            // 不使用 GetForegroundWindow() 作为菜单宿主：点击任务栏输入指示器时
+            // 前台窗口可能属于 shell（其它进程/线程），TrackPopupMenu 要求宿主窗口
+            // 属于调用线程且为前台窗口或其子窗口，否则菜单无法弹出（Chrome 常见）。
+            // 因此创建当前线程所有的隐藏窗口作为菜单宿主。
+            let host = match CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                PCWSTR::null(),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                None,
+                None,
+            ) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!("Failed to create menu host window: {}", e);
+                    let _ = DestroyMenu(root);
+                    return;
+                }
+            };
 
             // 设置进程级菜单主题偏好，菜单关闭后自动恢复。
             let mode = preferred_app_mode_for_theme(theme);
@@ -323,16 +376,22 @@ impl BlackHoleLangBarItem {
                 tracing::warn!("Failed to set preferred app mode for menu theme {}", mode);
             }
 
+            // 经典 workaround：TrackPopupMenu 要求宿主为前台窗口或其子窗口，
+            // 先把宿主置为前台，菜单关闭后发 WM_NULL 让原前台窗口恢复。
+            let _ = SetForegroundWindow(host);
+
             let cmd = TrackPopupMenu(
                 root,
-                TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+                TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTBUTTON,
                 pt.x,
                 pt.y,
                 None,
-                hwnd,
+                host,
                 None,
             );
 
+            let _ = PostMessageW(Some(host), WM_NULL, WPARAM(0), LPARAM(0));
+            let _ = DestroyWindow(host);
             let _ = DestroyMenu(root);
 
             let cmd_id = cmd.0 as u32;
@@ -344,6 +403,7 @@ impl BlackHoleLangBarItem {
 
             match cmd_id {
                 MENU_ID_SETTINGS => self.send_ui_command(UiCommand::ShowSettings),
+                MENU_ID_ENGLISH => self.toggle_input_mode(),
                 MENU_ID_PINYIN => {
                     self.set_scheme(SchemeId::Pinyin);
                     self.send_ui_command(UiCommand::SwitchScheme(SchemeId::Pinyin));
@@ -428,6 +488,18 @@ impl ITfLangBarItemButton_Impl for BlackHoleLangBarItem_Impl {
         let menu = pmenu.to_owned().ok_or(E_UNEXPECTED)?;
 
         add_menu_item(&menu, MENU_ID_SETTINGS, 0, "设置")?;
+        // 中英模式切换：Chrome 等应用不把单独的 Ctrl 按键事件转发给 TSF，
+        // Ctrl 快捷切换在 Chrome 下失效，因此提供显式菜单入口。
+        add_menu_item(
+            &menu,
+            MENU_ID_ENGLISH,
+            0,
+            if self.is_english_mode() {
+                "切换到中文模式"
+            } else {
+                "切换到英文模式"
+            },
+        )?;
         add_menu_separator(&menu)?;
 
         let scheme_menu = add_submenu(&menu, 0, "输入方案")?;
@@ -496,6 +568,7 @@ impl ITfLangBarItemButton_Impl for BlackHoleLangBarItem_Impl {
         tracing::debug!("LangBarItem::OnMenuSelect called: wid={}", wid);
         match wid {
             MENU_ID_SETTINGS => self.send_ui_command(UiCommand::ShowSettings),
+            MENU_ID_ENGLISH => self.toggle_input_mode(),
             MENU_ID_PINYIN => {
                 self.set_scheme(SchemeId::Pinyin);
                 self.send_ui_command(UiCommand::SwitchScheme(SchemeId::Pinyin));
