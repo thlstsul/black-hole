@@ -392,6 +392,7 @@ dependencies = [
  "dirs",
  "pinyin",
  "rime-dict",
+ "self_cell",
  "serde",
  "tempfile",
  "thiserror 2.0.19",

@@ -1,5 +1,6 @@
 use crate::{Codec, CodecState, SyllableGraph};
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::OnceLock;
 
 /// 拼音音节切分器
@@ -211,17 +212,41 @@ fn greedy_segment(input: &str, valid_syllables: &HashSet<String>) -> (Vec<String
     (result, remaining.to_string())
 }
 
+/// 共享尾部的切分路径节点：路径用单向链表表示，扩展一个音节只分配一个新节点，
+/// 尾部复用已有路径，避免对整条路径做深拷贝（消除 dp 表的 O(路径长度) 克隆）。
+struct SegPathNode {
+    syllable: String,
+    rest: Option<Rc<SegPathNode>>,
+}
+
+/// 切分路径：`None` 表示空路径（基础情况）
+type SegPath = Option<Rc<SegPathNode>>;
+
+/// 将链表路径物化为字符串列表（头节点即路径首音节）
+fn materialize_path(path: &SegPath) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = path;
+    while let Some(node) = cur {
+        out.push(node.syllable.clone());
+        cur = &node.rest;
+    }
+    out
+}
+
 /// 使用动态规划计算所有可能的切分结果
 ///
 /// 对给定输入字符串，从后往前做 DP，返回从位置 0 开始的所有完整切分。
+/// 路径使用共享尾部链表存储：每次扩展只做 O(1) 的新节点分配，
+/// 整体开销从 O(n²×max)（每次克隆整条路径）降为 O(n×6×max)，
+/// 长输入逐键重建不再随长度二次增长。
 fn dp_segment(
     input: &str,
     valid_syllables: &HashSet<String>,
     max_segmentations: usize,
 ) -> Vec<Vec<String>> {
     let len = input.len();
-    let mut dp: Vec<Vec<Vec<String>>> = vec![Vec::new(); len + 1];
-    dp[len] = vec![vec![]]; // 基础情况：空字符串有一种切分方式
+    let mut dp: Vec<Vec<SegPath>> = vec![Vec::new(); len + 1];
+    dp[len] = vec![None]; // 基础情况：空字符串有一种切分方式
 
     for i in (0..len).rev() {
         for syllable_len in 1..=6 {
@@ -235,21 +260,23 @@ fn dp_segment(
                     continue;
                 }
 
+                // 浅拷贝：SegPath 是 Rc 指针，克隆仅递增引用计数，
+                // 路径体共享，不复制音节字符串。
                 let rest_segments = dp[i + syllable_len].clone();
                 for rest in rest_segments {
                     if dp[i].len() >= max_segmentations {
                         break;
                     }
-                    let mut new_seg = Vec::with_capacity(1 + rest.len());
-                    new_seg.push(syllable.to_string());
-                    new_seg.extend(rest);
-                    dp[i].push(new_seg);
+                    dp[i].push(Some(Rc::new(SegPathNode {
+                        syllable: syllable.to_string(),
+                        rest,
+                    })));
                 }
             }
         }
     }
 
-    std::mem::take(&mut dp[0])
+    dp[0].iter().map(materialize_path).collect()
 }
 
 /// 构建有效拼音音节集合（使用 OnceLock 全局缓存）
