@@ -393,6 +393,7 @@ dependencies = [
  "pinyin",
  "rime-dict",
  "rustc-hash 2.1.3",
+ "self_cell",
  "serde",
  "tempfile",
  "thiserror 2.0.19",

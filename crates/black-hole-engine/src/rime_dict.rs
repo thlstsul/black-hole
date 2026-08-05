@@ -1,7 +1,7 @@
 //! 基于 `rime-dict` crate 的词典实现（替代原 SQLite 词典）。
 //!
 //! 编译管线：`.dict.yaml` 解析 → 递归 import → 缺码词条自动注音（pinyin crate）
-//! → `PrismBin` / `TableBin` 构建 → 缓存到本地 `.prism.bin` / `.table.bin`。
+//! → `PrismBuilder` / `TableBuilder` 构建 → 缓存到本地 `.prism.bin` / `.table.bin`。
 //!
 //! 查询映射：
 //! - `lookup`（精确）→ `Table::query_phrases`（四级以上长词条按完整编码过滤）
@@ -19,6 +19,27 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use ::rime_dict::{
     DictYaml, Prism, PrismBuilder, SpellingAlgebra, SyllableId, Table, TableBuilder, crc32,
 };
+use self_cell::self_cell;
+
+// 自引用缓存：owner 持有表字节，dependent 借用字节保存解析后的 `Table`。
+// 避免每次查询重新解析 58MB 表（实测 `Table::load` 约 3-7ms/次，
+// 冷查询均摊此成本，长输入场景下成为主要卡顿来源）。
+self_cell!(
+    struct TableCell {
+        owner: Vec<u8>,
+        #[covariant]
+        dependent: Table,
+    }
+);
+
+// Prism 同样缓存：避免每次前缀切分重新解析（与 Table 同法）。
+self_cell!(
+    struct PrismCell {
+        owner: Vec<u8>,
+        #[covariant]
+        dependent: Prism,
+    }
+);
 
 /// 词条构建输入（供测试与内置词典使用）
 pub use ::rime_dict::RawEntry;
@@ -64,8 +85,10 @@ pub enum RimeDictError {
 
 /// 基于 rime-dict 二进制格式（.prism.bin + .table.bin）的词典
 pub struct RimeDict {
-    prism_bin: Vec<u8>,
-    table_bin: Vec<u8>,
+    /// 自引用缓存：持有 prism 字节并缓存解析后的 Prism（避免每次切分重新解析）
+    prism_cell: PrismCell,
+    /// 自引用缓存：持有表字节并缓存解析后的 Table（避免每次查询重新解析）
+    table_cell: TableCell,
     /// 音节 id → 音节文本（已排序，与 prism/table 内部 id 一致）
     syllabary: Vec<String>,
     /// 音节文本 → 音节 id
@@ -103,9 +126,14 @@ impl RimeDict {
             .map(|(i, s)| (s.clone(), i as SyllableId))
             .collect();
 
+        // 缓存解析结果：查询/切分阶段复用，避免每次重新解析。
+        // 解析失败与上方校验路径一致，传播为 RimeDictError 而非 panic。
+        let prism_cell = PrismCell::try_new(prism_bin, |bytes| Prism::load(bytes))?;
+        let table_cell = TableCell::try_new(table_bin, |bytes| Table::load(bytes))?;
+
         Ok(Self {
-            prism_bin,
-            table_bin,
+            prism_cell,
+            table_cell,
             syllabary,
             syllable_to_id,
             prefix_cache: RwLock::new(FxHashMap::default()),
@@ -149,8 +177,8 @@ impl RimeDict {
         let dict = Self::compile(&entries, checksum)?;
 
         // 缓存写出失败不阻塞加载
-        let _ = std::fs::write(&prism_path, &dict.prism_bin);
-        let _ = std::fs::write(&table_path, &dict.table_bin);
+        let _ = std::fs::write(&prism_path, dict.prism_cell.borrow_owner());
+        let _ = std::fs::write(&table_path, dict.table_cell.borrow_owner());
 
         Ok(dict)
     }
@@ -308,7 +336,7 @@ impl RimeDict {
     }
 
     fn build_language_model_impl(&self) -> Result<LanguageModel, RimeDictError> {
-        let table = self.table()?;
+        let table = self.table();
         let exported = table.export_entries()?;
 
         let mut text_scores: FxHashMap<String, i64> = FxHashMap::default();
@@ -322,14 +350,14 @@ impl RimeDict {
         Ok(LanguageModel::from_text_scores(total, text_scores))
     }
 
-    /// Prism 视图（零拷贝借用，解析仅读头部，开销可忽略）
-    fn prism(&self) -> Result<Prism<'_>, ::rime_dict::Error> {
-        Prism::load(&self.prism_bin)
+    /// Prism 视图（已缓存解析结果，零拷贝借用）
+    fn prism(&self) -> &Prism<'_> {
+        self.prism_cell.borrow_dependent()
     }
 
-    /// Table 视图（零拷贝借用）
-    fn table(&self) -> Result<Table<'_>, ::rime_dict::Error> {
-        Table::load(&self.table_bin)
+    /// Table 视图（已缓存解析结果，零拷贝借用）
+    fn table(&self) -> &Table<'_> {
+        self.table_cell.borrow_dependent()
     }
 
     /// 空格分隔编码 → 音节 id 序列；任一音节不在音节表中则返回 None
@@ -363,9 +391,7 @@ impl RimeDict {
     ///
     /// 无法继续切分的位置记为死端（剩余输入由调用方按前缀扩展处理）。
     fn segment_paths(&self, input: &str) -> Vec<(Vec<SyllableId>, usize)> {
-        let Ok(prism) = self.prism() else {
-            return Vec::new();
-        };
+        let prism = self.prism();
         let bytes = input.as_bytes();
         let mut out: Vec<(Vec<SyllableId>, usize)> = Vec::new();
         // 中间节点也去重：不同切分路径可能到达相同的 (pos, ids)，
@@ -446,9 +472,7 @@ impl RimeDict {
 
     /// `Table::query_prefix` + 文本解析，按权重降序。
     fn query_prefix_resolved(&self, ids: &[SyllableId]) -> Vec<(String, i64)> {
-        let Ok(table) = self.table() else {
-            return Vec::new();
-        };
+        let table = self.table();
         let Ok(entries) = table.query_prefix(ids) else {
             return Vec::new();
         };
@@ -472,9 +496,7 @@ impl RimeDict {
 
     /// 精确查询（不缓存）：编码已拆分为音节 id
     fn lookup_uncached(&self, ids: &[SyllableId]) -> Vec<Candidate> {
-        let Ok(table) = self.table() else {
-            return Vec::new();
-        };
+        let table = self.table();
         let Ok(accessor) = table.query_phrases(ids) else {
             return Vec::new();
         };
