@@ -7,7 +7,7 @@ use black_hole_shared::candidate_layout::{
     navigate_grid_excluding,
 };
 use black_hole_shared::{Candidate, InputContext, KeyEvent, KeyState, SchemeId, SchemeResult};
-use std::collections::HashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::{Arc, Mutex};
 
 /// 拼音输入方案
@@ -19,9 +19,13 @@ pub struct PinyinScheme {
     preprocessor: PinyinPreprocessor,
     user_dict: Option<Arc<Mutex<UserDictionary>>>,
     /// 缓存用户词频（避免每次查询 SQLite）
-    user_freq_cache: HashMap<String, i64>,
+    user_freq_cache: FxHashMap<String, i64>,
     /// 优化：缓存最近一次查询结果，避免重复查询
     last_query: Option<(String, Vec<Candidate>)>,
+    /// 输入版本号，每次编码变化时递增，不变时跳过重复计算
+    input_version: u64,
+    /// 已缓存候选对应的版本号
+    cached_version: u64,
     /// 候选窗是否展开为完整列表
     expanded: bool,
     /// 当前选中的候选索引
@@ -46,8 +50,10 @@ impl PinyinScheme {
             lm,
             preprocessor: PinyinPreprocessor::new(),
             user_dict: None,
-            user_freq_cache: HashMap::new(),
+            user_freq_cache: FxHashMap::default(),
             last_query: None,
+            input_version: 0,
+            cached_version: 0,
             expanded: false,
             selected_index: 0,
             english_buffer: None,
@@ -62,8 +68,10 @@ impl PinyinScheme {
             lm,
             preprocessor: PinyinPreprocessor::new(),
             user_dict: None,
-            user_freq_cache: HashMap::new(),
+            user_freq_cache: FxHashMap::default(),
             last_query: None,
+            input_version: 0,
+            cached_version: 0,
             expanded: false,
             selected_index: 0,
             english_buffer: None,
@@ -113,19 +121,20 @@ impl PinyinScheme {
             self.user_freq_cache.clear();
         }
 
+        // 版本号未变（编码未变），直接返回上一轮缓存结果
+        // 方向键导航、数字选词等操作不改变编码，可跳过整条流水线
+        if self.input_version == self.cached_version {
+            if let Some((_, cached_candidates)) = &self.last_query {
+                return cached_candidates.clone();
+            }
+        }
+
         let full_code = self.codec.full_code();
         let spaced_code = self.codec.spaced_code();
         let abbreviated = self.codec.abbreviated_code();
 
-        // 优化：使用缓存避免重复查询
-        if let Some((cached_code, cached_candidates)) = &self.last_query
-            && cached_code == &full_code
-        {
-            return cached_candidates.clone();
-        }
-
         let mut candidates: Vec<Candidate> = Vec::new();
-        let mut seen_texts = std::collections::HashSet::new();
+        let mut seen_texts = FxHashSet::default();
 
         // === 核心流水线：音节图 → 词典检索 → 维特比解码 ===
         let graph = self.codec.syllable_graph();
@@ -232,8 +241,9 @@ impl PinyinScheme {
         // 输入完整切分时，字数等于音节数的候选额外优先
         crate::sort_candidates(&mut candidates, syllable_count, is_fully_segmented);
 
-        // 更新缓存
+        // 更新缓存与版本号
         self.last_query = Some((full_code.clone(), candidates.clone()));
+        self.cached_version = self.input_version;
 
         tracing::debug!(
             "current_candidates end: code='{}', candidates={}",
@@ -255,6 +265,7 @@ impl PinyinScheme {
         };
         self.record_user_commit(&text);
         self.codec.reset();
+        self.input_version += 1;
         self.expanded = false;
         self.selected_index = 0;
         self.last_query = None;
@@ -330,12 +341,14 @@ impl InputScheme for PinyinScheme {
             "Backspace" => {
                 if !self.codec.pop() {
                     self.codec.reset();
+                    self.input_version += 1;
                     self.expanded = false;
                     self.selected_index = 0;
                     return SchemeResult::Committed {
                         text: "".to_string(),
                     };
                 }
+                self.input_version += 1;
                 let code = self.codec.full_code();
                 let candidates = self.current_candidates();
                 self.selected_index = 0;
@@ -348,8 +361,10 @@ impl InputScheme for PinyinScheme {
             }
             "Escape" => {
                 self.codec.reset();
+                self.input_version += 1;
                 self.expanded = false;
                 self.selected_index = 0;
+                self.last_query = None;
                 SchemeResult::Ignored
             }
             "Space" => {
@@ -364,6 +379,7 @@ impl InputScheme for PinyinScheme {
                     self.record_user_commit(&text);
                 }
                 self.codec.reset();
+                self.input_version += 1;
                 self.expanded = false;
                 self.selected_index = 0;
                 self.last_query = None;
@@ -372,6 +388,7 @@ impl InputScheme for PinyinScheme {
             "Enter" => {
                 let text = self.codec.full_code();
                 self.codec.reset();
+                self.input_version += 1;
                 self.expanded = false;
                 self.selected_index = 0;
                 SchemeResult::Committed { text }
@@ -533,6 +550,7 @@ impl InputScheme for PinyinScheme {
                 }
                 match self.codec.push(ch) {
                     CodecState::Accepted | CodecState::Complete => {
+                        self.input_version += 1;
                         let code = self.codec.full_code();
                         let candidates = self.current_candidates();
                         self.selected_index = 0;
@@ -589,6 +607,7 @@ impl InputScheme for PinyinScheme {
 
     fn reset(&mut self) {
         self.codec.reset();
+        self.input_version += 1;
         self.last_query = None; // 清除缓存
         self.expanded = false;
         self.selected_index = 0;

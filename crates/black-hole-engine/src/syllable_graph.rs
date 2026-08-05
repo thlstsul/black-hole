@@ -1,3 +1,4 @@
+use rustc_hash::FxHashSet;
 use std::collections::HashSet;
 
 /// 音节切分有向无环图（DAG）
@@ -32,7 +33,7 @@ impl SyllableGraph {
             .unwrap_or(0);
 
         let mut edges: Vec<Vec<(usize, String)>> = vec![Vec::new(); total_len + 1];
-        let mut seen: HashSet<(usize, usize)> = HashSet::new();
+        let mut seen: FxHashSet<(usize, usize)> = FxHashSet::default();
 
         for seg in segmentations {
             let mut pos = 0;

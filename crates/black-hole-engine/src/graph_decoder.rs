@@ -1,5 +1,5 @@
 use crate::{Dictionary, LanguageModel, SyllableGraph};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 /// 解码结果
 #[derive(Debug, Clone, PartialEq)]
@@ -126,7 +126,7 @@ impl ScoringConfig {
 pub struct GraphDecoder<'a> {
     dict: &'a dyn Dictionary,
     lm: Option<&'a LanguageModel>,
-    user_freqs: Option<&'a HashMap<String, i64>>,
+    user_freqs: Option<&'a FxHashMap<String, i64>>,
     beam_width: usize,
     max_word_syllables: usize,
     config: ScoringConfig,
@@ -149,7 +149,7 @@ impl<'a> GraphDecoder<'a> {
         self
     }
 
-    pub fn with_user_freqs(mut self, freqs: &'a HashMap<String, i64>) -> Self {
+    pub fn with_user_freqs(mut self, freqs: &'a FxHashMap<String, i64>) -> Self {
         self.user_freqs = Some(freqs);
         self
     }

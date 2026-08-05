@@ -11,9 +11,10 @@
 use crate::{Dictionary, LanguageModel};
 use black_hole_shared::Candidate;
 use pinyin::ToPinyin;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use ::rime_dict::{
     DictYaml, Prism, PrismBuilder, SpellingAlgebra, SyllableId, Table, TableBuilder, crc32,
@@ -25,7 +26,7 @@ pub use ::rime_dict::RawEntry;
 /// Prism 构建所用的字母集
 const ALPHABET: &str = "abcdefghijklmnopqrstuvwxyz";
 /// 前缀查询最终结果上限
-const PREFIX_RESULT_LIMIT: usize = 100;
+const PREFIX_RESULT_LIMIT: usize = 500;
 /// 前缀查询单次最多枚举的切分路径数（防长句输入组合爆炸）
 const MAX_SEGMENTATION_PATHS: usize = 32;
 /// 前缀查询缓存条目：`(text, score)` 列表
@@ -68,13 +69,13 @@ pub struct RimeDict {
     /// 音节 id → 音节文本（已排序，与 prism/table 内部 id 一致）
     syllabary: Vec<String>,
     /// 音节文本 → 音节 id
-    syllable_to_id: HashMap<String, SyllableId>,
+    syllable_to_id: FxHashMap<String, SyllableId>,
     /// 前缀查询缓存（音节 id 序列 → `(text, score)` 列表），惰性填充。
     /// 单音节前缀缓存 top N；多音节前缀结果天然较小，全量缓存。
-    prefix_cache: Mutex<HashMap<Vec<SyllableId>, PrefixEntries>>,
+    prefix_cache: RwLock<FxHashMap<Vec<SyllableId>, PrefixEntries>>,
     /// 精确查询缓存（编码字符串 → 候选）。词典加载后只读，结果恒定；
     /// 输入逐键增长时相邻按键共享前缀编码，命中率高。
-    lookup_cache: Mutex<HashMap<String, Vec<Candidate>>>,
+    lookup_cache: RwLock<FxHashMap<String, Vec<Candidate>>>,
     /// 语言模型（惰性构建，共享实例只建一次）
     lm: OnceLock<LanguageModel>,
 }
@@ -96,7 +97,7 @@ impl RimeDict {
         let syllabary = table.syllabary_entries()?;
         Prism::load(&prism_bin)?;
 
-        let syllable_to_id: HashMap<String, SyllableId> = syllabary
+        let syllable_to_id: FxHashMap<String, SyllableId> = syllabary
             .iter()
             .enumerate()
             .map(|(i, s)| (s.clone(), i as SyllableId))
@@ -107,8 +108,8 @@ impl RimeDict {
             table_bin,
             syllabary,
             syllable_to_id,
-            prefix_cache: Mutex::new(HashMap::new()),
-            lookup_cache: Mutex::new(HashMap::new()),
+            prefix_cache: RwLock::new(FxHashMap::default()),
+            lookup_cache: RwLock::new(FxHashMap::default()),
             lm: OnceLock::new(),
         })
     }
@@ -310,9 +311,9 @@ impl RimeDict {
         let table = self.table()?;
         let exported = table.export_entries()?;
 
-        let mut text_scores: HashMap<String, i64> = HashMap::new();
+        let mut text_scores: FxHashMap<String, i64> = FxHashMap::default();
         for (_, text_id, weight) in exported {
-            if let Ok(text) = table.string_table().get_string(text_id) {
+            if let Ok(text) = table.string_table().string(text_id) {
                 *text_scores.entry(text).or_insert(0) += (weight as i64).max(1);
             }
         }
@@ -369,7 +370,7 @@ impl RimeDict {
         let mut out: Vec<(Vec<SyllableId>, usize)> = Vec::new();
         // 中间节点也去重：不同切分路径可能到达相同的 (pos, ids)，
         // 若不去重会重复展开同一子树，枚举量随音节数组合爆炸。
-        let mut seen: HashSet<(usize, Vec<SyllableId>)> = HashSet::new();
+        let mut seen: FxHashSet<(usize, Vec<SyllableId>)> = FxHashSet::default();
         let mut stack: Vec<(usize, Vec<SyllableId>)> = vec![(0, Vec::new())];
         seen.insert((0, Vec::new()));
 
@@ -419,7 +420,7 @@ impl RimeDict {
             return;
         }
         {
-            let cache = self.prefix_cache.lock().unwrap();
+            let cache = self.prefix_cache.read().unwrap();
             if let Some(cached) = cache.get(ids) {
                 stats.cache_hits += 1;
                 out.extend(cached.iter().cloned());
@@ -434,7 +435,7 @@ impl RimeDict {
         if ids.len() == 1 {
             entries.truncate(PREFIX1_CACHE_LIMIT);
         }
-        let mut cache = self.prefix_cache.lock().unwrap();
+        let mut cache = self.prefix_cache.write().unwrap();
         // 防御性清理：防止缓存无限增长（不同音节前缀组合随输入累积）
         if cache.len() > 1024 {
             cache.clear();
@@ -456,7 +457,7 @@ impl RimeDict {
             .filter_map(|(_, text_id, weight)| {
                 table
                     .string_table()
-                    .get_string(text_id)
+                    .string(text_id)
                     .ok()
                     .map(|t| (t, weight as i64))
             })
@@ -506,7 +507,7 @@ impl Dictionary for RimeDict {
         // 精确查询结果只取决于编码与只读词典，按编码字符串缓存；
         // 输入逐键增长时共享前缀命中率高，避免重复查表。
         {
-            let cache = self.lookup_cache.lock().unwrap();
+            let cache = self.lookup_cache.read().unwrap();
             if let Some(cached) = cache.get(code) {
                 return cached.clone();
             }
@@ -515,7 +516,7 @@ impl Dictionary for RimeDict {
             Some(ids) if !ids.is_empty() => self.lookup_uncached(&ids),
             _ => Vec::new(),
         };
-        let mut cache = self.lookup_cache.lock().unwrap();
+        let mut cache = self.lookup_cache.write().unwrap();
         // 防御性清理：防止不同编码前缀组合随输入累积无限增长
         if cache.len() > LOOKUP_CACHE_LIMIT {
             cache.clear();
@@ -555,7 +556,7 @@ impl Dictionary for RimeDict {
             // 连续编码：枚举全部音节切分路径，剩余部分按前缀扩展
             // 不同切分可能产生相同音节序列（如 [ni,ang] 既可完整切分、
             // 也可由 [ni]+"ang" 扩展得到），查询前去重避免重复查表
-            let mut seen_ids: HashSet<Vec<SyllableId>> = HashSet::new();
+            let mut seen_ids: FxHashSet<Vec<SyllableId>> = FxHashSet::default();
             let mut collect = |ids: Vec<SyllableId>,
                                paths: &mut usize,
                                results: &mut Vec<(String, i64)>,
@@ -591,7 +592,7 @@ impl Dictionary for RimeDict {
         }
 
         // 按文本去重（保留最高分），降序，截断
-        let mut best: HashMap<String, i64> = HashMap::new();
+        let mut best: FxHashMap<String, i64> = FxHashMap::default();
         for (text, score) in results {
             best.entry(text)
                 .and_modify(|s| {
@@ -600,6 +601,20 @@ impl Dictionary for RimeDict {
                     }
                 })
                 .or_insert(score);
+        }
+        // 补充精确匹配结果：确保单字候选（如 碳、炭 等低频字）
+        // 不会被多音节词条挤掉（#issue: prefix_lookup 按分数截断时）
+        if !code.is_empty() {
+            let exact = self.lookup(code);
+            for c in &exact {
+                best.entry(c.text.clone())
+                    .and_modify(|s| {
+                        if c.score > *s {
+                            *s = c.score;
+                        }
+                    })
+                    .or_insert(c.score);
+            }
         }
         let mut out: Vec<Candidate> = best
             .into_iter()
@@ -679,12 +694,12 @@ fn text_to_pinyin_code(text: &str) -> Option<String> {
 /// 解析词库文件内容：`.dict.yaml` 直接解析；无 YAML 头的纯码表按 `[text]` 列合成头部
 fn parse_dict_content(content: &str) -> Result<DictYaml, RimeDictError> {
     if content.starts_with("---") || content.contains("\n---") {
-        DictYaml::parse(content).map_err(RimeDictError::Parse)
+        DictYaml::parse(content).map_err(|e| RimeDictError::Parse(e.to_string()))
     } else {
         // 无头纯码表：每行 `文本[\t编码[\t权重]]`，缺码词条后续自动注音
         let synthesized =
             format!("---\nname: custom\ncolumns:\n  - text\n  - code\n  - weight\n...\n{content}");
-        DictYaml::parse(&synthesized).map_err(RimeDictError::Parse)
+        DictYaml::parse(&synthesized).map_err(|e| RimeDictError::Parse(e.to_string()))
     }
 }
 
@@ -1128,6 +1143,55 @@ mod tests {
         let dict2 = RimeDict::from_rime_dict_cached(&src, &cache_dir).unwrap();
         assert_eq!(dict2.lookup("a").len(), 1);
         assert_eq!(dict2.lookup("zhong wen")[0].text, "中文");
+    }
+
+    #[test]
+    fn test_real_dict_contains_tan_chars() {
+        // 使用实际 RIME 词库验证 tan 读音包含碳、炭等常见字
+        let cwd = std::env::current_dir().unwrap();
+        let dict_path = cwd.join("../../assets/dicts/rime_ice.dict.yaml");
+        if !dict_path.exists() {
+            println!("跳过测试：实际词库文件不存在于 {:?}", dict_path);
+            return;
+        }
+
+        let dict = RimeDict::from_rime_dict_cached(&dict_path, std::env::temp_dir()).unwrap();
+        let candidates = dict.lookup("tan");
+        let texts: Vec<&str> = candidates.iter().map(|c| c.text.as_str()).collect();
+
+        println!("lookup('tan') returned {} candidates", candidates.len());
+        for (i, c) in candidates.iter().enumerate() {
+            println!("  {}: {} (score={})", i, c.text, c.score);
+        }
+
+        assert!(
+            texts.contains(&"碳"),
+            "lookup('tan') 应包含'碳'，实际: {:?}",
+            texts
+        );
+        assert!(
+            texts.contains(&"炭"),
+            "lookup('tan') 应包含'炭'，实际: {:?}",
+            texts
+        );
+
+        // 同时测试 prefix_lookup
+        let prefix_candidates = dict.prefix_lookup("tan");
+        let prefix_texts: Vec<&str> = prefix_candidates.iter().map(|c| c.text.as_str()).collect();
+        println!("\nprefix_lookup('tan') returned {} candidates", prefix_candidates.len());
+        for (i, c) in prefix_candidates.iter().enumerate() {
+            println!("  {}: {} (score={})", i, c.text, c.score);
+        }
+        assert!(
+            prefix_texts.contains(&"碳"),
+            "prefix_lookup('tan') 应包含'碳'，实际: {:?}",
+            prefix_texts
+        );
+        assert!(
+            prefix_texts.contains(&"炭"),
+            "prefix_lookup('tan') 应包含'炭'，实际: {:?}",
+            prefix_texts
+        );
     }
 
     #[test]

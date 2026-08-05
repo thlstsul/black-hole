@@ -7,7 +7,7 @@ use black_hole_shared::candidate_layout::{
     navigate_grid_excluding,
 };
 use black_hole_shared::{Candidate, InputContext, KeyEvent, KeyState, SchemeId, SchemeResult};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::{Arc, Mutex};
 
 /// 小鹤双拼输入方案
@@ -17,7 +17,7 @@ pub struct ShuangpinScheme {
     ranker: Box<dyn CandidateRanker>,
     user_dict: Option<Arc<Mutex<UserDictionary>>>,
     /// 缓存用户词频（避免每次查询 SQLite）
-    user_freq_cache: HashMap<String, i64>,
+    user_freq_cache: FxHashMap<String, i64>,
     /// 缓存最近一次查询结果（导航期间复用，保证候选顺序稳定）
     last_query: Option<(String, Vec<Candidate>)>,
     expanded: bool,
@@ -39,7 +39,7 @@ impl ShuangpinScheme {
             dictionary: Box::new(RimeDict::from_builtin()),
             ranker: Box::new(SimpleRanker::new()),
             user_dict: None,
-            user_freq_cache: HashMap::new(),
+            user_freq_cache: FxHashMap::default(),
             last_query: None,
             expanded: false,
             selected_index: 0,
@@ -53,7 +53,7 @@ impl ShuangpinScheme {
             dictionary,
             ranker: Box::new(SimpleRanker::new()),
             user_dict: None,
-            user_freq_cache: HashMap::new(),
+            user_freq_cache: FxHashMap::default(),
             last_query: None,
             expanded: false,
             selected_index: 0,

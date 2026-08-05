@@ -1,5 +1,5 @@
 use black_hole_shared::Candidate;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 /// 最大保留的 unigram 条目数，超出时只保留高频词以降低内存
 const MAX_UNIGRAM_ENTRIES: usize = 20000;
@@ -13,12 +13,12 @@ const MAX_UNIGRAM_ENTRIES: usize = 20000;
 #[derive(Debug, Clone)]
 pub struct LanguageModel {
     /// 词语 -> log 概率
-    unigram: HashMap<String, f64>,
+    unigram: FxHashMap<String, f64>,
     /// 前词 -> (当前词 -> log 条件概率 P(当前词|前词))
     ///
     /// 两级嵌套结构使 `score_bigram(prev, curr)` 可通过 `&str` 借入查询，
     /// 避免原 `(String, String)` 键每次查询都要做两次堆分配。
-    bigram: HashMap<String, HashMap<String, f64>>,
+    bigram: FxHashMap<String, FxHashMap<String, f64>>,
     /// 未观测 bigram 的回退权重（乘到 unigram 上）
     backoff_weight: f64,
     /// 每个字节的额外 log 奖励（鼓励长词）
@@ -36,8 +36,8 @@ impl Default for LanguageModel {
 impl LanguageModel {
     pub fn new() -> Self {
         Self {
-            unigram: HashMap::new(),
-            bigram: HashMap::new(),
+            unigram: FxHashMap::default(),
+            bigram: FxHashMap::default(),
             backoff_weight: -3.0, // log(0.05) ≈ -3.0
             long_word_bonus: 0.3,
             total_frequency: 0.0,
@@ -45,7 +45,7 @@ impl LanguageModel {
     }
 
     /// 从聚合后的 text -> score 构建 Unigram 模型，并限制最大条目数以控制内存
-    pub fn from_text_scores(total: i64, mut text_scores: HashMap<String, i64>) -> Self {
+    pub fn from_text_scores(total: i64, mut text_scores: FxHashMap<String, i64>) -> Self {
         let mut lm = Self::new();
         if total > 0 {
             lm.total_frequency = total as f64;
@@ -71,7 +71,7 @@ impl LanguageModel {
     /// entries: (code, candidates) 列表，candidates 包含 text 和 score。
     /// 相同 text 在不同 code 下出现时会合并 score。
     pub fn from_entries(entries: &[(String, Vec<Candidate>)]) -> Self {
-        let mut text_scores: HashMap<String, i64> = HashMap::new();
+        let mut text_scores: FxHashMap<String, i64> = FxHashMap::default();
         for (_code, cands) in entries {
             for cand in cands {
                 *text_scores.entry(cand.text.clone()).or_insert(0) += cand.score.max(1);
@@ -99,8 +99,8 @@ impl LanguageModel {
     /// 适用于用户个性化调频。
     pub fn learn_from_commits(&mut self, commits: &[(String, String)]) {
         // commits: (text, code)
-        let mut bigram_counts: HashMap<(String, String), u64> = HashMap::new();
-        let mut unigram_counts: HashMap<String, u64> = HashMap::new();
+        let mut bigram_counts: FxHashMap<(String, String), u64> = FxHashMap::default();
+        let mut unigram_counts: FxHashMap<String, u64> = FxHashMap::default();
 
         for i in 1..commits.len() {
             let prev = &commits[i - 1].0;
