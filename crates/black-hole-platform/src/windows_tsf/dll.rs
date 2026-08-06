@@ -1,10 +1,14 @@
 use super::service::BlackHoleTextService;
 use super::{CLSID_BLACKHOLE_TIP, GLOBAL_REF_COUNT, dll_add_ref, dll_release, set_dll_instance};
+#[cfg(debug_assertions)]
 use std::env;
 use std::ffi::c_void;
+#[cfg(debug_assertions)]
 use std::fs;
-use std::ptr;
+#[cfg(debug_assertions)]
 use std::process;
+use std::ptr;
+#[cfg(debug_assertions)]
 use std::sync::Once;
 #[cfg(debug_assertions)]
 use tracing::Level;
@@ -16,7 +20,7 @@ use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_POINTER, HINSTANCE, S_FALSE, S_OK,
 };
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
-use windows_core::{BOOL, GUID, HRESULT, Interface, IUnknown, Ref, Result, implement};
+use windows_core::{BOOL, GUID, HRESULT, IUnknown, Interface, Ref, Result, implement};
 
 // ---------------------------------------------------------------------------
 // COM object: BlackHoleClassFactory
