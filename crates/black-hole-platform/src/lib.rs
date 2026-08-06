@@ -30,6 +30,9 @@ pub enum PlatformError {
     Other(String),
 }
 
+/// 开机自启动管理（平台相关）
+pub mod auto_start;
+
 #[cfg(target_os = "windows")]
 pub mod ipc;
 

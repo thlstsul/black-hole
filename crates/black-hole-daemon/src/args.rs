@@ -16,6 +16,10 @@ pub struct DaemonArgs {
     /// 以 IBus 引擎模式运行（Linux 专用）
     #[arg(long = "ibus")]
     pub ibus: bool,
+
+    /// 以设置面板模式运行（由守护进程以独立进程方式唤起，隐藏参数）
+    #[arg(long = "settings-panel", hide = true)]
+    pub settings_panel: bool,
 }
 
 fn parse_scheme(s: &str) -> Result<SchemeId, String> {

@@ -176,12 +176,71 @@ unsafe impl Sync for ServiceInner {}
 // Shared helpers
 // ---------------------------------------------------------------------------
 
+/// 确保与 daemon 的 IPC 连接存在;若已断开(如 daemon 重启)则自动重连。
+/// 返回连接是否可用。供菜单命令、候选窗等非按键路径复用。
+pub(crate) fn ensure_ipc_connection(inner_arc: &Arc<Mutex<ServiceInner>>) -> bool {
+    if inner_arc.lock().unwrap().ipc_conn.is_some() {
+        return true;
+    }
+
+    let max_retries = 3;
+    let mut retry_delay_ms = 200;
+
+    for attempt in 1..=max_retries {
+        match std::net::TcpStream::connect(super::ipc::IPC_SERVER_ADDR) {
+            Ok(stream) => {
+                let _ = stream.set_nodelay(true);
+                let reader = match stream.try_clone() {
+                    Ok(r) => std::io::BufReader::new(r),
+                    Err(_) => return false,
+                };
+                let mut inner = inner_arc.lock().unwrap();
+                inner.ipc_conn = Some(IpcConnection {
+                    writer: stream,
+                    reader,
+                });
+                tracing::info!(
+                    "ensure_ipc_connection: connected to daemon (attempt {})",
+                    attempt
+                );
+                return true;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "ensure_ipc_connection: failed to connect to daemon (attempt {}/{}): {}",
+                    attempt,
+                    max_retries,
+                    e
+                );
+                if attempt < max_retries {
+                    std::thread::sleep(std::time::Duration::from_millis(retry_delay_ms));
+                    retry_delay_ms = (retry_delay_ms * 2).min(2000);
+                }
+            }
+        }
+    }
+
+    false
+}
+
 /// Send a UI command to the daemon via IPC (free function for use outside impl).
+/// 连接缺失或已断开时自动重连后再发送,失败记录日志,不再静默丢弃。
 pub(crate) fn send_ui_command_inner(inner_arc: &Arc<Mutex<ServiceInner>>, cmd: UiCommand) {
+    if !ensure_ipc_connection(inner_arc) {
+        tracing::warn!(
+            "send_ui_command_inner: no IPC connection, dropping command {:?}",
+            std::mem::discriminant(&cmd)
+        );
+        return;
+    }
+
+    let request = super::ipc::IpcRequest::UiCommand(cmd);
     let mut inner = inner_arc.lock().unwrap();
     if let Some(ref mut conn) = inner.ipc_conn {
-        let request = super::ipc::IpcRequest::UiCommand(cmd);
-        let _ = super::ipc::send_request(&mut conn.writer, &request);
+        if let Err(e) = super::ipc::send_request(&mut conn.writer, &request) {
+            tracing::warn!("send_ui_command_inner: send failed: {}", e);
+            inner.ipc_conn = None;
+        }
     }
 }
 

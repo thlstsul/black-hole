@@ -158,6 +158,7 @@ pub enum UiCommand {
     CommitText(String),
     UpdateStatus(String),
     ShowSettings,
+    SetAutoStart(bool),
     SetTheme(Theme),
     SwitchScheme(SchemeId),
     Exit,
@@ -170,15 +171,19 @@ pub struct Settings {
     pub default_scheme: SchemeId,
     pub candidate_window: CandidateWindowSettings,
     pub key_bindings: KeyBindings,
+    /// 是否开机自启动（登录时自动运行守护进程）
+    #[serde(default)]
+    pub auto_start: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            theme: Theme::Light,
+            theme: Theme::System,
             default_scheme: SchemeId::Pinyin,
             candidate_window: CandidateWindowSettings::default(),
             key_bindings: KeyBindings::default(),
+            auto_start: false,
         }
     }
 }

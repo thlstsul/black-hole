@@ -20,10 +20,19 @@ pub struct App;
 impl App {
     /// 启动 daemon，阻塞直到平台服务结束或收到退出信号
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+        let args = DaemonArgs::parse();
+
+        // 设置面板模式：由守护进程以独立进程方式唤起。
+        // winit 0.30 每个进程只允许创建一个事件循环，候选窗已占用守护进程
+        // 进程内的那个，因此设置面板必须在独立进程中运行。
+        if args.settings_panel {
+            let settings_mgr = SettingsManager::new();
+            black_hole_ui::run_settings_panel(settings_mgr);
+            return Ok(());
+        }
+
         let _tracing_guard = Self::init_tracing();
         tracing::info!("Black-Hole IME daemon starting...");
-
-        let args = DaemonArgs::parse();
 
         #[cfg(target_os = "windows")]
         Self::ensure_ime_registered();
@@ -35,6 +44,12 @@ impl App {
         let settings_mgr = SettingsManager::new();
         let settings_scheme = settings_mgr.settings().default_scheme;
         let default_scheme = args.scheme.unwrap_or(settings_scheme);
+
+        // 按设置同步开机自启动状态（如安装目录变化后重新写入 Run 键 / autostart 文件）
+        let auto_start = settings_mgr.settings().auto_start;
+        if let Err(e) = black_hole_platform::auto_start::set_auto_start(auto_start) {
+            tracing::warn!("Failed to sync auto start ({}): {}", auto_start, e);
+        }
 
         tracing::info!(
             "resolved scheme: CLI={:?}, settings={:?}, effective={:?}",
@@ -269,10 +284,18 @@ impl App {
         match cmd {
             UiCommand::ShowSettings => {
                 tracing::info!("UI dispatch: open settings");
-                let settings_mgr = SettingsManager::new();
-                std::thread::spawn(move || {
-                    black_hole_ui::run_settings_panel(settings_mgr);
-                });
+                // winit 0.30 每进程仅允许一个事件循环，候选窗已占用 daemon 进程内的，
+                // 设置面板须以独立进程（--settings-panel）方式运行。
+                if let Ok(exe) = std::env::current_exe() {
+                    if let Err(e) = std::process::Command::new(exe)
+                        .arg("--settings-panel")
+                        .spawn()
+                    {
+                        tracing::error!("Failed to spawn settings panel: {}", e);
+                    }
+                } else {
+                    tracing::error!("Failed to resolve current exe for settings panel");
+                }
             }
             UiCommand::SwitchScheme(scheme_id) => {
                 tracing::info!("UI dispatch: switch to {:?}", scheme_id);
@@ -298,6 +321,17 @@ impl App {
                     cur.1 = theme;
                 }
                 let _ = ui_render_tx.send(UiCommand::SetTheme(theme));
+            }
+            UiCommand::SetAutoStart(enabled) => {
+                tracing::info!("UI dispatch: set auto start to {}", enabled);
+                // 平台写入（注册表 Run 键 / XDG autostart 文件）
+                if let Err(e) = black_hole_platform::auto_start::set_auto_start(enabled) {
+                    tracing::warn!("Failed to set auto start ({}): {}", enabled, e);
+                }
+                // 持久化到设置，使重启后保持本次选择
+                let mut settings_mgr = SettingsManager::new();
+                settings_mgr.settings_mut().auto_start = enabled;
+                settings_mgr.save();
             }
             UiCommand::Exit => {
                 tracing::info!("UI dispatch: exit requested");

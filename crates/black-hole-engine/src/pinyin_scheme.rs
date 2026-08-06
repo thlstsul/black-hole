@@ -123,11 +123,10 @@ impl PinyinScheme {
 
         // 版本号未变（编码未变），直接返回上一轮缓存结果
         // 方向键导航、数字选词等操作不改变编码，可跳过整条流水线
-        if self.input_version == self.cached_version {
-            if let Some((_, cached_candidates)) = &self.last_query {
+        if self.input_version == self.cached_version
+            && let Some((_, cached_candidates)) = &self.last_query {
                 return cached_candidates.clone();
             }
-        }
 
         let full_code = self.codec.full_code();
         let spaced_code = self.codec.spaced_code();

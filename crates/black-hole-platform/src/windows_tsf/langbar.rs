@@ -5,7 +5,7 @@
 //! - 不可移动（语言栏项固定位置）
 //! - 点击弹出菜单：设置、输入方案、主题、退出
 
-use super::ServiceInner;
+use super::{ServiceInner, send_ui_command_inner};
 use black_hole_shared::{SchemeId, Theme, UiCommand};
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{
@@ -49,6 +49,7 @@ const MENU_ID_DARK: u32 = 5;
 const MENU_ID_SYSTEM: u32 = 6;
 const MENU_ID_EXIT: u32 = 7;
 const MENU_ID_ENGLISH: u32 = 8;
+const MENU_ID_AUTO_START: u32 = 9;
 
 // ---------------------------------------------------------------------------
 // 菜单暗色主题支持
@@ -172,11 +173,8 @@ impl BlackHoleLangBarItem {
     }
 
     fn send_ui_command(&self, cmd: UiCommand) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(ref mut conn) = inner.ipc_conn {
-            let request = super::super::ipc::IpcRequest::UiCommand(cmd);
-            let _ = super::super::ipc::send_request(&mut conn.writer, &request);
-        }
+        // 委托公共函数:连接缺失/断开时自动重连,失败记录日志
+        send_ui_command_inner(&self.inner, cmd);
     }
 
     fn current_scheme(&self) -> SchemeId {
@@ -341,6 +339,21 @@ impl BlackHoleLangBarItem {
             let _ = AppendMenuW(root, MF_POPUP, theme_menu.0 as usize, w!("主题"));
 
             let _ = AppendMenuW(root, MF_SEPARATOR, 0, PCWSTR::null());
+
+            // 开机自启动：勾选状态反映系统当前配置（读注册表，无副作用）
+            let _ = AppendMenuW(
+                root,
+                MF_STRING
+                    | if crate::auto_start::is_auto_start() {
+                        MF_CHECKED
+                    } else {
+                        MF_UNCHECKED
+                    },
+                MENU_ID_AUTO_START as usize,
+                w!("开机自启动"),
+            );
+
+            let _ = AppendMenuW(root, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(root, MF_STRING, MENU_ID_EXIT as usize, w!("退出"));
 
             // 不使用 GetForegroundWindow() 作为菜单宿主：点击任务栏输入指示器时
@@ -423,6 +436,11 @@ impl BlackHoleLangBarItem {
                 MENU_ID_SYSTEM => {
                     self.set_theme(Theme::System);
                     self.send_ui_command(UiCommand::SetTheme(Theme::System));
+                }
+                MENU_ID_AUTO_START => {
+                    // 切换自启动状态；持久化与平台写入由 daemon 统一处理
+                    let next = !crate::auto_start::is_auto_start();
+                    self.send_ui_command(UiCommand::SetAutoStart(next));
                 }
                 MENU_ID_EXIT => self.send_ui_command(UiCommand::Exit),
                 _ => {}
@@ -559,6 +577,20 @@ impl ITfLangBarItemButton_Impl for BlackHoleLangBarItem_Impl {
         )?;
 
         add_menu_separator(&menu)?;
+
+        // 开机自启动：勾选状态反映系统当前配置（读注册表，无副作用）
+        add_menu_item(
+            &menu,
+            MENU_ID_AUTO_START,
+            if crate::auto_start::is_auto_start() {
+                TF_LBMENUF_CHECKED
+            } else {
+                0
+            },
+            "开机自启动",
+        )?;
+
+        add_menu_separator(&menu)?;
         add_menu_item(&menu, MENU_ID_EXIT, 0, "退出")?;
 
         Ok(())
@@ -588,6 +620,11 @@ impl ITfLangBarItemButton_Impl for BlackHoleLangBarItem_Impl {
             MENU_ID_SYSTEM => {
                 self.set_theme(Theme::System);
                 self.send_ui_command(UiCommand::SetTheme(Theme::System));
+            }
+            MENU_ID_AUTO_START => {
+                // 切换自启动状态；持久化与平台写入由 daemon 统一处理
+                let next = !crate::auto_start::is_auto_start();
+                self.send_ui_command(UiCommand::SetAutoStart(next));
             }
             MENU_ID_EXIT => self.send_ui_command(UiCommand::Exit),
             _ => {}
