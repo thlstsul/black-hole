@@ -1,13 +1,9 @@
 use super::commit::apply_result;
-use super::{IpcConnection, ServiceInner};
+use super::{ServiceInner, try_reconnect_ipc};
 use black_hole_shared::{KeyEvent, KeyState, Modifiers};
-use crate::ipc::{IPC_SERVER_ADDR, IpcRequest, read_response, send_request};
-use std::io::BufReader;
-use std::net::TcpStream;
+use crate::ipc::{IpcRequest, read_response, send_request};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
 use tracing::{error, warn};
 use windows::Win32::Foundation::{E_UNEXPECTED, LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -139,58 +135,33 @@ impl ITfEditSession_Impl for KeyHandlerEditSession_Impl {
 }
 
 /// Handle key event with automatic IPC reconnection support.
+///
+/// 注意：此函数在宿主程序 UI 线程（TSF DoEditSession）上执行，
+/// daemon 不可用时不允许 sleep 重试，否则会卡住宿主程序。
+/// 重连由 [`try_reconnect_ipc`] 限频，每次失败最多只额外尝试一次，
+/// 其余情况直接返回错误，交由下一次按键再试。
 pub(crate) fn handle_key_event_with_reconnect(
     service: &Arc<Mutex<ServiceInner>>,
     ec: u32,
     key_event: KeyEvent,
 ) -> Result<()> {
     let result = handle_key_event_internal(service, ec, &key_event);
-
-    if result.is_err() {
-        warn!("IPC operation failed, clearing connection and retrying");
-
-        {
-            let mut inner = service.lock().unwrap();
-            inner.ipc_conn = None;
-        }
-
-        let max_retries = 2;
-        let mut retry_delay_ms = 300;
-
-        for attempt in 1..=max_retries {
-            match TcpStream::connect(IPC_SERVER_ADDR) {
-                Ok(stream) => {
-                    let _ = stream.set_nodelay(true);
-                    let reader = BufReader::new(stream.try_clone().map_err(|_| E_UNEXPECTED)?);
-
-                    {
-                        let mut inner = service.lock().unwrap();
-                        inner.ipc_conn = Some(IpcConnection {
-                            writer: stream,
-                            reader,
-                        });
-                    }
-
-                    let retry_result = handle_key_event_internal(service, ec, &key_event);
-                    if retry_result.is_ok() {
-                        return Ok(());
-                    }
-                }
-                Err(e) => {
-                    warn!("reconnection attempt {} failed: {}", attempt, e);
-                }
-            }
-
-            if attempt < max_retries {
-                thread::sleep(Duration::from_millis(retry_delay_ms));
-                retry_delay_ms = (retry_delay_ms * 2).min(2000);
-            }
-        }
-
-        error!("all reconnection attempts failed");
+    if result.is_ok() {
+        return result;
     }
 
-    result
+    warn!("IPC operation failed, clearing connection");
+
+    {
+        let mut inner = service.lock().unwrap();
+        inner.ipc_conn = None;
+    }
+
+    if !try_reconnect_ipc(service) {
+        return result;
+    }
+
+    handle_key_event_internal(service, ec, &key_event)
 }
 
 /// Internal key event handling logic (assumes connection exists).

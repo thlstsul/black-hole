@@ -14,12 +14,12 @@ use serde_json::{from_str, to_string};
 use std::ffi::c_void;
 use std::io::{self, BufRead, BufReader, Write};
 use std::mem::discriminant;
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, WPARAM};
@@ -121,6 +121,8 @@ pub(crate) struct IpcConnection {
 pub(crate) struct ServiceInner {
     /// IPC connection to the daemon (out-of-process mode).
     pub(crate) ipc_conn: Option<IpcConnection>,
+    /// 上次尝试重连的时间戳，用于限制重连频率（daemon 不可用时避免不断重连）。
+    pub(crate) last_reconnect_attempt: Option<Instant>,
     /// Cached thread manager (set on Activate).
     pub(crate) thread_mgr: Option<ITfThreadMgr>,
     /// TSF client ID.
@@ -157,6 +159,7 @@ impl ServiceInner {
     pub(crate) fn new() -> Self {
         Self {
             ipc_conn: None,
+            last_reconnect_attempt: None,
             thread_mgr: None,
             client_id: 0,
             context: None,
@@ -185,49 +188,68 @@ unsafe impl Sync for ServiceInner {}
 // Shared helpers
 // ---------------------------------------------------------------------------
 
+/// 重连最小间隔：daemon 不可用时限制重连频率，避免不断重连、刷日志。
+const RECONNECT_MIN_INTERVAL: Duration = Duration::from_millis(1000);
+/// 单次连接尝试超时，防止 SYN 被防火墙/杀软丢弃时长时间阻塞调用线程。
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+
 /// 确保与 daemon 的 IPC 连接存在;若已断开(如 daemon 重启)则自动重连。
 /// 返回连接是否可用。供菜单命令、候选窗等非按键路径复用。
+/// 重连受 [`try_reconnect_ipc`] 限频，不会在调用线程上 sleep。
 pub(crate) fn ensure_ipc_connection(inner_arc: &Arc<Mutex<ServiceInner>>) -> bool {
     if inner_arc.lock().unwrap().ipc_conn.is_some() {
         return true;
     }
+    try_reconnect_ipc(inner_arc)
+}
 
-    let max_retries = 3;
-    let mut retry_delay_ms = 200;
-
-    for attempt in 1..=max_retries {
-        match TcpStream::connect(IPC_SERVER_ADDR) {
-            Ok(stream) => {
-                let _ = stream.set_nodelay(true);
-                let reader = match stream.try_clone() {
-                    Ok(r) => BufReader::new(r),
-                    Err(_) => return false,
-                };
-                let mut inner = inner_arc.lock().unwrap();
-                inner.ipc_conn = Some(IpcConnection {
-                    writer: stream,
-                    reader,
-                });
-                info!(
-                    "ensure_ipc_connection: connected to daemon (attempt {})",
-                    attempt
-                );
-                return true;
-            }
-            Err(e) => {
-                warn!(
-                    "ensure_ipc_connection: failed to connect to daemon (attempt {}/{}): {}",
-                    attempt, max_retries, e
-                );
-                if attempt < max_retries {
-                    thread::sleep(Duration::from_millis(retry_delay_ms));
-                    retry_delay_ms = (retry_delay_ms * 2).min(2000);
-                }
-            }
+/// 尝试重连 daemon（限频、带超时、不阻塞）。
+/// 距离上次尝试不足 [`RECONNECT_MIN_INTERVAL`] 时直接放弃，避免不断重连。
+/// 供按键路径在失败后调用一次，失败即返回，由下一次按键再试。
+pub(crate) fn try_reconnect_ipc(inner_arc: &Arc<Mutex<ServiceInner>>) -> bool {
+    {
+        let inner = inner_arc.lock().unwrap();
+        if inner.ipc_conn.is_some() {
+            return true;
+        }
+        if let Some(last) = inner.last_reconnect_attempt
+            && last.elapsed() < RECONNECT_MIN_INTERVAL
+        {
+            return false;
         }
     }
 
-    false
+    // 先记录尝试时间再连接，使连续调用被限频。
+    inner_arc.lock().unwrap().last_reconnect_attempt = Some(Instant::now());
+
+    let addr: SocketAddr = match IPC_SERVER_ADDR.parse() {
+        Ok(a) => a,
+        Err(_) => {
+            error!("try_reconnect_ipc: invalid IPC address: {}", IPC_SERVER_ADDR);
+            return false;
+        }
+    };
+
+    match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+        Ok(stream) => {
+            let _ = stream.set_nodelay(true);
+            let reader = match stream.try_clone() {
+                Ok(r) => BufReader::new(r),
+                Err(_) => return false,
+            };
+            let mut inner = inner_arc.lock().unwrap();
+            inner.ipc_conn = Some(IpcConnection {
+                writer: stream,
+                reader,
+            });
+            info!("try_reconnect_ipc: connected to daemon at {}", IPC_SERVER_ADDR);
+            true
+        }
+        Err(e) => {
+            warn!("try_reconnect_ipc: failed to connect to daemon: {}", e);
+            false
+        }
+    }
 }
 
 /// Send a UI command to the daemon via IPC (free function for use outside impl).

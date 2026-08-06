@@ -6,15 +6,11 @@ use super::hook::{
 };
 use super::key_event::{KeyHandlerEditSession, virtual_key_to_key_event};
 use super::langbar::BlackHoleLangBarItem;
-use super::super::ipc::{IPC_SERVER_ADDR, IpcRequest, IpcResponse, read_response, send_request};
-use super::{IpcConnection, ServiceInner, send_ui_command_inner};
+use super::super::ipc::{IpcRequest, IpcResponse, read_response, send_request};
+use super::{ServiceInner, ensure_ipc_connection, send_ui_command_inner};
 use black_hole_shared::{KeyState, UiCommand};
-use std::io::BufReader;
 use std::mem::ManuallyDrop;
-use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use windows::Win32::Foundation::{E_UNEXPECTED, LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -82,56 +78,16 @@ impl BlackHoleTextService {
         }
     }
 
-    /// Connect to the daemon IPC server with retry mechanism.
+    /// 连接 daemon IPC 服务器。
+    /// 在宿主进程线程上执行（Activate），不做 sleep 重试；失败后由按键
+    /// 路径经限频重连（try_reconnect_ipc）恢复，避免阻塞宿主程序。
     fn connect_ipc(&self) -> Result<()> {
-        let inner = self.inner.lock().unwrap();
-        if inner.ipc_conn.is_some() {
-            info!("connect_ipc: already connected");
-            return Ok(());
+        if ensure_ipc_connection(&self.inner) {
+            Ok(())
+        } else {
+            error!("connect_ipc: failed to connect to daemon");
+            Err(E_UNEXPECTED.into())
         }
-        drop(inner);
-
-        let max_retries = 3;
-        let mut retry_delay_ms = 500;
-
-        for attempt in 1..=max_retries {
-            match TcpStream::connect(IPC_SERVER_ADDR) {
-                Ok(stream) => {
-                    let _ = stream.set_nodelay(true);
-                    info!(
-                        "connect_ipc: connected to daemon at {} (attempt {})",
-                        IPC_SERVER_ADDR,
-                        attempt
-                    );
-                    let reader =
-                        BufReader::new(stream.try_clone().map_err(|_| E_UNEXPECTED)?);
-                    let mut inner = self.inner.lock().unwrap();
-                    inner.ipc_conn = Some(IpcConnection {
-                        writer: stream,
-                        reader,
-                    });
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!(
-                        "connect_ipc: failed to connect to daemon (attempt {}/{}): {}",
-                        attempt,
-                        max_retries,
-                        e
-                    );
-                    if attempt < max_retries {
-                        thread::sleep(Duration::from_millis(retry_delay_ms));
-                        retry_delay_ms = (retry_delay_ms * 2).min(3000);
-                    }
-                }
-            }
-        }
-
-        error!(
-            "connect_ipc: failed to connect to daemon after {} attempts",
-            max_retries
-        );
-        Err(E_UNEXPECTED.into())
     }
 
     /// 向 daemon 查询当前的 scheme 和 theme 设置，并更新 ServiceInner，
