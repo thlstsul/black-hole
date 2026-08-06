@@ -9,10 +9,18 @@
 //!
 //! Reference: Microsoft SampleIME project.
 
+use crate::ipc::{IPC_SERVER_ADDR, IpcRequest, IpcResponse, send_request};
+use serde_json::{from_str, to_string};
 use std::ffi::c_void;
+use std::io::{self, BufRead, BufReader, Write};
+use std::mem::discriminant;
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+use tracing::{debug, error, info, warn};
 
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, WPARAM};
 use windows::Win32::UI::TextServices::{
@@ -20,6 +28,7 @@ use windows::Win32::UI::TextServices::{
 };
 use windows_core::{GUID, PCWSTR, w};
 
+use super::{PlatformError, PlatformIme};
 use black_hole_shared::{
     EngineCommand, InputModeSwitch, KeyEvent, SchemeId, SchemeResult, Theme, UiCommand,
 };
@@ -105,8 +114,8 @@ pub(crate) fn get_dll_instance() -> Option<HINSTANCE> {
 
 /// IPC connection wrapper to avoid creating BufReader on every key press.
 pub(crate) struct IpcConnection {
-    pub(crate) writer: std::net::TcpStream,
-    pub(crate) reader: std::io::BufReader<std::net::TcpStream>,
+    pub(crate) writer: TcpStream,
+    pub(crate) reader: BufReader<TcpStream>,
 }
 
 pub(crate) struct ServiceInner {
@@ -187,11 +196,11 @@ pub(crate) fn ensure_ipc_connection(inner_arc: &Arc<Mutex<ServiceInner>>) -> boo
     let mut retry_delay_ms = 200;
 
     for attempt in 1..=max_retries {
-        match std::net::TcpStream::connect(super::ipc::IPC_SERVER_ADDR) {
+        match TcpStream::connect(IPC_SERVER_ADDR) {
             Ok(stream) => {
                 let _ = stream.set_nodelay(true);
                 let reader = match stream.try_clone() {
-                    Ok(r) => std::io::BufReader::new(r),
+                    Ok(r) => BufReader::new(r),
                     Err(_) => return false,
                 };
                 let mut inner = inner_arc.lock().unwrap();
@@ -199,21 +208,19 @@ pub(crate) fn ensure_ipc_connection(inner_arc: &Arc<Mutex<ServiceInner>>) -> boo
                     writer: stream,
                     reader,
                 });
-                tracing::info!(
+                info!(
                     "ensure_ipc_connection: connected to daemon (attempt {})",
                     attempt
                 );
                 return true;
             }
             Err(e) => {
-                tracing::warn!(
+                warn!(
                     "ensure_ipc_connection: failed to connect to daemon (attempt {}/{}): {}",
-                    attempt,
-                    max_retries,
-                    e
+                    attempt, max_retries, e
                 );
                 if attempt < max_retries {
-                    std::thread::sleep(std::time::Duration::from_millis(retry_delay_ms));
+                    thread::sleep(Duration::from_millis(retry_delay_ms));
                     retry_delay_ms = (retry_delay_ms * 2).min(2000);
                 }
             }
@@ -227,28 +234,26 @@ pub(crate) fn ensure_ipc_connection(inner_arc: &Arc<Mutex<ServiceInner>>) -> boo
 /// 连接缺失或已断开时自动重连后再发送,失败记录日志,不再静默丢弃。
 pub(crate) fn send_ui_command_inner(inner_arc: &Arc<Mutex<ServiceInner>>, cmd: UiCommand) {
     if !ensure_ipc_connection(inner_arc) {
-        tracing::warn!(
+        warn!(
             "send_ui_command_inner: no IPC connection, dropping command {:?}",
-            std::mem::discriminant(&cmd)
+            discriminant(&cmd)
         );
         return;
     }
 
-    let request = super::ipc::IpcRequest::UiCommand(cmd);
+    let request = IpcRequest::UiCommand(cmd);
     let mut inner = inner_arc.lock().unwrap();
-    if let Some(ref mut conn) = inner.ipc_conn {
-        if let Err(e) = super::ipc::send_request(&mut conn.writer, &request) {
-            tracing::warn!("send_ui_command_inner: send failed: {}", e);
-            inner.ipc_conn = None;
-        }
+    if let Some(ref mut conn) = inner.ipc_conn
+        && let Err(e) = send_request(&mut conn.writer, &request)
+    {
+        warn!("send_ui_command_inner: send failed: {}", e);
+        inner.ipc_conn = None;
     }
 }
 
 // ---------------------------------------------------------------------------
 // PlatformIme implementation (used by the daemon / test harness)
 // ---------------------------------------------------------------------------
-
-use super::{PlatformError, PlatformIme};
 
 pub struct WindowsTsfIme {
     /// 运行时方案/主题状态，daemon 每次切换方案/主题时同步更新
@@ -280,15 +285,10 @@ impl PlatformIme for WindowsTsfIme {
         platform_rx: Receiver<SchemeResult>,
         ui_tx: Sender<UiCommand>,
     ) -> Result<(), PlatformError> {
-        use std::net::TcpListener;
-
-        let listener = TcpListener::bind(super::ipc::IPC_SERVER_ADDR)
+        let listener = TcpListener::bind(IPC_SERVER_ADDR)
             .map_err(|e| PlatformError::Other(format!("Failed to bind IPC server: {}", e)))?;
 
-        tracing::info!(
-            "Windows TSF IPC server listening on {}",
-            super::ipc::IPC_SERVER_ADDR
-        );
+        info!("Windows TSF IPC server listening on {}", IPC_SERVER_ADDR);
 
         let platform_rx = Arc::new(Mutex::new(platform_rx));
 
@@ -296,21 +296,21 @@ impl PlatformIme for WindowsTsfIme {
             match stream {
                 Ok(stream) => {
                     let _ = stream.set_nodelay(true);
-                    tracing::info!("TSF DLL connected");
+                    info!("TSF DLL connected");
                     let engine_tx = engine_tx.clone();
                     let platform_rx = Arc::clone(&platform_rx);
                     let ui_tx = ui_tx.clone();
                     let current = Arc::clone(&self.current);
-                    std::thread::spawn(move || {
+                    thread::spawn(move || {
                         if let Err(e) =
                             handle_ipc_client(stream, engine_tx, platform_rx, ui_tx, current)
                         {
-                            tracing::error!("IPC client error: {}", e);
+                            error!("IPC client error: {}", e);
                         }
                     });
                 }
                 Err(e) => {
-                    tracing::error!("IPC accept error: {}", e);
+                    error!("IPC accept error: {}", e);
                 }
             }
         }
@@ -320,73 +320,67 @@ impl PlatformIme for WindowsTsfIme {
 }
 
 fn handle_ipc_client(
-    stream: std::net::TcpStream,
+    stream: TcpStream,
     engine_tx: Sender<EngineCommand>,
     platform_rx: Arc<Mutex<Receiver<SchemeResult>>>,
     ui_tx: Sender<UiCommand>,
     current: Arc<Mutex<(SchemeId, Theme)>>,
-) -> std::io::Result<()> {
-    use std::io::{BufRead, Write};
-
-    let mut reader = std::io::BufReader::new(stream.try_clone()?);
+) -> io::Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
     let mut line = String::new();
 
-    let send_engine = |cmd: EngineCommand| -> std::io::Result<SchemeResult> {
+    let send_engine = |cmd: EngineCommand| -> io::Result<SchemeResult> {
         let rx = platform_rx.lock().unwrap();
         engine_tx
             .send(cmd)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
         rx.recv()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))
+            .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))
     };
 
-    let write_response =
-        |writer: &mut std::net::TcpStream, result: SchemeResult| -> std::io::Result<()> {
-            let response: super::ipc::IpcResponse = result.into();
-            let json = serde_json::to_string(&response)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            writeln!(writer, "{}", json)?;
-            writer.flush()
-        };
+    let write_response = |writer: &mut TcpStream, result: SchemeResult| -> io::Result<()> {
+        let response: IpcResponse = result.into();
+        let json =
+            to_string(&response).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        writeln!(writer, "{}", json)?;
+        writer.flush()
+    };
 
     while reader.read_line(&mut line)? > 0 {
-        let request: super::ipc::IpcRequest = serde_json::from_str(line.trim())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let request: IpcRequest =
+            from_str(line.trim()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        tracing::debug!(
-            "handle_ipc_client start: req={:?}",
-            std::mem::discriminant(&request)
-        );
+        debug!("handle_ipc_client start: req={:?}", discriminant(&request));
         match request {
-            super::ipc::IpcRequest::KeyEvent(key) => {
+            IpcRequest::KeyEvent(key) => {
                 let result = send_engine(EngineCommand::Key(key))?;
                 if let SchemeResult::Committed { ref text } = result {
                     let _ = ui_tx.send(UiCommand::CommitText(text.clone()));
                 }
                 write_response(&mut writer, result)?;
             }
-            super::ipc::IpcRequest::SetContext(new_ctx) => {
+            IpcRequest::SetContext(new_ctx) => {
                 let _ = engine_tx.send(EngineCommand::SetContext(new_ctx));
             }
-            super::ipc::IpcRequest::Reset => {
+            IpcRequest::Reset => {
                 let result = send_engine(EngineCommand::Reset)?;
                 let _ = ui_tx.send(UiCommand::HideCandidates);
                 write_response(&mut writer, result)?;
             }
-            super::ipc::IpcRequest::UiCommand(ui_cmd) => {
+            IpcRequest::UiCommand(ui_cmd) => {
                 let _ = ui_tx.send(ui_cmd);
             }
-            super::ipc::IpcRequest::GetSettings => {
+            IpcRequest::GetSettings => {
                 let (scheme_id, theme) = *current.lock().unwrap();
-                let response = super::ipc::IpcResponse::Settings { scheme_id, theme };
-                let json = serde_json::to_string(&response)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                let response = IpcResponse::Settings { scheme_id, theme };
+                let json = to_string(&response)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 writeln!(writer, "{}", json)?;
                 writer.flush()?;
             }
         }
-        tracing::debug!("handle_ipc_client end");
+        debug!("handle_ipc_client end");
 
         line.clear();
     }

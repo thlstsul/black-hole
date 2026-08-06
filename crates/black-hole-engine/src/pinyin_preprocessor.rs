@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 
 /// 拼音预处理器
 ///
@@ -181,7 +183,7 @@ mod tests {
         // 确保没有重复
         let unique_count = variants
             .iter()
-            .collect::<std::collections::HashSet<_>>()
+            .collect::<HashSet<_>>()
             .len();
         assert_eq!(variants.len(), unique_count);
     }

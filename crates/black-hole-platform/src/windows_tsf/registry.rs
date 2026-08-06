@@ -2,6 +2,9 @@ use super::{
     CLSID_BLACKHOLE_TIP, CLSID_TF_INPUTPROCESSORPROFILES, GUID_PROFILE_BLACKHOLE, TIP_DISPLAY_NAME,
     TIP_PROFILE_NAME, get_dll_instance,
 };
+use std::mem;
+use std::ptr;
+use std::slice;
 use windows::Win32::Foundation::{E_FAIL, HMODULE, S_OK};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -12,6 +15,7 @@ use windows::Win32::System::Registry::{
     HKEY, HKEY_CLASSES_ROOT, HKEY_LOCAL_MACHINE, REG_DWORD, REG_SZ, RegCloseKey, RegCreateKeyW,
     RegDeleteTreeW, RegSetValueExW,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::HKL;
 use windows::Win32::UI::TextServices::{
     CLSID_TF_CategoryMgr, CLSID_TF_InputProcessorProfiles, GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER,
     GUID_TFCAT_TIP_KEYBOARD, GUID_TFCAT_TIPCAP_COMLESS, GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
@@ -19,7 +23,7 @@ use windows::Win32::UI::TextServices::{
     GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT, GUID_TFCAT_TIPCAP_UIELEMENTENABLED, ITfCategoryMgr,
     ITfInputProcessorProfileMgr, ITfInputProcessorProfiles,
 };
-use windows_core::{GUID, HRESULT, PCWSTR, w};
+use windows_core::{GUID, HRESULT, IUnknown, PCWSTR, Result, w};
 
 // ---------------------------------------------------------------------------
 // Registry helpers
@@ -27,7 +31,7 @@ use windows_core::{GUID, HRESULT, PCWSTR, w};
 
 unsafe fn set_reg_value(hkey: HKEY, name: PCWSTR, value: PCWSTR) {
     let data = unsafe { value.as_wide() };
-    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
+    let bytes = unsafe { slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
     let _ = unsafe { RegSetValueExW(hkey, name, Some(0), REG_SZ, Some(bytes)) };
 }
 
@@ -36,8 +40,8 @@ unsafe fn set_reg_dword(hkey: HKEY, name: PCWSTR, value: u32) {
     let _ = unsafe { RegSetValueExW(hkey, name, Some(0), REG_DWORD, Some(&bytes)) };
 }
 
-unsafe fn create_key(root: HKEY, path: PCWSTR) -> windows_core::Result<HKEY> {
-    let mut hkey = unsafe { std::mem::zeroed() };
+unsafe fn create_key(root: HKEY, path: PCWSTR) -> Result<HKEY> {
+    let mut hkey = unsafe { mem::zeroed() };
     let result = unsafe { RegCreateKeyW(root, path, &mut hkey) };
     if result.is_err() {
         return Err(result.into());
@@ -50,14 +54,14 @@ unsafe fn register_language_profile(
     clsid: &GUID,
     profile: &GUID,
     langid: &str,
-) -> windows_core::Result<()> {
+) -> Result<()> {
     let lp_path = format!(
         "SOFTWARE\\Microsoft\\CTF\\TIP\\{{{:?}}}\\LanguageProfile\\{}\\{{{:?}}}",
         clsid, langid, profile
     );
     let lp_path_w: Vec<u16> = lp_path.encode_utf16().chain(Some(0)).collect();
     let hkey = unsafe { create_key(root, PCWSTR(lp_path_w.as_ptr()))? };
-    unsafe { set_reg_value(hkey, PCWSTR(std::ptr::null()), TIP_PROFILE_NAME) };
+    unsafe { set_reg_value(hkey, PCWSTR(ptr::null()), TIP_PROFILE_NAME) };
     unsafe { set_reg_dword(hkey, w!("Enable"), 1) };
     let _ = unsafe { RegCloseKey(hkey) };
     Ok(())
@@ -92,7 +96,7 @@ extern "system" fn DllRegisterServer() -> HRESULT {
             Ok(h) => h,
             Err(_) => return E_FAIL,
         };
-        set_reg_value(hkey, PCWSTR(std::ptr::null()), TIP_DISPLAY_NAME);
+        set_reg_value(hkey, PCWSTR(ptr::null()), TIP_DISPLAY_NAME);
         let _ = RegCloseKey(hkey);
 
         // InprocServer32
@@ -106,7 +110,7 @@ extern "system" fn DllRegisterServer() -> HRESULT {
         let instance = get_dll_instance().unwrap_or_default();
         let _len = GetModuleFileNameW(Some(HMODULE(instance.0)), &mut dll_path);
         let dll_path_pcw = PCWSTR(dll_path.as_ptr());
-        set_reg_value(hkey, PCWSTR(std::ptr::null()), dll_path_pcw);
+        set_reg_value(hkey, PCWSTR(ptr::null()), dll_path_pcw);
         set_reg_value(hkey, w!("ThreadingModel"), w!("Apartment"));
         let _ = RegCloseKey(hkey);
 
@@ -132,7 +136,7 @@ extern "system" fn DllRegisterServer() -> HRESULT {
             Ok(h) => h,
             Err(_) => return E_FAIL,
         };
-        set_reg_value(hkey, PCWSTR(std::ptr::null()), TIP_DISPLAY_NAME);
+        set_reg_value(hkey, PCWSTR(ptr::null()), TIP_DISPLAY_NAME);
         let _ = RegCloseKey(hkey);
 
         for (_, langid_str) in PROFILE_LANGIDS {
@@ -155,7 +159,7 @@ extern "system" fn DllRegisterServer() -> HRESULT {
         );
         let ctf_tip_path_wow_w: Vec<u16> = ctf_tip_path_wow.encode_utf16().chain(Some(0)).collect();
         if let Ok(hkey) = create_key(HKEY_LOCAL_MACHINE, PCWSTR(ctf_tip_path_wow_w.as_ptr())) {
-            set_reg_value(hkey, PCWSTR(std::ptr::null()), TIP_DISPLAY_NAME);
+            set_reg_value(hkey, PCWSTR(ptr::null()), TIP_DISPLAY_NAME);
             let _ = RegCloseKey(hkey);
 
             for (_, langid_str) in PROFILE_LANGIDS {
@@ -174,7 +178,7 @@ extern "system" fn DllRegisterServer() -> HRESULT {
 
         if com_initialized || hr.0 == 0x80010106u32 as i32 {
             if let Ok(profile_mgr) = CoCreateInstance::<
-                Option<&windows_core::IUnknown>,
+                Option<&IUnknown>,
                 ITfInputProcessorProfileMgr,
             >(
                 &CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER
@@ -196,7 +200,7 @@ extern "system" fn DllRegisterServer() -> HRESULT {
                         &desc,
                         &icon_file,
                         0,
-                        windows::Win32::UI::Input::KeyboardAndMouse::HKL(std::ptr::null_mut()),
+                        HKL(ptr::null_mut()),
                         0,
                         true,
                         0,
@@ -204,7 +208,7 @@ extern "system" fn DllRegisterServer() -> HRESULT {
                 }
             }
 
-            if let Ok(cat_mgr) = CoCreateInstance::<Option<&windows_core::IUnknown>, ITfCategoryMgr>(
+            if let Ok(cat_mgr) = CoCreateInstance::<Option<&IUnknown>, ITfCategoryMgr>(
                 &CLSID_TF_CategoryMgr,
                 None,
                 CLSCTX_INPROC_SERVER,
@@ -216,7 +220,7 @@ extern "system" fn DllRegisterServer() -> HRESULT {
             }
 
             if let Ok(profiles) = CoCreateInstance::<
-                Option<&windows_core::IUnknown>,
+                Option<&IUnknown>,
                 ITfInputProcessorProfiles,
             >(
                 &CLSID_TF_INPUTPROCESSORPROFILES, None, CLSCTX_INPROC_SERVER
@@ -244,7 +248,7 @@ extern "system" fn DllUnregisterServer() -> HRESULT {
 
         if com_initialized || hr.0 == 0x80010106u32 as i32 {
             if let Ok(profile_mgr) = CoCreateInstance::<
-                Option<&windows_core::IUnknown>,
+                Option<&IUnknown>,
                 ITfInputProcessorProfileMgr,
             >(
                 &CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER
@@ -259,7 +263,7 @@ extern "system" fn DllUnregisterServer() -> HRESULT {
                 }
             }
 
-            if let Ok(cat_mgr) = CoCreateInstance::<Option<&windows_core::IUnknown>, ITfCategoryMgr>(
+            if let Ok(cat_mgr) = CoCreateInstance::<Option<&IUnknown>, ITfCategoryMgr>(
                 &CLSID_TF_CategoryMgr,
                 None,
                 CLSCTX_INPROC_SERVER,

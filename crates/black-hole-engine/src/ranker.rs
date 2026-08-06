@@ -1,5 +1,7 @@
 use crate::CandidateRanker;
 use black_hole_shared::Candidate;
+use std::cmp::Reverse;
+use std::collections::HashMap;
 
 /// 基于词频的简单候选排序器
 pub struct SimpleRanker;
@@ -24,7 +26,7 @@ impl CandidateRanker for SimpleRanker {
 
 /// 按 score 降序排列候选词
 fn rank_by_score_desc(candidates: &mut [Candidate]) {
-    candidates.sort_by_key(|b| std::cmp::Reverse(b.score));
+    candidates.sort_by_key(|b| Reverse(b.score));
 }
 
 /// 融合用户历史的候选排序器
@@ -53,7 +55,7 @@ impl UserAwareRanker {
     pub fn rank_with_frequencies(
         &self,
         candidates: &mut [Candidate],
-        user_freqs: &std::collections::HashMap<String, i64>,
+        user_freqs: &HashMap<String, i64>,
     ) {
         for c in candidates.iter_mut() {
             if let Some(freq) = user_freqs.get(&c.text) {

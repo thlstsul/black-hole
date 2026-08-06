@@ -1,14 +1,19 @@
 use black_hole_engine::EngineBuilder;
-use black_hole_shared::{EngineCommand, InputContext, KeyEvent, KeyState, Modifiers, SchemeId};
+use black_hole_shared::{
+    EngineCommand, InputContext, KeyEvent, KeyState, Modifiers, SchemeId, SchemeResult,
+};
+use std::env;
 use std::io::{self, Write};
+use tracing::info;
+use tracing_subscriber::fmt;
 
 fn main() {
-    tracing_subscriber::fmt()
+    fmt()
         .with_target(false)
         .without_time()
         .init();
 
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = env::args().collect();
     let mut dict_path: Option<&str> = None;
     let mut i = 1;
     while i < args.len() {
@@ -38,11 +43,11 @@ fn main() {
         i += 1;
     }
 
-    tracing::info!("Black-Hole IME CLI Test Harness");
-    tracing::info!("Commands: :pinyin | :shuangpin | :quit");
-    tracing::info!("Input code and press Enter.");
+    info!("Black-Hole IME CLI Test Harness");
+    info!("Commands: :pinyin | :shuangpin | :quit");
+    info!("Input code and press Enter.");
     if let Some(path) = dict_path {
-        tracing::info!("Loading RIME dictionary from: {}", path);
+        info!("Loading RIME dictionary from: {}", path);
     }
 
     let mut current_scheme = SchemeId::Pinyin;
@@ -81,13 +86,13 @@ fn main() {
             ":pinyin" => {
                 current_scheme = SchemeId::Pinyin;
                 engine.process(&EngineCommand::SwitchScheme(current_scheme), &ctx);
-                tracing::info!("Switched to 拼音");
+                info!("Switched to 拼音");
                 continue;
             }
             ":shuangpin" => {
                 current_scheme = SchemeId::Shuangpin;
                 engine.process(&EngineCommand::SwitchScheme(current_scheme), &ctx);
-                tracing::info!("Switched to 小鹤双拼");
+                info!("Switched to 小鹤双拼");
                 continue;
             }
             _ => {}
@@ -108,25 +113,25 @@ fn main() {
             };
             let result = engine.process(&EngineCommand::Key(key), &ctx);
             match result {
-                black_hole_shared::SchemeResult::Composing {
+                SchemeResult::Composing {
                     code,
                     candidates,
                     selected_index,
                     ..
                 } => {
-                    tracing::info!("  composing: {}", code);
+                    info!("  composing: {}", code);
                     for (i, c) in candidates.iter().enumerate() {
                         let marker = if i == selected_index { ">" } else { " " };
-                        tracing::info!("    {} {}. {}", marker, i + 1, c.text);
+                        info!("    {} {}. {}", marker, i + 1, c.text);
                     }
                     if candidates.is_empty() {
-                        tracing::info!("    (no candidates)");
+                        info!("    (no candidates)");
                     }
                 }
-                black_hole_shared::SchemeResult::Committed { text } => {
-                    tracing::info!("  committed: {}", text);
+                SchemeResult::Committed { text } => {
+                    info!("  committed: {}", text);
                 }
-                black_hole_shared::SchemeResult::Ignored => {
+                SchemeResult::Ignored => {
                     // 忽略非字母输入
                 }
             }
@@ -145,14 +150,14 @@ fn main() {
             state: KeyState::Press,
         };
         let result = engine.process(&EngineCommand::Key(enter_key), &ctx);
-        if let black_hole_shared::SchemeResult::Committed { text } = result {
-            tracing::info!("  committed: {}", text);
+        if let SchemeResult::Committed { text } = result {
+            info!("  committed: {}", text);
         }
 
         // 重置引擎状态，准备下一行输入
         engine.process(&EngineCommand::Reset, &ctx);
-        tracing::info!("");
+        info!("");
     }
 
-    tracing::info!("Goodbye!");
+    info!("Goodbye!");
 }

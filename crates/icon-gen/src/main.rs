@@ -6,23 +6,26 @@
 //! 用法:
 //!   cargo run -p icon-gen [SVG路径] [ICO输出路径]
 
+use std::env;
+use std::error::Error;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process;
 
 /// 需要生成的图标尺寸
 const SIZES: [u16; 5] = [256, 64, 48, 32, 16];
 
 fn main() {
     let repo_root =
-        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into()))
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into()))
             .parent()
             .unwrap()
             .parent()
             .unwrap()
             .to_path_buf();
 
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = env::args().collect();
     let svg_path = args
         .get(1)
         .map(PathBuf::from)
@@ -34,11 +37,11 @@ fn main() {
 
     if let Err(e) = run(&svg_path, &ico_path) {
         eprintln!("[ERROR] {e}");
-        std::process::exit(1);
+        process::exit(1);
     }
 }
 
-fn run(svg_path: &Path, ico_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn run(svg_path: &Path, ico_path: &Path) -> Result<(), Box<dyn Error>> {
     eprintln!("[ICON] Generating icons from SVG...");
 
     if !svg_path.exists() {
@@ -98,7 +101,7 @@ fn run(svg_path: &Path, ico_path: &Path) -> Result<(), Box<dyn std::error::Error
 }
 
 /// 将多个 PNG 数据合并为一个 ICO 文件
-fn write_ico(entries: &[(u16, Vec<u8>)], path: &Path) -> std::io::Result<()> {
+fn write_ico(entries: &[(u16, Vec<u8>)], path: &Path) -> io::Result<()> {
     let count = entries.len() as u16;
     let mut buf: Vec<u8> = Vec::new();
 

@@ -1,7 +1,8 @@
 use crate::{Codec, CodecState, SyllableGraph};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::OnceLock;
+use tracing::debug;
 
 /// 拼音音节切分器
 pub struct PinyinCodec {
@@ -12,7 +13,7 @@ pub struct PinyinCodec {
     /// 存储所有可能的切分结果（用于多策略查询）
     all_segmentations: Vec<Vec<String>>,
     /// 优化：缓存历史计算结果，避免删除时重复计算
-    segmentation_cache: std::collections::HashMap<String, Vec<Vec<String>>>,
+    segmentation_cache: HashMap<String, Vec<Vec<String>>>,
 }
 
 impl Default for PinyinCodec {
@@ -29,7 +30,7 @@ impl PinyinCodec {
             full_input: String::new(),
             valid_syllables: build_syllable_set(),
             all_segmentations: Vec::new(),
-            segmentation_cache: std::collections::HashMap::new(),
+            segmentation_cache: HashMap::new(),
         }
     }
 
@@ -88,7 +89,7 @@ impl PinyinCodec {
     }
 
     fn rebuild(&mut self) {
-        tracing::debug!("rebuild start: input='{}'", self.full_input);
+        debug!("rebuild start: input='{}'", self.full_input);
         self.syllables.clear();
         self.raw_input.clear();
 
@@ -116,7 +117,7 @@ impl PinyinCodec {
                 .insert(self.full_input.clone(), self.all_segmentations.clone());
         }
 
-        tracing::debug!(
+        debug!(
             "rebuild end: input='{}', syllables={}, segmentations={}",
             self.full_input,
             self.syllables.len(),

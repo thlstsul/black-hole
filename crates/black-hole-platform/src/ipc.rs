@@ -3,9 +3,12 @@
 //! 用于 Windows TSF DLL 与 daemon 之间的跨进程通信。
 //! 基于 TCP localhost socket + JSON 序列化，轻量且无需额外依赖。
 
-use black_hole_shared::{InputContext, KeyEvent, SchemeId, SchemeResult, Theme, UiCommand};
+use black_hole_shared::{
+    Candidate, InputContext, KeyEvent, SchemeId, SchemeResult, Theme, UiCommand,
+};
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, Write};
+use serde_json::{from_str, to_string};
+use std::io::{self, BufRead, Write};
 
 /// TSF DLL → Daemon 的请求
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,7 +28,7 @@ pub enum IpcRequest {
 pub enum IpcResponse {
     Composing {
         code: String,
-        candidates: Vec<black_hole_shared::Candidate>,
+        candidates: Vec<Candidate>,
         selected_index: usize,
         expanded: bool,
     },
@@ -86,20 +89,20 @@ impl From<IpcResponse> for SchemeResult {
 }
 
 /// IPC 通信辅助函数：发送请求到 stream
-pub fn send_request<W: Write>(writer: &mut W, request: &IpcRequest) -> Result<(), std::io::Error> {
-    let json = serde_json::to_string(request)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+pub fn send_request<W: Write>(writer: &mut W, request: &IpcRequest) -> Result<(), io::Error> {
+    let json = to_string(request)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     writeln!(writer, "{}", json)?;
     writer.flush()?;
     Ok(())
 }
 
 /// IPC 通信辅助函数：从 stream 读取响应
-pub fn read_response<R: BufRead>(reader: &mut R) -> Result<IpcResponse, std::io::Error> {
+pub fn read_response<R: BufRead>(reader: &mut R) -> Result<IpcResponse, io::Error> {
     let mut line = String::new();
     reader.read_line(&mut line)?;
-    let response: IpcResponse = serde_json::from_str(line.trim())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let response: IpcResponse = from_str(line.trim())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(response)
 }
 

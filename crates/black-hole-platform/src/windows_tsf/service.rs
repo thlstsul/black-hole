@@ -1,10 +1,24 @@
-use super::super::ipc::{IpcRequest, IpcResponse};
-use super::{ServiceInner, send_ui_command_inner};
+use super::caret::LayoutChangeEditSession;
+use super::commit::CancelCompositionEditSession;
+use super::dll_release;
+use super::hook::{
+    clear_foreground_thread, register_service, set_foreground_thread, unregister_service,
+};
+use super::key_event::{KeyHandlerEditSession, virtual_key_to_key_event};
+use super::langbar::BlackHoleLangBarItem;
+use super::super::ipc::{IPC_SERVER_ADDR, IpcRequest, IpcResponse, read_response, send_request};
+use super::{IpcConnection, ServiceInner, send_ui_command_inner};
 use black_hole_shared::{KeyState, UiCommand};
+use std::io::BufReader;
+use std::mem::ManuallyDrop;
+use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+use tracing::{debug, error, info, warn};
 use windows::Win32::Foundation::{E_UNEXPECTED, LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::System::Variant::{VARIANT, VT_I4};
+use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_I4};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VIRTUAL_KEY, VK_CONTROL};
 use windows::Win32::UI::TextServices::{
     GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
@@ -16,7 +30,7 @@ use windows::Win32::UI::TextServices::{
     TF_CONVERSIONMODE_NATIVE, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC, TF_LBI_ICON, TF_LC_CHANGE,
     TfLayoutCode,
 };
-use windows_core::{BOOL, GUID, Interface, Ref, implement};
+use windows_core::{BOOL, GUID, Interface, Ref, Result, implement};
 
 // ---------------------------------------------------------------------------
 // COM object: BlackHoleTextService
@@ -46,7 +60,7 @@ impl Default for BlackHoleTextService {
 impl Drop for BlackHoleTextService {
     fn drop(&mut self) {
         if self.track_ref_count {
-            super::dll_release();
+            dll_release();
         }
     }
 }
@@ -69,10 +83,10 @@ impl BlackHoleTextService {
     }
 
     /// Connect to the daemon IPC server with retry mechanism.
-    fn connect_ipc(&self) -> windows_core::Result<()> {
+    fn connect_ipc(&self) -> Result<()> {
         let inner = self.inner.lock().unwrap();
         if inner.ipc_conn.is_some() {
-            tracing::info!("connect_ipc: already connected");
+            info!("connect_ipc: already connected");
             return Ok(());
         }
         drop(inner);
@@ -81,39 +95,39 @@ impl BlackHoleTextService {
         let mut retry_delay_ms = 500;
 
         for attempt in 1..=max_retries {
-            match std::net::TcpStream::connect(super::super::ipc::IPC_SERVER_ADDR) {
+            match TcpStream::connect(IPC_SERVER_ADDR) {
                 Ok(stream) => {
                     let _ = stream.set_nodelay(true);
-                    tracing::info!(
+                    info!(
                         "connect_ipc: connected to daemon at {} (attempt {})",
-                        super::super::ipc::IPC_SERVER_ADDR,
+                        IPC_SERVER_ADDR,
                         attempt
                     );
                     let reader =
-                        std::io::BufReader::new(stream.try_clone().map_err(|_| E_UNEXPECTED)?);
+                        BufReader::new(stream.try_clone().map_err(|_| E_UNEXPECTED)?);
                     let mut inner = self.inner.lock().unwrap();
-                    inner.ipc_conn = Some(super::IpcConnection {
+                    inner.ipc_conn = Some(IpcConnection {
                         writer: stream,
                         reader,
                     });
                     return Ok(());
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    warn!(
                         "connect_ipc: failed to connect to daemon (attempt {}/{}): {}",
                         attempt,
                         max_retries,
                         e
                     );
                     if attempt < max_retries {
-                        std::thread::sleep(std::time::Duration::from_millis(retry_delay_ms));
+                        thread::sleep(Duration::from_millis(retry_delay_ms));
                         retry_delay_ms = (retry_delay_ms * 2).min(3000);
                     }
                 }
             }
         }
 
-        tracing::error!(
+        error!(
             "connect_ipc: failed to connect to daemon after {} attempts",
             max_retries
         );
@@ -126,13 +140,13 @@ impl BlackHoleTextService {
         let mut inner = self.inner.lock().unwrap();
         if let Some(ref mut conn) = inner.ipc_conn {
             let request = IpcRequest::GetSettings;
-            if super::super::ipc::send_request(&mut conn.writer, &request).is_ok()
+            if send_request(&mut conn.writer, &request).is_ok()
                 && let Ok(IpcResponse::Settings { scheme_id, theme }) =
-                    super::super::ipc::read_response(&mut conn.reader)
+                    read_response(&mut conn.reader)
             {
                 inner.current_scheme = scheme_id;
                 inner.current_theme = theme;
-                tracing::info!(
+                info!(
                     "Synced settings from daemon: scheme={:?}, theme={:?}",
                     scheme_id,
                     theme
@@ -159,15 +173,15 @@ impl BlackHoleTextService {
         let (ctx_opt, client_id) = {
             let mut inner = self.inner.lock().unwrap();
             if let Some(ref mut conn) = inner.ipc_conn {
-                let request = super::super::ipc::IpcRequest::Reset;
-                let _ = super::super::ipc::send_request(&mut conn.writer, &request);
-                let _ = super::super::ipc::read_response(&mut conn.reader);
+                let request = IpcRequest::Reset;
+                let _ = send_request(&mut conn.writer, &request);
+                let _ = read_response(&mut conn.reader);
             }
             (inner.context.clone(), inner.client_id)
         };
 
         if let Some(ctx) = ctx_opt {
-            let session = super::commit::CancelCompositionEditSession {
+            let session = CancelCompositionEditSession {
                 inner_arc: self.inner.clone(),
             };
             let edit_session: ITfEditSession = session.into();
@@ -191,7 +205,7 @@ impl BlackHoleTextService {
     /// 中英文模式切换后的收尾工作：取消进行中的 composition、
     /// 重置引擎状态、同步系统输入法状态并刷新语言栏图标。
     fn on_input_mode_toggled(&self, english: bool) {
-        tracing::info!(
+        info!(
             "Input mode toggled: {}",
             if english { "英文" } else { "中文" }
         );
@@ -228,7 +242,7 @@ impl BlackHoleTextService {
         if let Ok(comp) = unsafe { mgr.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_OPENCLOSE) } {
             let value = variant_i32(if english { 0 } else { 1 });
             if let Err(e) = unsafe { comp.SetValue(client_id, &value) } {
-                tracing::warn!("Failed to set OPENCLOSE compartment: {}", e);
+                warn!("Failed to set OPENCLOSE compartment: {}", e);
             }
         }
 
@@ -242,7 +256,7 @@ impl BlackHoleTextService {
             };
             let value = variant_i32(mode as i32);
             if let Err(e) = unsafe { comp.SetValue(client_id, &value) } {
-                tracing::warn!("Failed to set INPUTMODE_CONVERSION compartment: {}", e);
+                warn!("Failed to set INPUTMODE_CONVERSION compartment: {}", e);
             }
         }
     }
@@ -257,9 +271,6 @@ pub(crate) fn apply_input_mode_toggle(inner: &Arc<Mutex<ServiceInner>>, english:
 
 /// 构造 VT_I4 类型的 VARIANT（windows crate 的 Win32 VARIANT 未提供 From<i32>）
 fn variant_i32(v: i32) -> VARIANT {
-    use std::mem::ManuallyDrop;
-    use windows::Win32::System::Variant::{VARIANT_0, VARIANT_0_0, VARIANT_0_0_0};
-
     VARIANT {
         Anonymous: VARIANT_0 {
             Anonymous: ManuallyDrop::new(VARIANT_0_0 {
@@ -278,8 +289,8 @@ fn variant_i32(v: i32) -> VARIANT {
 // ---------------------------------------------------------------------------
 
 impl ITfTextInputProcessor_Impl for BlackHoleTextService_Impl {
-    fn Activate(&self, ptim: Ref<'_, ITfThreadMgr>, tid: u32) -> windows_core::Result<()> {
-        tracing::info!("BlackHoleTextService::Activate called tid={}", tid);
+    fn Activate(&self, ptim: Ref<'_, ITfThreadMgr>, tid: u32) -> Result<()> {
+        info!("BlackHoleTextService::Activate called tid={}", tid);
         let mut inner = self.inner.lock().unwrap();
         inner.thread_mgr = ptim.to_owned();
         inner.client_id = tid;
@@ -307,21 +318,21 @@ impl ITfTextInputProcessor_Impl for BlackHoleTextService_Impl {
         // 注册语言栏项（任务栏输入法指示器左侧的专属托盘）
         match tm.cast::<ITfLangBarItemMgr>() {
             Ok(langbar_mgr) => {
-                let item = super::langbar::BlackHoleLangBarItem::new(self.inner.clone());
+                let item = BlackHoleLangBarItem::new(self.inner.clone());
                 let item_iface: ITfLangBarItem = item.into();
                 match unsafe { langbar_mgr.AddItem(&item_iface) } {
                     Ok(()) => {
                         let mut inner = self.inner.lock().unwrap();
                         inner.langbar_item = Some(item_iface);
-                        tracing::info!("Language bar item registered");
+                        info!("Language bar item registered");
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to add language bar item: {}", e);
+                        warn!("Failed to add language bar item: {}", e);
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!("Failed to obtain ITfLangBarItemMgr: {}", e);
+                warn!("Failed to obtain ITfLangBarItemMgr: {}", e);
             }
         }
 
@@ -329,7 +340,7 @@ impl ITfTextInputProcessor_Impl for BlackHoleTextService_Impl {
 
         // 注册全局键盘钩子（Ctrl 切换用）：Chrome 等应用不把修饰键事件转发给
         // TSF，需通过 WH_KEYBOARD_LL 直接监听物理按键。
-        super::hook::register_service(unsafe { GetCurrentThreadId() }, self.inner.clone());
+        register_service(unsafe { GetCurrentThreadId() }, self.inner.clone());
 
         // 连接成功后，向 daemon 查询当前设置，确保托盘菜单勾选正确。
         self.sync_settings_from_daemon();
@@ -342,7 +353,7 @@ impl ITfTextInputProcessor_Impl for BlackHoleTextService_Impl {
         Ok(())
     }
 
-    fn Deactivate(&self) -> windows_core::Result<()> {
+    fn Deactivate(&self) -> Result<()> {
         // 先取出需要注销所需的数据，避免在持有 inner 锁时调用 COM 方法。
         // COM 方法可能回调到同一线程的其它接口方法（如 UnadviseSink），
         // 导致 std::sync::Mutex 重入死锁。
@@ -372,12 +383,12 @@ impl ITfTextInputProcessor_Impl for BlackHoleTextService_Impl {
             && let Some(ref item) = langbar_item
         {
             let _ = unsafe { langbar_mgr.RemoveItem(item) };
-            tracing::info!("Language bar item removed");
+            info!("Language bar item removed");
         }
 
         self.send_reset();
         self.disconnect_ipc();
-        super::hook::unregister_service(unsafe { GetCurrentThreadId() });
+        unregister_service(unsafe { GetCurrentThreadId() });
         let mut inner = self.inner.lock().unwrap();
         inner.context = None;
         inner.thread_mgr = None;
@@ -395,7 +406,7 @@ impl ITfTextInputProcessor_Impl for BlackHoleTextService_Impl {
 // ---------------------------------------------------------------------------
 
 impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
-    fn OnSetFocus(&self, fforeground: BOOL) -> windows_core::Result<()> {
+    fn OnSetFocus(&self, fforeground: BOOL) -> Result<()> {
         {
             let mut inner = self.inner.lock().unwrap();
             inner.last_caret_pos = None;
@@ -403,9 +414,9 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         // 记录 TSF 输入焦点：WebView2 等多进程应用的 IME 承载进程与宿主窗口
         // 进程不同，GetForegroundWindow 不可靠，钩子依赖此处的焦点状态判定前台。
         if fforeground.as_bool() {
-            super::hook::set_foreground_thread(unsafe { GetCurrentThreadId() });
+            set_foreground_thread(unsafe { GetCurrentThreadId() });
         } else {
-            super::hook::clear_foreground_thread();
+            clear_foreground_thread();
         }
         if !fforeground.as_bool() {
             self.send_reset();
@@ -418,9 +429,9 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         _pic: Ref<'_, ITfContext>,
         wparam: WPARAM,
         lparam: LPARAM,
-    ) -> windows_core::Result<BOOL> {
+    ) -> Result<BOOL> {
         let vk = VIRTUAL_KEY(wparam.0 as u16);
-        tracing::debug!(
+        debug!(
             "OnTestKeyDown: vk=0x{:04X} ctrl_held={}",
             vk.0,
             unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0
@@ -436,7 +447,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         }
 
         if let Some(evt) =
-            super::key_event::virtual_key_to_key_event(vk, wparam, lparam, KeyState::Press)
+            virtual_key_to_key_event(vk, wparam, lparam, KeyState::Press)
         {
             let is_composing = self.is_composing();
             let is_input_char = evt.key.len() == 1 && {
@@ -474,10 +485,10 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         _pic: Ref<'_, ITfContext>,
         wparam: WPARAM,
         _lparam: LPARAM,
-    ) -> windows_core::Result<BOOL> {
+    ) -> Result<BOOL> {
         // Ctrl 切换已由全局键盘钩子（hook.rs）统一处理，这里不再处理按键松开。
         let vk = VIRTUAL_KEY(wparam.0 as u16);
-        tracing::debug!(
+        debug!(
             "OnTestKeyUp: vk=0x{:04X} ctrl_held={}",
             vk.0,
             unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0
@@ -490,7 +501,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         pic: Ref<'_, ITfContext>,
         wparam: WPARAM,
         lparam: LPARAM,
-    ) -> windows_core::Result<BOOL> {
+    ) -> Result<BOOL> {
         // 英文模式下不处理任何按键。
         {
             let inner = self.inner.lock().unwrap();
@@ -513,8 +524,8 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         let key_event = match cached_event {
             Some(evt) => evt,
             None => {
-                let vk = windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(wparam.0 as u16);
-                match super::key_event::virtual_key_to_key_event(
+                let vk = VIRTUAL_KEY(wparam.0 as u16);
+                match virtual_key_to_key_event(
                     vk,
                     wparam,
                     lparam,
@@ -542,7 +553,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
             inner.context = pic.to_owned();
         }
 
-        let session = super::key_event::KeyHandlerEditSession {
+        let session = KeyHandlerEditSession {
             service: self.inner.clone(),
             key_event,
         };
@@ -565,7 +576,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         _pic: Ref<'_, ITfContext>,
         _wparam: WPARAM,
         _lparam: LPARAM,
-    ) -> windows_core::Result<BOOL> {
+    ) -> Result<BOOL> {
         Ok(BOOL(0))
     }
 
@@ -573,7 +584,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         &self,
         _pic: Ref<'_, ITfContext>,
         _rguid: *const GUID,
-    ) -> windows_core::Result<BOOL> {
+    ) -> Result<BOOL> {
         Ok(BOOL(0))
     }
 }
@@ -587,7 +598,7 @@ impl ITfCompositionSink_Impl for BlackHoleTextService_Impl {
         &self,
         _ecwrite: u32,
         _pcomposition: Ref<'_, ITfComposition>,
-    ) -> windows_core::Result<()> {
+    ) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.composition = None;
         if let Some(cookie) = inner.layout_sink_cookie.take()
@@ -610,7 +621,7 @@ impl ITfTextLayoutSink_Impl for BlackHoleTextService_Impl {
         pic: Ref<'_, ITfContext>,
         lcode: TfLayoutCode,
         _pview: Ref<'_, ITfContextView>,
-    ) -> windows_core::Result<()> {
+    ) -> Result<()> {
         if lcode != TF_LC_CHANGE {
             return Ok(());
         }
@@ -630,7 +641,7 @@ impl ITfTextLayoutSink_Impl for BlackHoleTextService_Impl {
             }
         }
 
-        let session = super::caret::LayoutChangeEditSession {
+        let session = LayoutChangeEditSession {
             inner_arc: self.inner.clone(),
         };
         let edit_session: ITfEditSession = session.into();
@@ -652,11 +663,11 @@ impl ITfTextLayoutSink_Impl for BlackHoleTextService_Impl {
 // ---------------------------------------------------------------------------
 
 impl ITfThreadMgrEventSink_Impl for BlackHoleTextService_Impl {
-    fn OnInitDocumentMgr(&self, _pdocmgr: Ref<'_, ITfDocumentMgr>) -> windows_core::Result<()> {
+    fn OnInitDocumentMgr(&self, _pdocmgr: Ref<'_, ITfDocumentMgr>) -> Result<()> {
         Ok(())
     }
 
-    fn OnUninitDocumentMgr(&self, _pdocmgr: Ref<'_, ITfDocumentMgr>) -> windows_core::Result<()> {
+    fn OnUninitDocumentMgr(&self, _pdocmgr: Ref<'_, ITfDocumentMgr>) -> Result<()> {
         Ok(())
     }
 
@@ -664,7 +675,7 @@ impl ITfThreadMgrEventSink_Impl for BlackHoleTextService_Impl {
         &self,
         _pdocmgrfocus: Ref<'_, ITfDocumentMgr>,
         _pdocmgrprevfocus: Ref<'_, ITfDocumentMgr>,
-    ) -> windows_core::Result<()> {
+    ) -> Result<()> {
         {
             let mut inner = self.inner.lock().unwrap();
             inner.last_caret_pos = None;
@@ -673,11 +684,11 @@ impl ITfThreadMgrEventSink_Impl for BlackHoleTextService_Impl {
         Ok(())
     }
 
-    fn OnPushContext(&self, _pic: Ref<'_, ITfContext>) -> windows_core::Result<()> {
+    fn OnPushContext(&self, _pic: Ref<'_, ITfContext>) -> Result<()> {
         Ok(())
     }
 
-    fn OnPopContext(&self, _pic: Ref<'_, ITfContext>) -> windows_core::Result<()> {
+    fn OnPopContext(&self, _pic: Ref<'_, ITfContext>) -> Result<()> {
         Ok(())
     }
 }

@@ -3,9 +3,11 @@
 mod app;
 mod args;
 
+use std::process;
+
 fn main() {
     if let Err(e) = app::App::run() {
         eprintln!("Daemon failed: {}", e);
-        std::process::exit(1);
+        process::exit(1);
     }
 }

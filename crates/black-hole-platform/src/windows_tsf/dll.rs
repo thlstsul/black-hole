@@ -1,8 +1,22 @@
-use super::{CLSID_BLACKHOLE_TIP, GLOBAL_REF_COUNT, dll_add_ref, dll_release};
+use super::service::BlackHoleTextService;
+use super::{CLSID_BLACKHOLE_TIP, GLOBAL_REF_COUNT, dll_add_ref, dll_release, set_dll_instance};
+use std::env;
 use std::ffi::c_void;
-use windows::Win32::Foundation::{CLASS_E_NOAGGREGATION, E_POINTER, HINSTANCE, S_FALSE, S_OK};
+use std::fs;
+use std::ptr;
+use std::process;
+use std::sync::Once;
+#[cfg(debug_assertions)]
+use tracing::Level;
+#[cfg(debug_assertions)]
+use tracing_appender::non_blocking;
+#[cfg(debug_assertions)]
+use tracing_subscriber::fmt;
+use windows::Win32::Foundation::{
+    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_POINTER, HINSTANCE, S_FALSE, S_OK,
+};
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
-use windows_core::{BOOL, GUID, HRESULT, Interface, Ref, implement};
+use windows_core::{BOOL, GUID, HRESULT, Interface, IUnknown, Ref, Result, implement};
 
 // ---------------------------------------------------------------------------
 // COM object: BlackHoleClassFactory
@@ -14,10 +28,10 @@ pub struct BlackHoleClassFactory;
 impl IClassFactory_Impl for BlackHoleClassFactory_Impl {
     fn CreateInstance(
         &self,
-        punkouter: Ref<'_, windows_core::IUnknown>,
+        punkouter: Ref<'_, IUnknown>,
         riid: *const GUID,
         ppv: *mut *mut c_void,
-    ) -> windows_core::Result<()> {
+    ) -> Result<()> {
         if !punkouter.is_null() {
             return Err(CLASS_E_NOAGGREGATION.into());
         }
@@ -25,11 +39,11 @@ impl IClassFactory_Impl for BlackHoleClassFactory_Impl {
             return Err(E_POINTER.into());
         }
         unsafe {
-            *ppv = std::ptr::null_mut();
+            *ppv = ptr::null_mut();
         }
 
-        let service = super::service::BlackHoleTextService::new();
-        let unknown: windows_core::IUnknown = service.into();
+        let service = BlackHoleTextService::new();
+        let unknown: IUnknown = service.into();
         unsafe {
             unknown.query(riid, ppv).ok()?;
         }
@@ -37,7 +51,7 @@ impl IClassFactory_Impl for BlackHoleClassFactory_Impl {
         Ok(())
     }
 
-    fn LockServer(&self, flock: BOOL) -> windows_core::Result<()> {
+    fn LockServer(&self, flock: BOOL) -> Result<()> {
         if flock.as_bool() {
             dll_add_ref();
         } else {
@@ -54,7 +68,7 @@ impl IClassFactory_Impl for BlackHoleClassFactory_Impl {
 const DLL_PROCESS_ATTACH: u32 = 1;
 
 #[cfg(debug_assertions)]
-static INIT_LOGS: std::sync::Once = std::sync::Once::new();
+static INIT_LOGS: Once = Once::new();
 
 /// Initialize tracing subscriber to write DLL logs to a file.
 /// Each process gets its own log file under `%TEMP%`.
@@ -62,11 +76,11 @@ static INIT_LOGS: std::sync::Once = std::sync::Once::new();
 #[cfg(debug_assertions)]
 fn init_dll_logging() {
     INIT_LOGS.call_once(|| {
-        let temp_dir = std::env::temp_dir();
-        let pid = std::process::id();
+        let temp_dir = env::temp_dir();
+        let pid = process::id();
         let log_path = temp_dir.join(format!("black_hole_tsf_{}.log", pid));
 
-        let file = match std::fs::OpenOptions::new()
+        let file = match fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&log_path)
@@ -75,12 +89,12 @@ fn init_dll_logging() {
             Err(_) => return,
         };
 
-        let (non_blocking, _guard) = tracing_appender::non_blocking(file);
+        let (non_blocking, _guard) = non_blocking(file);
         let _ = Box::leak(Box::new(_guard));
 
-        let _ = tracing_subscriber::fmt()
+        let _ = fmt()
             .with_writer(non_blocking)
-            .with_max_level(tracing::Level::DEBUG)
+            .with_max_level(Level::DEBUG)
             .with_ansi(false)
             .with_thread_ids(true)
             .with_line_number(true)
@@ -93,7 +107,7 @@ fn init_dll_logging() {
 #[unsafe(no_mangle)]
 extern "system" fn DllMain(instance: HINSTANCE, reason: u32, _reserved: *mut c_void) -> BOOL {
     if reason == DLL_PROCESS_ATTACH {
-        super::set_dll_instance(instance);
+        set_dll_instance(instance);
         #[cfg(debug_assertions)]
         init_dll_logging();
     }
@@ -110,14 +124,14 @@ extern "system" fn DllGetClassObject(
         return E_POINTER;
     }
     unsafe {
-        *ppv = std::ptr::null_mut();
+        *ppv = ptr::null_mut();
     }
 
     if rclsid.is_null() || unsafe { *rclsid } != CLSID_BLACKHOLE_TIP {
-        return windows::Win32::Foundation::CLASS_E_CLASSNOTAVAILABLE;
+        return CLASS_E_CLASSNOTAVAILABLE;
     }
 
-    let factory: windows::Win32::System::Com::IClassFactory = BlackHoleClassFactory.into();
+    let factory: IClassFactory = BlackHoleClassFactory.into();
     let result = unsafe { factory.query(riid, ppv) };
     if result.is_ok() {
         dll_add_ref();

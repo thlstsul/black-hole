@@ -1,5 +1,7 @@
 // 性能测试：比较 rime-dict 词典的内存占用
-use black_hole_engine::Dictionary;
+use black_hole_engine::{Dictionary, RimeDict};
+use std::env;
+use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::time::Instant;
@@ -8,8 +10,8 @@ fn main() {
     println!("=== rime-dict Dictionary Performance Test ===\n");
 
     // 创建一个大词库测试文件
-    let test_dir = std::env::temp_dir().join("black_hole_perf_test");
-    std::fs::create_dir_all(&test_dir).unwrap();
+    let test_dir = env::temp_dir().join("black_hole_perf_test");
+    fs::create_dir_all(&test_dir).unwrap();
     let dict_path = test_dir.join("test_dict.dict.yaml");
 
     println!("Generating test dictionary with 100,000 entries...");
@@ -35,7 +37,7 @@ fn main() {
     println!("Loading dictionary...");
     let start = Instant::now();
 
-    match black_hole_engine::RimeDict::from_rime_dict(&dict_path) {
+    match RimeDict::from_rime_dict(&dict_path) {
         Ok(dict) => {
             let load_time = start.elapsed();
             println!("Dictionary loaded in {:.2}s\n", load_time.as_secs_f64());
@@ -82,6 +84,6 @@ fn main() {
     }
 
     // 清理
-    let _ = std::fs::remove_file(&dict_path);
-    let _ = std::fs::remove_dir(&test_dir);
+    let _ = fs::remove_file(&dict_path);
+    let _ = fs::remove_dir(&test_dir);
 }

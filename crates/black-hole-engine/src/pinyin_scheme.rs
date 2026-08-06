@@ -1,14 +1,22 @@
 use crate::{
     Codec, CodecState, Dictionary, GraphDecoder, InputScheme, LanguageModel, PinyinCodec,
-    PinyinPreprocessor, RimeDict, UserDictionary, global_user_dict,
+    PinyinPreprocessor, RimeDict, UserDictionary, global_user_dict, sort_candidates,
 };
+use crate::punctuation::convert_punctuation;
+#[cfg(test)]
+use crate::RawEntry;
 use black_hole_shared::candidate_layout::{
     EXPANDED_AVAILABLE_WIDTH, GridDirection, digit_to_candidate_index_excluding,
     navigate_grid_excluding,
 };
 use black_hole_shared::{Candidate, InputContext, KeyEvent, KeyState, SchemeId, SchemeResult};
 use rustc_hash::{FxHashMap, FxHashSet};
+#[cfg(test)]
+use std::env;
+#[cfg(test)]
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+use tracing::debug;
 
 /// 拼音输入方案
 pub struct PinyinScheme {
@@ -111,7 +119,7 @@ impl PinyinScheme {
     }
 
     fn current_candidates(&mut self) -> Vec<Candidate> {
-        tracing::debug!(
+        debug!(
             "current_candidates start: code='{}'",
             self.codec.full_code()
         );
@@ -142,7 +150,7 @@ impl PinyinScheme {
                 .with_lm(&self.lm)
                 .with_user_freqs(&self.user_freq_cache);
             let decode_results = decoder.decode(&graph);
-            tracing::debug!(
+            debug!(
                 "pinyin decode_results: count={}, top5={:?}",
                 decode_results.len(),
                 decode_results
@@ -238,13 +246,13 @@ impl PinyinScheme {
 
         // 排序：按来源分层，用户词 > 整句精确匹配 > 组合 > 前缀匹配 > 简拼匹配
         // 输入完整切分时，字数等于音节数的候选额外优先
-        crate::sort_candidates(&mut candidates, syllable_count, is_fully_segmented);
+        sort_candidates(&mut candidates, syllable_count, is_fully_segmented);
 
         // 更新缓存与版本号
         self.last_query = Some((full_code.clone(), candidates.clone()));
         self.cached_version = self.input_version;
 
-        tracing::debug!(
+        debug!(
             "current_candidates end: code='{}', candidates={}",
             full_code,
             candidates.len()
@@ -282,7 +290,7 @@ impl InputScheme for PinyinScheme {
     }
 
     fn handle_key(&mut self, key: &KeyEvent, _ctx: &InputContext) -> SchemeResult {
-        tracing::debug!("handle_key start: key='{}'", key.key);
+        debug!("handle_key start: key='{}'", key.key);
         if key.state != KeyState::Press {
             return SchemeResult::Ignored;
         }
@@ -562,7 +570,7 @@ impl InputScheme for PinyinScheme {
                         }
                     }
                     CodecState::Rejected => {
-                        let Some(cn) = crate::punctuation::convert_punctuation(ch) else {
+                        let Some(cn) = convert_punctuation(ch) else {
                             return SchemeResult::Ignored;
                         };
                         let committed = if self.codec.full_code().is_empty() {
@@ -581,7 +589,7 @@ impl InputScheme for PinyinScheme {
             }
         };
 
-        tracing::debug!(
+        debug!(
             "handle_key end: key='{}', code='{}'",
             key.key,
             self.codec.full_code()
@@ -639,7 +647,7 @@ mod tests {
             RimeDict::from_entries(
                 entries
                     .iter()
-                    .map(|(code, text, weight)| crate::RawEntry {
+                    .map(|(code, text, weight)| RawEntry {
                         code: code.to_string(),
                         text: text.to_string(),
                         weight: Some(*weight as f32),
@@ -1004,14 +1012,14 @@ mod tests {
     #[test]
     fn test_real_dict_single_syllable() {
         // 使用实际 RIME 词库测试
-        let dict_path = std::path::Path::new("../../temp/dicts/rime_ice.dict.yaml");
+        let dict_path = Path::new("../../temp/dicts/rime_ice.dict.yaml");
         if !dict_path.exists() {
             println!("跳过测试：实际词库文件不存在");
             return;
         }
 
         let dict =
-            Arc::new(RimeDict::from_rime_dict_cached(dict_path, std::env::temp_dir()).unwrap());
+            Arc::new(RimeDict::from_rime_dict_cached(dict_path, env::temp_dir()).unwrap());
         let mut scheme = PinyinScheme::with_dictionary(dict);
         let ctx = InputContext {
             caret_x: 0,

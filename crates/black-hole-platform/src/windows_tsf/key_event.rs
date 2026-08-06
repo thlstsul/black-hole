@@ -1,14 +1,21 @@
-use super::ServiceInner;
-use black_hole_shared::{KeyEvent, KeyState};
-use std::panic::AssertUnwindSafe;
+use super::commit::apply_result;
+use super::{IpcConnection, ServiceInner};
+use black_hole_shared::{KeyEvent, KeyState, Modifiers};
+use crate::ipc::{IPC_SERVER_ADDR, IpcRequest, read_response, send_request};
+use std::io::BufReader;
+use std::net::TcpStream;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+use tracing::{error, warn};
 use windows::Win32::Foundation::{E_UNEXPECTED, LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE,
-    VK_UP,
+    GetAsyncKeyState, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT,
+    VK_SHIFT, VK_SPACE, VK_UP, VIRTUAL_KEY,
 };
 use windows::Win32::UI::TextServices::{ITfEditSession, ITfEditSession_Impl};
-use windows_core::{BOOL, implement};
+use windows_core::{BOOL, Error, Result, implement};
 
 // External Win32 functions not provided by the windows crate
 unsafe extern "system" {
@@ -26,7 +33,7 @@ unsafe extern "system" {
 
 /// Convert a Win32 virtual-key code into our internal `KeyEvent` representation.
 pub(crate) fn virtual_key_to_key_event(
-    vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY,
+    vk: VIRTUAL_KEY,
     _wparam: WPARAM,
     _lparam: LPARAM,
     state: KeyState,
@@ -85,17 +92,17 @@ pub(crate) fn virtual_key_to_key_event(
     };
 
     let shift =
-        unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(VK_SHIFT.0 as i32) }
+        unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) }
             < 0;
     let ctrl = unsafe {
-        windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(VK_CONTROL.0 as i32)
+        GetAsyncKeyState(VK_CONTROL.0 as i32)
     } < 0;
-    let alt = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x12i32) } < 0;
+    let alt = unsafe { GetAsyncKeyState(0x12i32) } < 0;
     let capslock = (kbd_state[0x14] & 0x01) != 0;
 
     Some(KeyEvent {
         key,
-        modifiers: black_hole_shared::Modifiers {
+        modifiers: Modifiers {
             shift,
             ctrl,
             alt,
@@ -117,14 +124,14 @@ pub(crate) struct KeyHandlerEditSession {
 }
 
 impl ITfEditSession_Impl for KeyHandlerEditSession_Impl {
-    fn DoEditSession(&self, ec: u32) -> windows_core::Result<()> {
+    fn DoEditSession(&self, ec: u32) -> Result<()> {
         let service = self.service.clone();
         let key_event = self.key_event.clone();
 
         match handle_key_event_with_reconnect(&service, ec, key_event) {
             Ok(()) => Ok(()),
             Err(e) => {
-                tracing::error!("DoEditSession: failed with error: {:?}", e);
+                error!("DoEditSession: failed with error: {:?}", e);
                 Err(e)
             }
         }
@@ -136,11 +143,11 @@ pub(crate) fn handle_key_event_with_reconnect(
     service: &Arc<Mutex<ServiceInner>>,
     ec: u32,
     key_event: KeyEvent,
-) -> windows_core::Result<()> {
+) -> Result<()> {
     let result = handle_key_event_internal(service, ec, &key_event);
 
     if result.is_err() {
-        tracing::warn!("IPC operation failed, clearing connection and retrying");
+        warn!("IPC operation failed, clearing connection and retrying");
 
         {
             let mut inner = service.lock().unwrap();
@@ -151,15 +158,14 @@ pub(crate) fn handle_key_event_with_reconnect(
         let mut retry_delay_ms = 300;
 
         for attempt in 1..=max_retries {
-            match std::net::TcpStream::connect(super::super::ipc::IPC_SERVER_ADDR) {
+            match TcpStream::connect(IPC_SERVER_ADDR) {
                 Ok(stream) => {
                     let _ = stream.set_nodelay(true);
-                    let reader =
-                        std::io::BufReader::new(stream.try_clone().map_err(|_| E_UNEXPECTED)?);
+                    let reader = BufReader::new(stream.try_clone().map_err(|_| E_UNEXPECTED)?);
 
                     {
                         let mut inner = service.lock().unwrap();
-                        inner.ipc_conn = Some(super::IpcConnection {
+                        inner.ipc_conn = Some(IpcConnection {
                             writer: stream,
                             reader,
                         });
@@ -171,17 +177,17 @@ pub(crate) fn handle_key_event_with_reconnect(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("reconnection attempt {} failed: {}", attempt, e);
+                    warn!("reconnection attempt {} failed: {}", attempt, e);
                 }
             }
 
             if attempt < max_retries {
-                std::thread::sleep(std::time::Duration::from_millis(retry_delay_ms));
+                thread::sleep(Duration::from_millis(retry_delay_ms));
                 retry_delay_ms = (retry_delay_ms * 2).min(2000);
             }
         }
 
-        tracing::error!("all reconnection attempts failed");
+        error!("all reconnection attempts failed");
     }
 
     result
@@ -192,21 +198,20 @@ fn handle_key_event_internal(
     service: &Arc<Mutex<ServiceInner>>,
     ec: u32,
     key_event: &KeyEvent,
-) -> windows_core::Result<()> {
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+) -> Result<()> {
+    let result = catch_unwind(AssertUnwindSafe(|| {
         let mut inner = service.lock().unwrap();
         let ctx = inner.context.clone().ok_or(E_UNEXPECTED)?;
         let conn = inner.ipc_conn.as_mut().ok_or(E_UNEXPECTED)?;
 
-        let request = super::super::ipc::IpcRequest::KeyEvent(key_event.clone());
-        super::super::ipc::send_request(&mut conn.writer, &request).map_err(|_| E_UNEXPECTED)?;
+        let request = IpcRequest::KeyEvent(key_event.clone());
+        send_request(&mut conn.writer, &request).map_err(|_| E_UNEXPECTED)?;
 
-        let response =
-            super::super::ipc::read_response(&mut conn.reader).map_err(|_| E_UNEXPECTED)?;
+        let response = read_response(&mut conn.reader).map_err(|_| E_UNEXPECTED)?;
 
         drop(inner);
-        super::commit::apply_result(service.clone(), ec, &ctx, &response.into())?;
-        Ok::<(), windows_core::Error>(())
+        apply_result(service.clone(), ec, &ctx, &response.into())?;
+        Ok::<(), Error>(())
     }));
 
     match result {

@@ -1,14 +1,24 @@
 use crate::{
     CandidateRanker, Codec, CodecState, Dictionary, GraphDecoder, InputScheme, RimeDict,
-    ShuangpinCodec, SimpleRanker, UserDictionary, global_user_dict,
+    ShuangpinCodec, SimpleRanker, UserDictionary, global_user_dict, sort_candidates,
 };
+use crate::punctuation::convert_punctuation;
+#[cfg(test)]
+use crate::RawEntry;
 use black_hole_shared::candidate_layout::{
     EXPANDED_AVAILABLE_WIDTH, GridDirection, digit_to_candidate_index_excluding,
     navigate_grid_excluding,
 };
 use black_hole_shared::{Candidate, InputContext, KeyEvent, KeyState, SchemeId, SchemeResult};
 use rustc_hash::FxHashMap;
+use std::collections::HashSet;
+#[cfg(test)]
+use std::env;
+#[cfg(test)]
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use tracing::debug;
 
 /// 小鹤双拼输入方案
 pub struct ShuangpinScheme {
@@ -93,7 +103,7 @@ impl ShuangpinScheme {
     }
 
     fn current_candidates(&mut self) -> Vec<Candidate> {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let full_code = self.codec.full_code();
         let spaced_code = self.codec.spaced_code();
         let has_pending = self.codec.has_pending();
@@ -107,7 +117,7 @@ impl ShuangpinScheme {
         }
 
         let mut candidates: Vec<Candidate> = Vec::new();
-        let mut seen_texts = std::collections::HashSet::new();
+        let mut seen_texts = HashSet::new();
 
         // === 核心流水线：音节图 → 词典检索 → 维特比解码 ===
         let graph = self.codec.syllable_graph();
@@ -135,7 +145,7 @@ impl ShuangpinScheme {
 
         // === 前缀匹配（空格分隔 + 连续全拼）===
         // 单音节时 spaced 与 full 相同（如 "niang"），只查一次
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let queries: Vec<&String> = if spaced_code == full_code {
             vec![&spaced_code]
         } else {
@@ -160,7 +170,7 @@ impl ShuangpinScheme {
         // === 挂起字符声母前缀匹配 ===
         // 当有 pending 时，用 "[已有音节] [pending声母]" 格式查找双字词。
         // 例如 "uuy" → "shu y" 匹配 "shu yao" / "shu ye" / "shu yu" 等。
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         if let Some(pending_query) = self.codec.spaced_code_with_pending_initial() {
             for cand in self.dictionary.prefix_lookup(&pending_query) {
                 if seen_texts.insert(cand.text.clone()) {
@@ -178,7 +188,7 @@ impl ShuangpinScheme {
         let pending_prefix_elapsed = t.elapsed();
 
         // === 用户词典查询 ===
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         if let Some(ref ud) = self.user_dict_ref() {
             let user_cands = ud.lock().unwrap().lookup(SchemeId::Shuangpin, &spaced_code);
             for cand in user_cands {
@@ -202,7 +212,7 @@ impl ShuangpinScheme {
         // 当刚好完整切分时，字数等于音节数的候选优先。
         // 有 pending 时（如 "uuy" 的 'y'→下一字声母），有效音节数含 pending 音节，
         // 使双字词获得字数匹配优先。且此时跳过 ranker（ranker 按分数排序会打乱层序）。
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let syllable_count = spaced_code.split_whitespace().count();
         let is_fully_segmented =
             !spaced_code.is_empty() && full_code == spaced_code.replace(" ", "");
@@ -212,7 +222,7 @@ impl ShuangpinScheme {
             syllable_count
         };
 
-        crate::sort_candidates(
+        sort_candidates(
             &mut candidates,
             eff_syl_count,
             is_fully_segmented || has_pending,
@@ -223,7 +233,7 @@ impl ShuangpinScheme {
         }
         let sort_elapsed = t.elapsed();
 
-        tracing::debug!(
+        debug!(
             "shuangpin candidates: full='{}', spaced='{}', pending={}, n={}, decode_us={}, prefix_us={}, pending_prefix_us={}, userdb_us={}, sort_us={}, total_us={}",
             full_code,
             spaced_code,
@@ -550,7 +560,7 @@ impl InputScheme for ShuangpinScheme {
                 }
             }
             CodecState::Rejected => {
-                let Some(cn) = crate::punctuation::convert_punctuation(ch) else {
+                let Some(cn) = convert_punctuation(ch) else {
                     return SchemeResult::Ignored;
                 };
                 let committed = if self.codec.code().is_empty() {
@@ -594,7 +604,8 @@ impl InputScheme for ShuangpinScheme {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use black_hole_shared::{InputContext, KeyEvent, KeyState, Modifiers};
+    use crate::{Engine, PinyinScheme, ShuangpinScheme};
+    use black_hole_shared::{EngineCommand, InputContext, KeyEvent, KeyState, Modifiers};
 
     fn key_event(key: &str) -> KeyEvent {
         KeyEvent {
@@ -615,7 +626,7 @@ mod tests {
         RimeDict::from_entries(
             entries
                 .iter()
-                .map(|(code, text, weight)| crate::RawEntry {
+                .map(|(code, text, weight)| RawEntry {
                     code: code.to_string(),
                     text: text.to_string(),
                     weight: Some(*weight as f32),
@@ -683,13 +694,13 @@ mod tests {
     #[test]
     fn test_shuangpin_le_real_dict() {
         // 使用实际 RIME 词库测试
-        let dict_path = std::path::Path::new("../../temp/dicts/rime_ice.dict.yaml");
+        let dict_path = Path::new("../../temp/dicts/rime_ice.dict.yaml");
         if !dict_path.exists() {
             println!("跳过测试：实际词库文件不存在");
             return;
         }
 
-        let dict = RimeDict::from_rime_dict_cached(dict_path, std::env::temp_dir()).unwrap();
+        let dict = RimeDict::from_rime_dict_cached(dict_path, env::temp_dir()).unwrap();
         let mut scheme = ShuangpinScheme::with_dictionary(Box::new(dict));
         let ctx = InputContext {
             caret_x: 0,
@@ -741,10 +752,7 @@ mod tests {
 
     #[test]
     fn test_engine_switch_scheme_shares_dict() {
-        use crate::{Engine, PinyinScheme, ShuangpinScheme};
-        use black_hole_shared::{EngineCommand, SchemeResult};
-
-        let dict_path = std::path::Path::new("../../temp/dicts/rime_ice.dict.yaml");
+        let dict_path = Path::new("../../temp/dicts/rime_ice.dict.yaml");
         if !dict_path.exists() {
             println!("跳过测试：实际词库文件不存在");
             return;
@@ -757,8 +765,8 @@ mod tests {
         };
 
         // 手动加载外部词典，分别构建拼音和双拼引擎（避免用户词典干扰）
-        let cache_dir = std::env::temp_dir();
-        let pinyin_dict = std::sync::Arc::new(
+        let cache_dir = env::temp_dir();
+        let pinyin_dict = Arc::new(
             RimeDict::from_rime_dict_cached(dict_path, &cache_dir).expect("加载外部词典失败"),
         );
         let shuangpin_dict =

@@ -7,10 +7,12 @@ use black_hole_shared::{
     EngineCommand, InputContext, InputModeSwitch, KeyEvent, KeyState, Modifiers, SchemeResult,
     UiCommand,
 };
+use std::future::pending;
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender};
+use tracing::info;
 use zbus::zvariant::{Array, Dict, StructureBuilder, Type, Value};
-use zbus::{Connection, interface};
+use zbus::{Connection, Error, interface};
 
 use super::{PlatformError, PlatformIme};
 
@@ -46,7 +48,7 @@ impl LinuxIbusIme {
         engine_tx: Sender<EngineCommand>,
         platform_rx: Receiver<SchemeResult>,
         ui_tx: Sender<UiCommand>,
-    ) -> Result<(), zbus::Error> {
+    ) -> Result<(), Error> {
         let conn = Connection::session().await?;
 
         let ibus_engine = IbusEngine {
@@ -63,7 +65,7 @@ impl LinuxIbusIme {
             .await?;
 
         // 保持连接活跃
-        std::future::pending::<()>().await;
+        pending::<()>().await;
         Ok(())
     }
 }
@@ -131,7 +133,7 @@ impl IbusEngine {
                 }
             };
             if let Some(english) = toggled {
-                tracing::info!(
+                info!(
                     "Input mode toggled: {}",
                     if english { "英文" } else { "中文" }
                 );
@@ -174,7 +176,7 @@ impl IbusEngine {
             SchemeResult::Committed { text } => {
                 // 发送 CommitText DBus 信号
                 let ibus_text = (text.as_str(), Vec::<(u32, u32, u32, u32)>::new());
-                let variant = zbus::zvariant::Value::from(ibus_text);
+                let variant = Value::from(ibus_text);
 
                 let _ = self
                     .conn
@@ -277,7 +279,7 @@ impl IbusEngine {
             .unwrap()
             .set_english(prop_state == PROP_STATE_UNCHECKED as i32);
         if let Some(english) = toggled {
-            tracing::info!(
+            info!(
                 "Input mode toggled via property: {}",
                 if english { "英文" } else { "中文" }
             );

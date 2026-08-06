@@ -2,6 +2,7 @@
 use black_hole_engine::{InputScheme, PinyinScheme, RimeDict};
 use black_hole_shared::{InputContext, KeyEvent, KeyState, Modifiers};
 use std::sync::Arc;
+use std::time::Instant;
 
 fn key_event(key: &str) -> KeyEvent {
     KeyEvent {
@@ -31,7 +32,7 @@ fn test_performance_si_input() {
         caret_h: 20,
     };
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
 
     // 输入 "s"
     let _ = scheme.handle_key(&key_event("s"), &ctx);
@@ -60,7 +61,7 @@ fn test_performance_shu_input() {
         caret_h: 20,
     };
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
 
     // 输入 "s"
     let _ = scheme.handle_key(&key_event("s"), &ctx);
@@ -91,7 +92,7 @@ fn test_performance_shi_input() {
         caret_h: 20,
     };
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
 
     // 输入 "s"
     let _ = scheme.handle_key(&key_event("s"), &ctx);
@@ -122,7 +123,7 @@ fn test_performance_zhuang_input() {
         caret_h: 20,
     };
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
 
     for ch in ["z", "h", "u", "a", "n", "g"] {
         let _ = scheme.handle_key(&key_event(ch), &ctx);
@@ -155,7 +156,7 @@ fn test_performance_delete_si() {
     let _ = scheme.handle_key(&key_event("i"), &ctx);
 
     // 然后删除 "i"
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let _ = scheme.handle_key(&key_event("Backspace"), &ctx);
     let elapsed = start.elapsed();
 
@@ -185,7 +186,7 @@ fn test_performance_delete_shu() {
     let _ = scheme.handle_key(&key_event("u"), &ctx);
 
     // 然后删除 "u"
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let _ = scheme.handle_key(&key_event("Backspace"), &ctx);
     let elapsed = start.elapsed();
 
@@ -215,7 +216,7 @@ fn test_performance_delete_shi() {
     let _ = scheme.handle_key(&key_event("i"), &ctx);
 
     // 然后删除 "i"
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let _ = scheme.handle_key(&key_event("Backspace"), &ctx);
     let elapsed = start.elapsed();
 

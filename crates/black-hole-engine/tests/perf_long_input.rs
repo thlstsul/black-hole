@@ -4,9 +4,10 @@
 // 且路径用 Vec<String> 深拷贝存储，开销 O(n²×50) 随输入长度二次增长——
 // 39 字输入时单键可达 30-80ms。修复后路径改为共享尾部链表（Rc），
 // 每次按键降为 O(n×6×50) 的轻量节点分配。
-use black_hole_engine::{InputScheme, PinyinScheme, RimeDict};
+use black_hole_engine::{InputScheme, PinyinScheme, RimeDict, default_user_dict_dir};
 use black_hole_shared::{InputContext, KeyEvent, KeyState, Modifiers};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 fn key_event(key: &str) -> KeyEvent {
     KeyEvent {
@@ -36,28 +37,28 @@ fn real_dict() -> Arc<RimeDict> {
         env!("CARGO_MANIFEST_DIR"),
         "/../../assets/dicts/rime_ice.dict.yaml"
     );
-    let cache_dir = black_hole_engine::default_user_dict_dir().join("cache");
+    let cache_dir = default_user_dict_dir().join("cache");
     Arc::new(
         RimeDict::from_rime_dict_cached(dict_path, &cache_dir).expect("failed to load rime_ice dict"),
     )
 }
 
 /// 逐键输入，返回每键耗时（µs）。scheme 在轮次间复位，避免输入累积。
-fn type_keys(scheme: &mut PinyinScheme, input: &str) -> Vec<std::time::Duration> {
+fn type_keys(scheme: &mut PinyinScheme, input: &str) -> Vec<Duration> {
     let c = ctx();
     scheme.reset();
     let mut per_key = Vec::new();
     for ch in input.chars() {
         let k = ch.to_string();
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let _ = scheme.handle_key(&key_event(&k), &c);
         per_key.push(t.elapsed());
     }
     per_key
 }
 
-fn report(input: &str, label: &str, per_key: &[std::time::Duration]) {
-    let total: std::time::Duration = per_key.iter().sum();
+fn report(input: &str, label: &str, per_key: &[Duration]) {
+    let total: Duration = per_key.iter().sum();
     let avg = total.as_secs_f64() * 1000.0 / per_key.len() as f64;
     let max = per_key.iter().map(|d| d.as_secs_f64()).fold(0.0, f64::max) * 1000.0;
     println!(

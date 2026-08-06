@@ -1,15 +1,17 @@
 use super::{ServiceInner, send_ui_command_inner};
+use black_hole_shared::{InputContext, UiCommand};
+use std::mem;
 use std::sync::{Arc, Mutex};
-use windows::Win32::Foundation::E_FAIL;
+use windows::Win32::Foundation::{E_FAIL, POINT, RECT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::TextServices::{
-    ITfComposition, ITfContext, ITfEditSession, ITfEditSession_Impl, TF_DEFAULT_SELECTION,
-    TF_SELECTION,
+    ITfComposition, ITfContext, ITfEditSession, ITfEditSession_Impl, TF_ANCHOR_END,
+    TF_DEFAULT_SELECTION, TF_SELECTION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
 };
-use windows_core::BOOL;
+use windows_core::{BOOL, Result};
 use windows_core::implement;
 
 /// Get the screen coordinates of the current caret position.
@@ -23,7 +25,7 @@ pub(crate) fn get_caret_position(
     ec: u32,
     ctx: &ITfContext,
     composition: Option<&ITfComposition>,
-) -> windows_core::Result<(i32, i32, i32)> {
+) -> Result<(i32, i32, i32)> {
     // Layer 1: TSF GetSelection + ITfContextView::GetTextExt
     let mut sel_buf = [TF_SELECTION::default()];
     let mut fetched = 0u32;
@@ -36,11 +38,11 @@ pub(crate) fn get_caret_position(
         )
     };
     if hr.is_ok() && fetched > 0 {
-        let range_opt = unsafe { std::mem::ManuallyDrop::take(&mut sel_buf[0].range) };
+        let range_opt = unsafe { mem::ManuallyDrop::take(&mut sel_buf[0].range) };
         if let Some(range) = range_opt
             && let Ok(context_view) = unsafe { ctx.GetActiveView() }
         {
-            let mut rect = windows::Win32::Foundation::RECT::default();
+            let mut rect = RECT::default();
             let mut clipped = BOOL(0);
             let hr = unsafe { context_view.GetTextExt(ec, &range, &mut rect, &mut clipped) };
             if hr.is_ok() {
@@ -56,8 +58,8 @@ pub(crate) fn get_caret_position(
     {
         if let Ok(collapsed) = unsafe { range.Clone() } {
             unsafe {
-                let _ = collapsed.Collapse(ec, windows::Win32::UI::TextServices::TF_ANCHOR_END);
-                let mut rect = windows::Win32::Foundation::RECT::default();
+                let _ = collapsed.Collapse(ec, TF_ANCHOR_END);
+                let mut rect = RECT::default();
                 let mut clipped = BOOL(0);
                 let hr = context_view.GetTextExt(ec, &collapsed, &mut rect, &mut clipped);
                 if hr.is_ok() {
@@ -66,7 +68,7 @@ pub(crate) fn get_caret_position(
             }
         }
 
-        let mut rect = windows::Win32::Foundation::RECT::default();
+        let mut rect = RECT::default();
         let mut clipped = BOOL(0);
         let hr = unsafe { context_view.GetTextExt(ec, &range, &mut rect, &mut clipped) };
         if hr.is_ok() {
@@ -79,9 +81,7 @@ pub(crate) fn get_caret_position(
 }
 
 /// Get caret position via `GetGUIThreadInfo` Windows API.
-pub(crate) fn get_caret_position_via_gui_thread_info() -> windows_core::Result<(i32, i32, i32)> {
-    use windows::Win32::Foundation::POINT;
-
+pub(crate) fn get_caret_position_via_gui_thread_info() -> Result<(i32, i32, i32)> {
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.0.is_null() {
@@ -89,7 +89,7 @@ pub(crate) fn get_caret_position_via_gui_thread_info() -> windows_core::Result<(
         }
 
         let mut gui_thread_info = GUITHREADINFO {
-            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            cbSize: mem::size_of::<GUITHREADINFO>() as u32,
             ..Default::default()
         };
 
@@ -123,7 +123,7 @@ pub(crate) struct LayoutChangeEditSession {
 }
 
 impl ITfEditSession_Impl for LayoutChangeEditSession_Impl {
-    fn DoEditSession(&self, ec: u32) -> windows_core::Result<()> {
+    fn DoEditSession(&self, ec: u32) -> Result<()> {
         let inner = self.inner_arc.lock().unwrap();
         let ctx = match &inner.context {
             Some(c) => c.clone(),
@@ -137,12 +137,12 @@ impl ITfEditSession_Impl for LayoutChangeEditSession_Impl {
             inner.last_caret_pos = Some((caret_x, caret_y, caret_h));
             drop(inner);
 
-            let context = black_hole_shared::InputContext {
+            let context = InputContext {
                 caret_x,
                 caret_y,
                 caret_h,
             };
-            let cmd = black_hole_shared::UiCommand::UpdatePosition { context };
+            let cmd = UiCommand::UpdatePosition { context };
             send_ui_command_inner(&self.inner_arc, cmd);
         }
 

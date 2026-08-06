@@ -3,6 +3,7 @@ use crate::{
 };
 use black_hole_shared::SchemeId;
 use std::sync::Arc;
+use tracing::info;
 
 /// 方案注册表：根据 SchemeId 创建对应的输入方案实例
 pub struct SchemeRegistry {
@@ -62,9 +63,9 @@ impl SchemeRegistry {
         let path = self.dict_path.as_ref()?;
         let cache_dir = default_user_dict_dir().join("cache");
 
-        tracing::info!("Loading RIME dictionary from: {}", path);
+        info!("Loading RIME dictionary from: {}", path);
         let dict = RimeDict::shared(path, &cache_dir)?;
-        tracing::info!("RIME dictionary loaded successfully.");
+        info!("RIME dictionary loaded successfully.");
         Some(dict)
     }
 }

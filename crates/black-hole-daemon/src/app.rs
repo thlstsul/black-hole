@@ -1,13 +1,37 @@
 use crate::args::DaemonArgs;
 use black_hole_engine::{Engine, EngineBuilder};
+use black_hole_platform::auto_start::set_auto_start;
 use black_hole_platform::PlatformIme;
 use black_hole_shared::{EngineCommand, InputContext, SchemeId, SchemeResult, Theme, UiCommand};
-use black_hole_ui::SettingsManager;
+use black_hole_ui::{SettingsManager, run_candidate_window, run_settings_panel};
 use clap::Parser;
+use std::env;
+use std::error::Error;
+use std::io;
+use std::mem::discriminant;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::Duration;
+use tracing::{debug, error, info, warn};
+use tracing_appender::non_blocking;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::rolling;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::registry;
 use tracing_subscriber::util::SubscriberInitExt;
+#[cfg(target_os = "windows")]
+use black_hole_platform::windows_tsf::auto_register::{is_registered, register_ime};
+#[cfg(target_os = "windows")]
+use black_hole_platform::{PlatformError as WindowsPlatformError, WindowsTsfIme};
+#[cfg(target_os = "linux")]
+use black_hole_platform::linux_ibus::auto_register::{is_registered as is_registered_linux, register_ime as register_ime_linux};
+#[cfg(target_os = "linux")]
+use black_hole_platform::{LinuxIbusIme, PlatformError as LinuxPlatformError};
 
 /// 全局退出标志，由信号处理器设置
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
@@ -19,7 +43,7 @@ pub struct App;
 
 impl App {
     /// 启动 daemon，阻塞直到平台服务结束或收到退出信号
-    pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    pub fn run() -> Result<(), Box<dyn Error>> {
         let args = DaemonArgs::parse();
 
         // 设置面板模式：由守护进程以独立进程方式唤起。
@@ -27,12 +51,12 @@ impl App {
         // 进程内的那个，因此设置面板必须在独立进程中运行。
         if args.settings_panel {
             let settings_mgr = SettingsManager::new();
-            black_hole_ui::run_settings_panel(settings_mgr);
+            run_settings_panel(settings_mgr);
             return Ok(());
         }
 
         let _tracing_guard = Self::init_tracing();
-        tracing::info!("Black-Hole IME daemon starting...");
+        info!("Black-Hole IME daemon starting...");
 
         #[cfg(target_os = "windows")]
         Self::ensure_ime_registered();
@@ -47,11 +71,11 @@ impl App {
 
         // 按设置同步开机自启动状态（如安装目录变化后重新写入 Run 键 / autostart 文件）
         let auto_start = settings_mgr.settings().auto_start;
-        if let Err(e) = black_hole_platform::auto_start::set_auto_start(auto_start) {
-            tracing::warn!("Failed to sync auto start ({}): {}", auto_start, e);
+        if let Err(e) = set_auto_start(auto_start) {
+            warn!("Failed to sync auto start ({}): {}", auto_start, e);
         }
 
-        tracing::info!(
+        info!(
             "resolved scheme: CLI={:?}, settings={:?}, effective={:?}",
             args.scheme,
             settings_scheme,
@@ -59,7 +83,7 @@ impl App {
         );
 
         let dict_path = args.dict_path.or_else(|| {
-            std::env::current_exe()
+            env::current_exe()
                 .ok()?
                 .parent()
                 .map(|p| p.join("dicts").join("rime_ice.dict.yaml"))
@@ -88,14 +112,14 @@ impl App {
 
         // UI 渲染线程（只处理候选窗相关命令）
         let (ui_render_tx, ui_render_rx) = mpsc::channel::<UiCommand>();
-        let ui_handle = std::thread::spawn(move || {
-            black_hole_ui::run_candidate_window(ui_render_rx, default_theme);
+        let ui_handle = thread::spawn(move || {
+            run_candidate_window(ui_render_rx, default_theme);
         });
 
         // 引擎线程（带 panic 恢复）
         let engine_clone = Arc::clone(&engine);
         let ui_tx_clone = ui_tx.clone();
-        let engine_handle = std::thread::spawn(move || {
+        let engine_handle = thread::spawn(move || {
             Self::run_engine_thread(engine_clone, engine_rx, platform_tx, ui_tx_clone);
         });
 
@@ -106,11 +130,11 @@ impl App {
         let current_for_dispatch = Arc::clone(&current_settings);
 
         // 平台线程（后台运行，避免阻塞主线程）
-        let _platform_handle = std::thread::spawn(move || {
+        let _platform_handle = thread::spawn(move || {
             if let Err(e) =
                 run_platform(engine_tx, platform_rx, ui_tx_for_platform, current_settings)
             {
-                tracing::error!("Platform IME error: {}", e);
+                error!("Platform IME error: {}", e);
             }
         });
 
@@ -124,12 +148,12 @@ impl App {
                     &current_for_dispatch,
                 );
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(100));
         }
 
         Self::graceful_shutdown(ui_render_tx_for_shutdown, ui_handle, engine_handle);
 
-        tracing::info!("Black-Hole IME daemon exited.");
+        info!("Black-Hole IME daemon exited.");
         Ok(())
     }
 
@@ -140,16 +164,16 @@ impl App {
     /// 初始化 tracing 日志系统
     ///
     /// 返回的 guard 必须被持有，否则非阻塞文件 appender 会被提前刷新关闭。
-    fn init_tracing() -> tracing_appender::non_blocking::WorkerGuard {
-        let log_dir = std::env::temp_dir();
-        let file_appender = tracing_appender::rolling::never(log_dir, "black-hole-daemon.log");
-        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+    fn init_tracing() -> WorkerGuard {
+        let log_dir = env::temp_dir();
+        let file_appender = rolling::never(log_dir, "black-hole-daemon.log");
+        let (non_blocking, guard) = non_blocking(file_appender);
 
-        tracing_subscriber::registry()
-            .with(tracing_subscriber::EnvFilter::from_default_env())
-            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
+        registry()
+            .with(EnvFilter::from_default_env())
+            .with(fmt::layer().with_writer(io::stdout))
             .with(
-                tracing_subscriber::fmt::layer()
+                fmt::layer()
                     .with_writer(non_blocking)
                     .with_ansi(false),
             )
@@ -164,31 +188,31 @@ impl App {
 
     #[cfg(target_os = "windows")]
     fn ensure_ime_registered() {
-        if black_hole_platform::windows_tsf::auto_register::is_registered() {
-            tracing::info!("IME already registered");
+        if is_registered() {
+            info!("IME already registered");
             return;
         }
 
-        let dll_path = match std::env::current_exe()
+        let dll_path = match env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("black_hole_platform.dll")))
         {
             Some(p) => p,
             None => {
-                tracing::warn!("Could not determine DLL path for auto-registration");
+                warn!("Could not determine DLL path for auto-registration");
                 return;
             }
         };
 
         if !dll_path.exists() {
-            tracing::warn!("Platform DLL not found at: {}", dll_path.display());
+            warn!("Platform DLL not found at: {}", dll_path.display());
             return;
         }
 
-        tracing::info!("IME not registered, attempting auto-registration...");
-        match black_hole_platform::windows_tsf::auto_register::register_ime(&dll_path) {
-            Ok(()) => tracing::info!("Auto-registration succeeded"),
-            Err(e) => tracing::warn!("Auto-registration failed: {}", e),
+        info!("IME not registered, attempting auto-registration...");
+        match register_ime(&dll_path) {
+            Ok(()) => info!("Auto-registration succeeded"),
+            Err(e) => warn!("Auto-registration failed: {}", e),
         }
     }
 
@@ -198,15 +222,15 @@ impl App {
 
     #[cfg(target_os = "linux")]
     fn ensure_ime_registered() {
-        if black_hole_platform::linux_ibus::auto_register::is_registered() {
-            tracing::info!("IBus component already registered");
+        if is_registered_linux() {
+            info!("IBus component already registered");
             return;
         }
 
-        tracing::info!("IBus component not registered, attempting auto-registration...");
-        match black_hole_platform::linux_ibus::auto_register::register_ime() {
-            Ok(()) => tracing::info!("Auto-registration succeeded"),
-            Err(e) => tracing::warn!("Auto-registration failed: {}", e),
+        info!("IBus component not registered, attempting auto-registration...");
+        match register_ime_linux() {
+            Ok(()) => info!("Auto-registration succeeded"),
+            Err(e) => warn!("Auto-registration failed: {}", e),
         }
     }
 
@@ -216,11 +240,11 @@ impl App {
 
     fn setup_signal_handler() {
         let result = ctrlc::set_handler(|| {
-            tracing::info!("Received interrupt signal, requesting shutdown...");
+            info!("Received interrupt signal, requesting shutdown...");
             SHOULD_EXIT.store(true, Ordering::SeqCst);
         });
         if let Err(e) = result {
-            tracing::warn!("Failed to register Ctrl+C handler: {}", e);
+            warn!("Failed to register Ctrl+C handler: {}", e);
         }
     }
 
@@ -234,17 +258,17 @@ impl App {
         platform_tx: mpsc::Sender<SchemeResult>,
         ui_tx: mpsc::Sender<UiCommand>,
     ) {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = catch_unwind(AssertUnwindSafe(|| {
             let mut ctx = InputContext::default();
             while let Ok(cmd) = engine_rx.recv() {
                 if SHOULD_EXIT.load(Ordering::Relaxed) {
-                    tracing::info!("Engine thread received exit request");
+                    info!("Engine thread received exit request");
                     break;
                 }
 
-                tracing::debug!(
+                debug!(
                     "engine_thread start: cmd={:?}",
-                    std::mem::discriminant(&cmd)
+                    discriminant(&cmd)
                 );
 
                 let result = Self::process_engine_command(&engine, &mut ctx, cmd, &ui_tx);
@@ -252,11 +276,11 @@ impl App {
                 if let Some(r) = result
                     && platform_tx.send(r).is_err()
                 {
-                    tracing::warn!("Platform receiver dropped, exiting engine thread");
+                    warn!("Platform receiver dropped, exiting engine thread");
                     break;
                 }
 
-                tracing::debug!("engine_thread end");
+                debug!("engine_thread end");
             }
         }));
 
@@ -268,7 +292,7 @@ impl App {
             } else {
                 "unknown panic".to_string()
             };
-            tracing::error!(msg, "Engine thread panicked");
+            error!(msg, "Engine thread panicked");
             // 尽量通知 UI 隐藏候选窗，避免界面残留
             let _ = ui_tx.send(UiCommand::HideCandidates);
         }
@@ -283,22 +307,22 @@ impl App {
     ) {
         match cmd {
             UiCommand::ShowSettings => {
-                tracing::info!("UI dispatch: open settings");
+                info!("UI dispatch: open settings");
                 // winit 0.30 每进程仅允许一个事件循环，候选窗已占用 daemon 进程内的，
                 // 设置面板须以独立进程（--settings-panel）方式运行。
-                if let Ok(exe) = std::env::current_exe() {
-                    if let Err(e) = std::process::Command::new(exe)
+                if let Ok(exe) = env::current_exe() {
+                    if let Err(e) = Command::new(exe)
                         .arg("--settings-panel")
                         .spawn()
                     {
-                        tracing::error!("Failed to spawn settings panel: {}", e);
+                        error!("Failed to spawn settings panel: {}", e);
                     }
                 } else {
-                    tracing::error!("Failed to resolve current exe for settings panel");
+                    error!("Failed to resolve current exe for settings panel");
                 }
             }
             UiCommand::SwitchScheme(scheme_id) => {
-                tracing::info!("UI dispatch: switch to {:?}", scheme_id);
+                info!("UI dispatch: switch to {:?}", scheme_id);
                 let _ = engine_tx.send(EngineCommand::SwitchScheme(scheme_id));
                 // 持久化到设置，使重启后保持本次选择
                 let mut settings_mgr = SettingsManager::new();
@@ -311,7 +335,7 @@ impl App {
                 }
             }
             UiCommand::SetTheme(theme) => {
-                tracing::info!("UI dispatch: set theme to {:?}", theme);
+                info!("UI dispatch: set theme to {:?}", theme);
                 let mut settings_mgr = SettingsManager::new();
                 settings_mgr.settings_mut().theme = theme;
                 settings_mgr.save();
@@ -323,10 +347,10 @@ impl App {
                 let _ = ui_render_tx.send(UiCommand::SetTheme(theme));
             }
             UiCommand::SetAutoStart(enabled) => {
-                tracing::info!("UI dispatch: set auto start to {}", enabled);
+                info!("UI dispatch: set auto start to {}", enabled);
                 // 平台写入（注册表 Run 键 / XDG autostart 文件）
-                if let Err(e) = black_hole_platform::auto_start::set_auto_start(enabled) {
-                    tracing::warn!("Failed to set auto start ({}): {}", enabled, e);
+                if let Err(e) = set_auto_start(enabled) {
+                    warn!("Failed to set auto start ({}): {}", enabled, e);
                 }
                 // 持久化到设置，使重启后保持本次选择
                 let mut settings_mgr = SettingsManager::new();
@@ -334,7 +358,7 @@ impl App {
                 settings_mgr.save();
             }
             UiCommand::Exit => {
-                tracing::info!("UI dispatch: exit requested");
+                info!("UI dispatch: exit requested");
                 SHOULD_EXIT.store(true, Ordering::SeqCst);
             }
             other => {
@@ -394,35 +418,35 @@ impl App {
 
     fn graceful_shutdown(
         ui_tx: mpsc::Sender<UiCommand>,
-        ui_handle: std::thread::JoinHandle<()>,
-        engine_handle: std::thread::JoinHandle<()>,
+        ui_handle: thread::JoinHandle<()>,
+        engine_handle: thread::JoinHandle<()>,
     ) {
-        tracing::info!("Shutting down daemon...");
+        info!("Shutting down daemon...");
 
         // 通知 UI 退出
         if ui_tx.send(UiCommand::Exit).is_err() {
-            tracing::warn!("UI channel closed, UI thread may have already exited");
+            warn!("UI channel closed, UI thread may have already exited");
         }
 
         // 等待引擎线程结束（5 秒超时）
-        if !Self::join_with_timeout(engine_handle, "Engine", std::time::Duration::from_secs(5)) {
-            tracing::warn!("Engine thread did not exit within timeout");
+        if !Self::join_with_timeout(engine_handle, "Engine", Duration::from_secs(5)) {
+            warn!("Engine thread did not exit within timeout");
         }
 
         // 等待 UI 线程结束（5 秒超时）
-        if !Self::join_with_timeout(ui_handle, "UI", std::time::Duration::from_secs(5)) {
-            tracing::warn!("UI thread did not exit within timeout");
+        if !Self::join_with_timeout(ui_handle, "UI", Duration::from_secs(5)) {
+            warn!("UI thread did not exit within timeout");
         }
     }
 
     /// 等待线程结束，带超时
     fn join_with_timeout(
-        handle: std::thread::JoinHandle<()>,
+        handle: thread::JoinHandle<()>,
         name: &str,
-        timeout: std::time::Duration,
+        timeout: Duration,
     ) -> bool {
         let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
+        thread::spawn(move || {
             let result = handle.join();
             let _ = tx.send(result);
         });
@@ -430,7 +454,7 @@ impl App {
         match rx.recv_timeout(timeout) {
             Ok(Ok(())) => true,
             Ok(Err(_)) => {
-                tracing::warn!("{} thread panicked during shutdown", name);
+                warn!("{} thread panicked during shutdown", name);
                 true // 虽然 panic 了，但至少 join 返回了
             }
             Err(mpsc::RecvTimeoutError::Timeout) => false,
@@ -449,8 +473,8 @@ fn run_platform(
     platform_rx: mpsc::Receiver<SchemeResult>,
     ui_tx: mpsc::Sender<UiCommand>,
     current_settings: Arc<Mutex<(SchemeId, Theme)>>,
-) -> Result<(), black_hole_platform::PlatformError> {
-    let mut platform = black_hole_platform::WindowsTsfIme::new(current_settings);
+) -> Result<(), WindowsPlatformError> {
+    let mut platform = WindowsTsfIme::new(current_settings);
     platform.run(engine_tx, platform_rx, ui_tx)?;
     Ok(())
 }
@@ -461,8 +485,8 @@ fn run_platform(
     platform_rx: mpsc::Receiver<SchemeResult>,
     ui_tx: mpsc::Sender<UiCommand>,
     _current_settings: Arc<Mutex<(SchemeId, Theme)>>,
-) -> Result<(), black_hole_platform::PlatformError> {
-    let mut platform = black_hole_platform::LinuxIbusIme::new();
+) -> Result<(), LinuxPlatformError> {
+    let mut platform = LinuxIbusIme::new();
     platform.run(engine_tx, platform_rx, ui_tx)?;
     Ok(())
 }

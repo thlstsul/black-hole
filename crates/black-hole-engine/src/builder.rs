@@ -1,5 +1,6 @@
 use crate::{Engine, SchemeRegistry, default_user_dict_dir, init_global_user_dict};
 use black_hole_shared::SchemeId;
+use tracing::warn;
 
 /// 引擎构建器
 ///
@@ -57,7 +58,7 @@ impl EngineBuilder {
         // 初始化全局用户词典
         let user_dict_dir = default_user_dict_dir();
         if let Err(e) = init_global_user_dict(&user_dict_dir) {
-            tracing::warn!(
+            warn!(
                 "Failed to initialize user dictionary at {:?}: {}",
                 user_dict_dir,
                 e

@@ -5,9 +5,16 @@
 //! - 不可移动（语言栏项固定位置）
 //! - 点击弹出菜单：设置、输入方案、主题、退出
 
-use super::{ServiceInner, send_ui_command_inner};
+use super::service::apply_input_mode_toggle;
+use super::{CLSID_BLACKHOLE_TIP, ServiceInner, send_ui_command_inner};
 use black_hole_shared::{SchemeId, Theme, UiCommand};
+use crate::auto_start::is_auto_start;
+use std::ffi::c_void;
+use std::mem;
+use std::ptr;
+use std::slice;
 use std::sync::{Arc, Mutex};
+use tracing::{debug, warn};
 use windows::Win32::Foundation::{
     COLORREF, E_FAIL, E_UNEXPECTED, FreeLibrary, HMODULE, LPARAM, POINT, RECT, TRUE, WPARAM,
 };
@@ -35,7 +42,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, TPM_LEFTBUTTON, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu,
     WINDOW_EX_STYLE, WM_NULL, WS_POPUP,
 };
-use windows_core::{BOOL, BSTR, GUID, Interface, PCSTR, PCWSTR, Ref, implement, w};
+use windows_core::{
+    BOOL, BSTR, GUID, Interface, IUnknown, PCSTR, PCWSTR, Ref, Result, implement, w,
+};
 
 // ---------------------------------------------------------------------------
 // 菜单命令 ID
@@ -77,11 +86,11 @@ impl PreferredAppModeGuard {
             let module = LoadLibraryW(w!("uxtheme.dll")).ok()?;
             let set = GetProcAddress(module, PCSTR(135 as *const u8))?;
             let flush = GetProcAddress(module, PCSTR(136 as *const u8))?;
-            let set: SetPreferredAppModeFn = std::mem::transmute(set);
-            let flush: FlushMenuThemesFn = std::mem::transmute(flush);
+            let set: SetPreferredAppModeFn = mem::transmute(set);
+            let flush: FlushMenuThemesFn = mem::transmute(flush);
             let previous = set(mode);
             flush();
-            tracing::debug!("SetPreferredAppMode mode={} previous={}", mode, previous);
+            debug!("SetPreferredAppMode mode={} previous={}", mode, previous);
             Some(Self {
                 _module: module,
                 set,
@@ -98,7 +107,7 @@ impl Drop for PreferredAppModeGuard {
             let _ = (self.set)(self.previous);
             (self.flush)();
             let _ = FreeLibrary(self._module);
-            tracing::debug!("Restored PreferredAppMode to {}", self.previous);
+            debug!("Restored PreferredAppMode to {}", self.previous);
         }
     }
 }
@@ -125,7 +134,7 @@ fn system_uses_dark_mode() -> bool {
             .chain(Some(0))
             .collect();
         let value: Vec<u16> = "AppsUseLightTheme".encode_utf16().chain(Some(0)).collect();
-        let mut hkey = std::mem::zeroed();
+        let mut hkey = mem::zeroed();
         if RegOpenKeyExW(
             HKEY_CURRENT_USER,
             PCWSTR(path.as_ptr()),
@@ -139,7 +148,7 @@ fn system_uses_dark_mode() -> bool {
         }
 
         let mut data: u32 = 0;
-        let mut size = std::mem::size_of::<u32>() as u32;
+        let mut size = mem::size_of::<u32>() as u32;
         let mut ty = REG_VALUE_TYPE(0);
         let is_dark = RegQueryValueExW(
             hkey,
@@ -201,7 +210,7 @@ impl BlackHoleLangBarItem {
             inner.mode_switch.set_english(next)
         };
         if let Some(english) = toggled {
-            super::service::apply_input_mode_toggle(&self.inner, english);
+            apply_input_mode_toggle(&self.inner, english);
         }
     }
 
@@ -238,7 +247,7 @@ impl BlackHoleLangBarItem {
             let root = match CreatePopupMenu() {
                 Ok(m) => m,
                 Err(e) => {
-                    tracing::warn!("Failed to create popup menu: {}", e);
+                    warn!("Failed to create popup menu: {}", e);
                     return;
                 }
             };
@@ -264,7 +273,7 @@ impl BlackHoleLangBarItem {
             let scheme_menu = match CreatePopupMenu() {
                 Ok(m) => m,
                 Err(e) => {
-                    tracing::warn!("Failed to create scheme submenu: {}", e);
+                    warn!("Failed to create scheme submenu: {}", e);
                     let _ = DestroyMenu(root);
                     return;
                 }
@@ -297,7 +306,7 @@ impl BlackHoleLangBarItem {
             let theme_menu = match CreatePopupMenu() {
                 Ok(m) => m,
                 Err(e) => {
-                    tracing::warn!("Failed to create theme submenu: {}", e);
+                    warn!("Failed to create theme submenu: {}", e);
                     let _ = DestroyMenu(root);
                     let _ = DestroyMenu(scheme_menu);
                     return;
@@ -344,7 +353,7 @@ impl BlackHoleLangBarItem {
             let _ = AppendMenuW(
                 root,
                 MF_STRING
-                    | if crate::auto_start::is_auto_start() {
+                    | if is_auto_start() {
                         MF_CHECKED
                     } else {
                         MF_UNCHECKED
@@ -376,7 +385,7 @@ impl BlackHoleLangBarItem {
             ) {
                 Ok(h) => h,
                 Err(e) => {
-                    tracing::warn!("Failed to create menu host window: {}", e);
+                    warn!("Failed to create menu host window: {}", e);
                     let _ = DestroyMenu(root);
                     return;
                 }
@@ -386,7 +395,7 @@ impl BlackHoleLangBarItem {
             let mode = preferred_app_mode_for_theme(theme);
             let theme_guard = PreferredAppModeGuard::set(mode);
             if theme_guard.is_none() {
-                tracing::warn!("Failed to set preferred app mode for menu theme {}", mode);
+                warn!("Failed to set preferred app mode for menu theme {}", mode);
             }
 
             // 经典 workaround：TrackPopupMenu 要求宿主为前台窗口或其子窗口，
@@ -409,10 +418,10 @@ impl BlackHoleLangBarItem {
 
             let cmd_id = cmd.0 as u32;
             if cmd_id == 0 {
-                tracing::debug!("LangBarItem menu dismissed without selection");
+                debug!("LangBarItem menu dismissed without selection");
                 return;
             }
-            tracing::debug!("LangBarItem menu selected: cmd={}", cmd_id);
+            debug!("LangBarItem menu selected: cmd={}", cmd_id);
 
             match cmd_id {
                 MENU_ID_SETTINGS => self.send_ui_command(UiCommand::ShowSettings),
@@ -439,7 +448,7 @@ impl BlackHoleLangBarItem {
                 }
                 MENU_ID_AUTO_START => {
                     // 切换自启动状态；持久化与平台写入由 daemon 统一处理
-                    let next = !crate::auto_start::is_auto_start();
+                    let next = !is_auto_start();
                     self.send_ui_command(UiCommand::SetAutoStart(next));
                 }
                 MENU_ID_EXIT => self.send_ui_command(UiCommand::Exit),
@@ -450,11 +459,11 @@ impl BlackHoleLangBarItem {
 }
 
 impl ITfLangBarItem_Impl for BlackHoleLangBarItem_Impl {
-    fn GetInfo(&self, pinfo: *mut TF_LANGBARITEMINFO) -> windows_core::Result<()> {
-        tracing::debug!("LangBarItem::GetInfo called");
+    fn GetInfo(&self, pinfo: *mut TF_LANGBARITEMINFO) -> Result<()> {
+        debug!("LangBarItem::GetInfo called");
         unsafe {
             let info = &mut *pinfo;
-            info.clsidService = super::CLSID_BLACKHOLE_TIP;
+            info.clsidService = CLSID_BLACKHOLE_TIP;
             // Windows 8+ 的输入指示器只显示 GUID 为 GUID_LBI_INPUTMODE 的项。
             info.guidItem = GUID_LBI_INPUTMODE;
             info.dwStyle =
@@ -469,18 +478,18 @@ impl ITfLangBarItem_Impl for BlackHoleLangBarItem_Impl {
         Ok(())
     }
 
-    fn GetStatus(&self) -> windows_core::Result<u32> {
-        tracing::debug!("LangBarItem::GetStatus called");
+    fn GetStatus(&self) -> Result<u32> {
+        debug!("LangBarItem::GetStatus called");
         Ok(0)
     }
 
-    fn Show(&self, fshow: BOOL) -> windows_core::Result<()> {
-        tracing::debug!("LangBarItem::Show called: fshow={}", fshow.0);
+    fn Show(&self, fshow: BOOL) -> Result<()> {
+        debug!("LangBarItem::Show called: fshow={}", fshow.0);
         Ok(())
     }
 
-    fn GetTooltipString(&self) -> windows_core::Result<BSTR> {
-        tracing::debug!("LangBarItem::GetTooltipString called");
+    fn GetTooltipString(&self) -> Result<BSTR> {
+        debug!("LangBarItem::GetTooltipString called");
         Ok(BSTR::from("黑洞输入法"))
     }
 }
@@ -491,8 +500,8 @@ impl ITfLangBarItemButton_Impl for BlackHoleLangBarItem_Impl {
         click: TfLBIClick,
         pt: &POINT,
         _prcarea: *const RECT,
-    ) -> windows_core::Result<()> {
-        tracing::debug!("LangBarItem::OnClick called: click={:?}", click.0);
+    ) -> Result<()> {
+        debug!("LangBarItem::OnClick called: click={:?}", click.0);
         // Windows 8+ 对 GUID_LBI_INPUTMODE 项通常走 OnClick 而不是 InitMenu，
         // 因此左右键统一弹出上下文菜单。
         if click == TF_LBI_CLK_LEFT || click == TF_LBI_CLK_RIGHT {
@@ -501,8 +510,8 @@ impl ITfLangBarItemButton_Impl for BlackHoleLangBarItem_Impl {
         Ok(())
     }
 
-    fn InitMenu(&self, pmenu: Ref<'_, ITfMenu>) -> windows_core::Result<()> {
-        tracing::debug!("LangBarItem::InitMenu called");
+    fn InitMenu(&self, pmenu: Ref<'_, ITfMenu>) -> Result<()> {
+        debug!("LangBarItem::InitMenu called");
         let menu = pmenu.to_owned().ok_or(E_UNEXPECTED)?;
 
         add_menu_item(&menu, MENU_ID_SETTINGS, 0, "设置")?;
@@ -582,7 +591,7 @@ impl ITfLangBarItemButton_Impl for BlackHoleLangBarItem_Impl {
         add_menu_item(
             &menu,
             MENU_ID_AUTO_START,
-            if crate::auto_start::is_auto_start() {
+            if is_auto_start() {
                 TF_LBMENUF_CHECKED
             } else {
                 0
@@ -596,8 +605,8 @@ impl ITfLangBarItemButton_Impl for BlackHoleLangBarItem_Impl {
         Ok(())
     }
 
-    fn OnMenuSelect(&self, wid: u32) -> windows_core::Result<()> {
-        tracing::debug!("LangBarItem::OnMenuSelect called: wid={}", wid);
+    fn OnMenuSelect(&self, wid: u32) -> Result<()> {
+        debug!("LangBarItem::OnMenuSelect called: wid={}", wid);
         match wid {
             MENU_ID_SETTINGS => self.send_ui_command(UiCommand::ShowSettings),
             MENU_ID_ENGLISH => self.toggle_input_mode(),
@@ -623,7 +632,7 @@ impl ITfLangBarItemButton_Impl for BlackHoleLangBarItem_Impl {
             }
             MENU_ID_AUTO_START => {
                 // 切换自启动状态；持久化与平台写入由 daemon 统一处理
-                let next = !crate::auto_start::is_auto_start();
+                let next = !is_auto_start();
                 self.send_ui_command(UiCommand::SetAutoStart(next));
             }
             MENU_ID_EXIT => self.send_ui_command(UiCommand::Exit),
@@ -632,8 +641,8 @@ impl ITfLangBarItemButton_Impl for BlackHoleLangBarItem_Impl {
         Ok(())
     }
 
-    fn GetIcon(&self) -> windows_core::Result<HICON> {
-        tracing::debug!("LangBarItem::GetIcon called");
+    fn GetIcon(&self) -> Result<HICON> {
+        debug!("LangBarItem::GetIcon called");
         render_scheme_icon(
             self.current_scheme(),
             self.current_theme(),
@@ -641,8 +650,8 @@ impl ITfLangBarItemButton_Impl for BlackHoleLangBarItem_Impl {
         )
     }
 
-    fn GetText(&self) -> windows_core::Result<BSTR> {
-        tracing::debug!("LangBarItem::GetText called");
+    fn GetText(&self) -> Result<BSTR> {
+        debug!("LangBarItem::GetText called");
         // 菜单按钮通常只显示图标；文本留空避免占用空间。
         Ok(BSTR::new())
     }
@@ -652,12 +661,12 @@ impl ITfSource_Impl for BlackHoleLangBarItem_Impl {
     fn AdviseSink(
         &self,
         riid: *const GUID,
-        punk: Ref<'_, windows_core::IUnknown>,
-    ) -> windows_core::Result<u32> {
+        punk: Ref<'_, IUnknown>,
+    ) -> Result<u32> {
         let riid_safe = unsafe { riid.as_ref().copied() };
-        tracing::debug!("LangBarItem::AdviseSink called: riid={:?}", riid_safe);
+        debug!("LangBarItem::AdviseSink called: riid={:?}", riid_safe);
 
-        let sink_iid = <ITfLangBarItemSink as windows_core::Interface>::IID;
+        let sink_iid = <ITfLangBarItemSink as Interface>::IID;
         if let Some(req_riid) = riid_safe
             && req_riid == sink_iid
         {
@@ -666,12 +675,12 @@ impl ITfSource_Impl for BlackHoleLangBarItem_Impl {
             let mut inner = self.inner.lock().unwrap();
             inner.langbar_item_sink = Some(sink.clone());
             inner.langbar_item_sink_cookie = 1;
-            tracing::debug!("LangBarItem sink installed");
+            debug!("LangBarItem sink installed");
             // 通知语言栏管理器立即刷新该项的图标和文本。
             // Windows 在项未完全就绪时可能返回 E_FAIL，不影响后续渲染。
             match unsafe { sink.OnUpdate(TF_LBI_ICON | TF_LBI_TEXT) } {
-                Ok(()) => tracing::debug!("LangBarItem OnUpdate sent successfully"),
-                Err(e) => tracing::debug!("LangBarItem OnUpdate ignored: {}", e),
+                Ok(()) => debug!("LangBarItem OnUpdate sent successfully"),
+                Err(e) => debug!("LangBarItem OnUpdate ignored: {}", e),
             }
             return Ok(1);
         }
@@ -679,8 +688,8 @@ impl ITfSource_Impl for BlackHoleLangBarItem_Impl {
         Ok(0)
     }
 
-    fn UnadviseSink(&self, dwcookie: u32) -> windows_core::Result<()> {
-        tracing::debug!("LangBarItem::UnadviseSink called: dwcookie={}", dwcookie);
+    fn UnadviseSink(&self, dwcookie: u32) -> Result<()> {
+        debug!("LangBarItem::UnadviseSink called: dwcookie={}", dwcookie);
         if dwcookie == 1 {
             let mut inner = self.inner.lock().unwrap();
             inner.langbar_item_sink = None;
@@ -694,33 +703,33 @@ impl ITfSource_Impl for BlackHoleLangBarItem_Impl {
 // 菜单辅助函数
 // ---------------------------------------------------------------------------
 
-fn add_menu_item(menu: &ITfMenu, id: u32, flags: u32, text: &str) -> windows_core::Result<()> {
+fn add_menu_item(menu: &ITfMenu, id: u32, flags: u32, text: &str) -> Result<()> {
     let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
     unsafe {
         menu.AddMenuItem(
             id,
             flags,
-            HBITMAP(std::ptr::null_mut()),
-            HBITMAP(std::ptr::null_mut()),
+            HBITMAP(ptr::null_mut()),
+            HBITMAP(ptr::null_mut()),
             &wide,
-            std::ptr::null_mut(),
+            ptr::null_mut(),
         )
     }
 }
 
-fn add_menu_separator(menu: &ITfMenu) -> windows_core::Result<()> {
+fn add_menu_separator(menu: &ITfMenu) -> Result<()> {
     add_menu_item(menu, 0, TF_LBMENUF_SEPARATOR, "")
 }
 
-fn add_submenu(menu: &ITfMenu, flags: u32, text: &str) -> windows_core::Result<ITfMenu> {
+fn add_submenu(menu: &ITfMenu, flags: u32, text: &str) -> Result<ITfMenu> {
     let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
     let mut submenu: Option<ITfMenu> = None;
     unsafe {
         menu.AddMenuItem(
             0,
             flags | TF_LBMENUF_SUBMENU,
-            HBITMAP(std::ptr::null_mut()),
-            HBITMAP(std::ptr::null_mut()),
+            HBITMAP(ptr::null_mut()),
+            HBITMAP(ptr::null_mut()),
             &wide,
             &mut submenu,
         )?;
@@ -736,7 +745,7 @@ fn render_scheme_icon(
     scheme: SchemeId,
     theme: Theme,
     english: bool,
-) -> windows_core::Result<HICON> {
+) -> Result<HICON> {
     const SIZE: i32 = 16;
     const PX_COUNT: usize = (SIZE * SIZE) as usize;
 
@@ -754,7 +763,7 @@ fn render_scheme_icon(
         // 32bpp 自顶向下 DIB。
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biSize: mem::size_of::<BITMAPINFOHEADER>() as u32,
                 biWidth: SIZE,
                 biHeight: -SIZE, // 负值表示自顶向下
                 biPlanes: 1,
@@ -768,7 +777,7 @@ fn render_scheme_icon(
             },
             bmiColors: [Default::default(); 1],
         };
-        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let mut bits: *mut c_void = ptr::null_mut();
         let color_bmp = CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)?;
         if color_bmp.is_invalid() {
             let _ = DeleteDC(mem_dc);
@@ -776,7 +785,7 @@ fn render_scheme_icon(
         }
 
         // DIB 初始内容未定义，先清零以获得透明背景。
-        std::ptr::write_bytes(bits, 0, PX_COUNT * 4);
+        ptr::write_bytes(bits, 0, PX_COUNT * 4);
 
         let old_bmp = SelectObject(mem_dc, HGDIOBJ(color_bmp.0));
 
@@ -827,7 +836,7 @@ fn render_scheme_icon(
         ]);
 
         // 后处理 alpha：GDI 不写入 alpha，手动把非零亮度像素设为文字颜色并完全不透明。
-        let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, PX_COUNT);
+        let pixels = slice::from_raw_parts_mut(bits as *mut u32, PX_COUNT);
         for px in pixels.iter_mut() {
             let b = (*px & 0xFF) as u8;
             let g = ((*px >> 8) & 0xFF) as u8;

@@ -1,5 +1,6 @@
 use crate::{Dictionary, LanguageModel, SyllableGraph};
 use rustc_hash::FxHashMap;
+use tracing::debug;
 
 /// 解码结果
 #[derive(Debug, Clone, PartialEq)]
@@ -169,7 +170,7 @@ impl<'a> GraphDecoder<'a> {
         let word_edges = self.build_word_edges(graph);
         let n = graph.total_len();
 
-        tracing::debug!(
+        debug!(
             "decode start: n={}, word_edges={}",
             n,
             word_edges.iter().map(|v| v.len()).sum::<usize>()
@@ -298,7 +299,7 @@ impl<'a> GraphDecoder<'a> {
                 });
             }
         }
-        tracing::debug!(
+        debug!(
             "decode full-coverage results: count={}, texts={:?}",
             results.len(),
             results.iter().map(|r| &r.text).collect::<Vec<_>>()
@@ -313,7 +314,7 @@ impl<'a> GraphDecoder<'a> {
         graph: &SyllableGraph,
         n: usize,
     ) -> Vec<DecodeResult> {
-        tracing::debug!("decode: no full coverage, falling back to hybrid");
+        debug!("decode: no full coverage, falling back to hybrid");
 
         for end in (1..=n).rev() {
             let Some(states) = dp.get(end) else { continue };
@@ -345,7 +346,7 @@ impl<'a> GraphDecoder<'a> {
             }
 
             if !hybrid_results.is_empty() {
-                tracing::debug!(
+                debug!(
                     "decode hybrid results: count={}, texts={:?}",
                     hybrid_results.len(),
                     hybrid_results.iter().map(|r| &r.text).collect::<Vec<_>>()
@@ -380,7 +381,7 @@ impl<'a> GraphDecoder<'a> {
         results.sort_by(|a, b| b.score.total_cmp(&a.score));
         results.dedup_by(|a, b| a.text == b.text);
 
-        tracing::debug!(
+        debug!(
             "decode end: final_results count={}, top5={:?}",
             results.len(),
             results
@@ -459,9 +460,9 @@ impl<'a> GraphDecoder<'a> {
         start: usize,
         end: usize,
     ) -> Vec<(String, f64)> {
-        tracing::debug!("fallback_for_range: start={}, end={}", start, end);
+        debug!("fallback_for_range: start={}, end={}", start, end);
         let Some(syllables) = graph.find_path_from(start) else {
-            tracing::debug!("fallback_for_range: no path from start={}", start);
+            debug!("fallback_for_range: no path from start={}", start);
             return Vec::new();
         };
 
@@ -507,14 +508,14 @@ impl<'a> GraphDecoder<'a> {
 
         if pos < end {
             // 未能覆盖到 end，返回空表示失败
-            tracing::debug!(
+            debug!(
                 "fallback_for_range: failed to cover to end={}, pos={}",
                 end,
                 pos
             );
             Vec::new()
         } else {
-            tracing::debug!(
+            debug!(
                 "fallback_for_range: results count={}, top3={:?}",
                 results.len(),
                 results.iter().take(3).collect::<Vec<_>>()

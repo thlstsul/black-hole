@@ -1,5 +1,6 @@
 use black_hole_shared::Candidate;
 use rustc_hash::FxHashMap;
+use std::cmp::Reverse;
 
 /// 最大保留的 unigram 条目数，超出时只保留高频词以降低内存
 const MAX_UNIGRAM_ENTRIES: usize = 20000;
@@ -53,7 +54,7 @@ impl LanguageModel {
             // 如果词条数过多，只保留高频词，降低内存占用
             if text_scores.len() > MAX_UNIGRAM_ENTRIES {
                 let mut entries: Vec<(String, i64)> = text_scores.into_iter().collect();
-                entries.sort_by_key(|b| std::cmp::Reverse(b.1));
+                entries.sort_by_key(|b| Reverse(b.1));
                 entries.truncate(MAX_UNIGRAM_ENTRIES);
                 text_scores = entries.into_iter().collect();
             }

@@ -1,13 +1,16 @@
+use super::caret::{get_caret_position, get_caret_position_via_gui_thread_info};
 use super::service::BlackHoleTextService;
 use super::{ServiceInner, send_ui_command_inner};
-use black_hole_shared::SchemeResult;
+use black_hole_shared::{InputContext, SchemeResult, UiCommand};
+use std::mem;
+use std::slice;
 use std::sync::{Arc, Mutex};
 use windows::Win32::UI::TextServices::{
     ITfCompositionSink, ITfContext, ITfContextComposition, ITfEditSession, ITfEditSession_Impl,
-    ITfInsertAtSelection, ITfSource, ITfTextLayoutSink, TF_AE_NONE, TF_IAS_QUERYONLY, TF_SELECTION,
-    TF_SELECTIONSTYLE,
+    ITfInsertAtSelection, ITfSource, ITfTextLayoutSink, TF_AE_NONE, TF_ANCHOR_END, TF_IAS_QUERYONLY,
+    TF_SELECTION, TF_SELECTIONSTYLE,
 };
-use windows_core::{BOOL, Interface, implement};
+use windows_core::{BOOL, Interface, Result, implement};
 
 /// Apply the engine result to TSF and the UI.
 pub(crate) fn apply_result(
@@ -15,7 +18,7 @@ pub(crate) fn apply_result(
     ec: u32,
     ctx: &ITfContext,
     result: &SchemeResult,
-) -> windows_core::Result<()> {
+) -> Result<()> {
     match result {
         SchemeResult::Composing {
             code,
@@ -68,14 +71,14 @@ pub(crate) fn apply_result(
                 }
 
                 let mut sel = TF_SELECTION {
-                    range: std::mem::ManuallyDrop::new(Some(range)),
+                    range: mem::ManuallyDrop::new(Some(range)),
                     style: TF_SELECTIONSTYLE {
                         ase: TF_AE_NONE,
                         fInterimChar: BOOL(0),
                     },
                 };
-                unsafe { ctx.SetSelection(ec, std::slice::from_ref(&sel))? };
-                let _ = unsafe { std::mem::ManuallyDrop::take(&mut sel.range) };
+                unsafe { ctx.SetSelection(ec, slice::from_ref(&sel))? };
+                let _ = unsafe { mem::ManuallyDrop::take(&mut sel.range) };
             }
 
             if code.is_empty() {
@@ -103,12 +106,12 @@ pub(crate) fn apply_result(
             }
 
             let caret_pos = if need_start {
-                match super::caret::get_caret_position_via_gui_thread_info() {
+                match get_caret_position_via_gui_thread_info() {
                     Ok(pos) => Some(pos),
                     Err(_) => {
                         let inner = inner_arc.lock().unwrap();
                         let comp = inner.composition.as_ref();
-                        match super::caret::get_caret_position(ec, ctx, comp) {
+                        match get_caret_position(ec, ctx, comp) {
                             Ok(pos) => Some(pos),
                             Err(_) => inner.last_caret_pos,
                         }
@@ -117,7 +120,7 @@ pub(crate) fn apply_result(
             } else {
                 let inner = inner_arc.lock().unwrap();
                 let comp = inner.composition.as_ref();
-                match super::caret::get_caret_position(ec, ctx, comp) {
+                match get_caret_position(ec, ctx, comp) {
                     Ok(pos) => Some(pos),
                     Err(_) => inner.last_caret_pos,
                 }
@@ -127,12 +130,12 @@ pub(crate) fn apply_result(
                 let mut inner = inner_arc.lock().unwrap();
                 inner.last_caret_pos = Some((caret_x, caret_y, caret_h));
                 drop(inner);
-                let context = black_hole_shared::InputContext {
+                let context = InputContext {
                     caret_x,
                     caret_y,
                     caret_h,
                 };
-                let cmd = black_hole_shared::UiCommand::ShowCandidates {
+                let cmd = UiCommand::ShowCandidates {
                     code: code.clone(),
                     candidates: candidates.clone(),
                     selected_index: *selected_index,
@@ -149,7 +152,7 @@ pub(crate) fn apply_result(
             };
 
             let Some(composition) = composition else {
-                let _ = (|| -> windows_core::Result<()> {
+                let _ = (|| -> Result<()> {
                     let insert: ITfInsertAtSelection = ctx.cast()?;
                     let utf16: Vec<u16> = text.encode_utf16().collect();
                     // 使用 QUERYONLY 获取插入点 range（避免 NOQUERY 返回空指针导致 Drop 时崩溃）
@@ -160,7 +163,7 @@ pub(crate) fn apply_result(
                 return Ok(());
             };
 
-            let _ = (|| -> windows_core::Result<()> {
+            let _ = (|| -> Result<()> {
                 let range = unsafe { composition.GetRange()? };
                 let utf16: Vec<u16> = text.encode_utf16().collect();
                 unsafe { range.SetText(ec, 0, &utf16)? };
@@ -170,17 +173,17 @@ pub(crate) fn apply_result(
                     return Ok(());
                 };
                 let _ = unsafe {
-                    collapsed.Collapse(ec, windows::Win32::UI::TextServices::TF_ANCHOR_END)
+                    collapsed.Collapse(ec, TF_ANCHOR_END)
                 };
                 let mut sel = TF_SELECTION {
-                    range: std::mem::ManuallyDrop::new(Some(collapsed)),
+                    range: mem::ManuallyDrop::new(Some(collapsed)),
                     style: TF_SELECTIONSTYLE {
                         ase: TF_AE_NONE,
                         fInterimChar: BOOL(0),
                     },
                 };
-                let _ = unsafe { ctx.SetSelection(ec, std::slice::from_ref(&sel)) };
-                let _ = unsafe { std::mem::ManuallyDrop::take(&mut sel.range) };
+                let _ = unsafe { ctx.SetSelection(ec, slice::from_ref(&sel)) };
+                let _ = unsafe { mem::ManuallyDrop::take(&mut sel.range) };
                 Ok(())
             })();
             {
@@ -209,7 +212,7 @@ pub(crate) struct CancelCompositionEditSession {
 }
 
 impl ITfEditSession_Impl for CancelCompositionEditSession_Impl {
-    fn DoEditSession(&self, ec: u32) -> windows_core::Result<()> {
+    fn DoEditSession(&self, ec: u32) -> Result<()> {
         let (composition, ctx, layout_cookie) = {
             let inner = self.inner_arc.lock().unwrap();
             let comp = inner.composition.clone();
@@ -219,7 +222,7 @@ impl ITfEditSession_Impl for CancelCompositionEditSession_Impl {
         };
 
         if let Some(comp) = composition {
-            let _ = (|| -> windows_core::Result<()> {
+            let _ = (|| -> Result<()> {
                 let range = unsafe { comp.GetRange()? };
                 unsafe { range.SetText(ec, 0, &[])? };
                 let _ = unsafe { comp.EndComposition(ec) };

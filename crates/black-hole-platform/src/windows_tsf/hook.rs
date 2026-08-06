@@ -27,6 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::ServiceInner;
 use super::service::apply_input_mode_toggle;
+use tracing::{debug, warn};
 
 /// 当前进程内所有已激活的文本服务实例（线程 id → 弱引用）。
 /// 钩子回调据此定位前台窗口所属线程对应的服务。
@@ -42,7 +43,7 @@ static FOREGROUND_TID: Mutex<Option<u32>> = Mutex::new(None);
 
 /// 记录当前持有 TSF 输入焦点的线程（OnSetFocus(fforeground=true) 时调用）。
 pub(crate) fn set_foreground_thread(thread_id: u32) {
-    tracing::debug!("hook: set_foreground_thread thread_id={}", thread_id);
+    debug!("hook: set_foreground_thread thread_id={}", thread_id);
     if let Ok(mut guard) = FOREGROUND_TID.lock() {
         *guard = Some(thread_id);
     }
@@ -50,7 +51,7 @@ pub(crate) fn set_foreground_thread(thread_id: u32) {
 
 /// 清除 TSF 输入焦点记录（OnSetFocus(fforeground=false) 时调用）。
 pub(crate) fn clear_foreground_thread() {
-    tracing::debug!("hook: clear_foreground_thread");
+    debug!("hook: clear_foreground_thread");
     if let Ok(mut guard) = FOREGROUND_TID.lock() {
         *guard = None;
     }
@@ -58,7 +59,7 @@ pub(crate) fn clear_foreground_thread() {
 
 /// 注册一个已激活的服务实例（Activate 时调用），并确保钩子已安装。
 pub(crate) fn register_service(thread_id: u32, inner: Arc<Mutex<ServiceInner>>) {
-    tracing::debug!("hook: register_service thread_id={}", thread_id);
+    debug!("hook: register_service thread_id={}", thread_id);
     if let Ok(mut guard) = ACTIVE_SERVICES.lock() {
         let map = guard.get_or_insert_with(HashMap::new);
         map.insert(thread_id, Arc::downgrade(&inner));
@@ -106,10 +107,10 @@ fn install_hook() {
     };
     match hook {
         Ok(h) => {
-            tracing::debug!("WH_KEYBOARD_LL hook installed");
+            debug!("WH_KEYBOARD_LL hook installed");
             *guard = Some(h.0 as usize);
         }
-        Err(e) => tracing::warn!("Failed to install WH_KEYBOARD_LL hook: {}", e),
+        Err(e) => warn!("Failed to install WH_KEYBOARD_LL hook: {}", e),
     }
 }
 
@@ -167,7 +168,7 @@ fn foreground_thread_id() -> Option<u32> {
         let mut pid = 0u32;
         let tid = GetWindowThreadProcessId(hwnd, Some(&mut pid));
         if pid != GetCurrentProcessId() {
-            tracing::debug!(
+            debug!(
                 "hook: 前台窗口属于其他进程 pid={} (本进程 pid={})，跳过",
                 pid,
                 GetCurrentProcessId()
@@ -209,11 +210,11 @@ fn foreground_service() -> Option<Arc<Mutex<ServiceInner>>> {
     // 3) 唯一实例兜底：未命中焦点线程但注册表中只有一个实例时回退使用。
     if map.len() == 1 {
         let weak = map.values().next()?;
-        tracing::debug!("hook: 未命中焦点线程，回退唯一注册实例");
+        debug!("hook: 未命中焦点线程，回退唯一注册实例");
         return weak.upgrade();
     }
 
-    tracing::debug!(
+    debug!(
         "hook: 未命中焦点线程（tsf={:?} win={:?}）且注册实例数={}",
         focused_tid,
         win_tid,
@@ -252,7 +253,7 @@ fn on_ctrl_released() {
         guard.mode_switch.ctrl_released()
     };
     if let Some(english) = toggled {
-        tracing::debug!(
+        debug!(
             "Ctrl toggled via keyboard hook: {}",
             if english { "英文" } else { "中文" }
         );

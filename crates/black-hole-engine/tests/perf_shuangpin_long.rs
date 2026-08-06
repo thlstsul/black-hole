@@ -4,9 +4,10 @@
 // 枚举全部切分路径并逐路径查表；且每次冷查询都会重新解析 58MB 词典表
 // （Table::load 约 3-7ms/次）。长输入下单键可达数百 ms 至数秒。
 // 修复：用 self_cell 缓存解析后的 Table/Prism，冷查询不再重复解析。
-use black_hole_engine::{InputScheme, RimeDict, ShuangpinScheme};
+use black_hole_engine::{InputScheme, RimeDict, ShuangpinScheme, default_user_dict_dir};
 use black_hole_shared::{InputContext, KeyEvent, KeyState, Modifiers};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 fn key_event(key: &str) -> KeyEvent {
     KeyEvent {
@@ -36,28 +37,28 @@ fn real_dict() -> Arc<RimeDict> {
         env!("CARGO_MANIFEST_DIR"),
         "/../../assets/dicts/rime_ice.dict.yaml"
     );
-    let cache_dir = black_hole_engine::default_user_dict_dir().join("cache");
+    let cache_dir = default_user_dict_dir().join("cache");
     Arc::new(
         RimeDict::from_rime_dict_cached(dict_path, &cache_dir).expect("failed to load rime_ice dict"),
     )
 }
 
 /// 逐键输入，返回每键耗时（µs）。scheme 在轮次间复位。
-fn type_keys(scheme: &mut ShuangpinScheme, input: &str) -> Vec<std::time::Duration> {
+fn type_keys(scheme: &mut ShuangpinScheme, input: &str) -> Vec<Duration> {
     let c = ctx();
     scheme.reset();
     let mut per_key = Vec::new();
     for ch in input.chars() {
         let k = ch.to_string();
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let _ = scheme.handle_key(&key_event(&k), &c);
         per_key.push(t.elapsed());
     }
     per_key
 }
 
-fn report(input: &str, label: &str, per_key: &[std::time::Duration]) {
-    let total: std::time::Duration = per_key.iter().sum();
+fn report(input: &str, label: &str, per_key: &[Duration]) {
+    let total: Duration = per_key.iter().sum();
     let avg = total.as_secs_f64() * 1000.0 / per_key.len() as f64;
     let max = per_key.iter().map(|d| d.as_secs_f64()).fold(0.0, f64::max) * 1000.0;
     println!(

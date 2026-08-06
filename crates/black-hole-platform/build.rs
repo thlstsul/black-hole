@@ -3,12 +3,13 @@
 // Windows TSF calls RegisterProfile with the DLL path as icon_file
 // and icon_index=0, extracting the first icon from the DLL's resource section.
 
+use std::env;
 use std::path::PathBuf;
 
 fn main() {
     #[cfg(target_os = "windows")]
     {
-        let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+        let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
         let ico = manifest_dir.join("../../assets/icons/black-hole.ico");
 
         if ico.exists() {

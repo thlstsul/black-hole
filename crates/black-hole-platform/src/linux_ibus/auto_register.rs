@@ -1,4 +1,9 @@
+use std::env;
+use std::fs;
+use std::io;
 use std::path::PathBuf;
+use std::process;
+use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
 // IBus component XML template
@@ -54,29 +59,29 @@ pub fn is_registered() -> bool {
 ///
 /// - 无法获取当前可执行路径时返回错误
 /// - 无法创建目录或写入文件时返回错误
-pub fn register_ime() -> std::io::Result<()> {
+pub fn register_ime() -> io::Result<()> {
     let component_dir = ibus_component_dir();
-    std::fs::create_dir_all(&component_dir)?;
+    fs::create_dir_all(&component_dir)?;
 
-    let exec_path = std::env::current_exe()?.to_string_lossy().to_string();
+    let exec_path = env::current_exe()?.to_string_lossy().to_string();
 
     let xml_content = IBUS_COMPONENT_TEMPLATE.replace("{exec_path}", &exec_path);
     let xml_path = component_dir.join("black-hole.xml");
-    std::fs::write(&xml_path, xml_content)?;
+    fs::write(&xml_path, xml_content)?;
 
-    tracing::info!("IBus component XML written to: {}", xml_path.display());
+    info!("IBus component XML written to: {}", xml_path.display());
 
     // 尝试重启 ibus 使新组件生效
-    match std::process::Command::new("ibus").arg("restart").output() {
+    match process::Command::new("ibus").arg("restart").output() {
         Ok(output) if output.status.success() => {
-            tracing::info!("ibus restart succeeded");
+            info!("ibus restart succeeded");
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!("ibus restart failed: {}", stderr);
+            warn!("ibus restart failed: {}", stderr);
         }
         Err(e) => {
-            tracing::warn!("Failed to run ibus restart: {}", e);
+            warn!("Failed to run ibus restart: {}", e);
         }
     }
 
@@ -88,7 +93,7 @@ pub fn register_ime() -> std::io::Result<()> {
 // ---------------------------------------------------------------------------
 
 fn ibus_component_dir() -> PathBuf {
-    let home = std::env::var("HOME")
+    let home = env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."));
     home.join(".config/ibus/component")

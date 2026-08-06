@@ -1,4 +1,7 @@
+use std::io::{self, ErrorKind};
+use std::mem;
 use std::path::Path;
+use std::ptr;
 use windows::Win32::Foundation::{CloseHandle, HWND, WAIT_OBJECT_0};
 use windows::Win32::System::Registry::{HKEY_CLASSES_ROOT, KEY_READ, RegCloseKey, RegOpenKeyExW};
 use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
@@ -18,7 +21,7 @@ pub fn is_registered() -> bool {
     unsafe {
         let clsid_path = format!("CLSID\\{{{:?}}}", CLSID_BLACKHOLE_TIP);
         let clsid_path_w: Vec<u16> = clsid_path.encode_utf16().chain(Some(0)).collect();
-        let mut hkey = std::mem::zeroed();
+        let mut hkey = mem::zeroed();
         let result = RegOpenKeyExW(
             HKEY_CLASSES_ROOT,
             PCWSTR(clsid_path_w.as_ptr()),
@@ -49,7 +52,7 @@ pub fn is_registered() -> bool {
 /// - 当 DLL 路径包含非法字符或参数构造失败时返回错误
 /// - 当无法启动提权进程（如用户拒绝 UAC）时返回错误
 /// - 当 `regsvr32` 返回非零退出码时返回错误
-pub fn register_ime(dll_path: &Path) -> std::io::Result<()> {
+pub fn register_ime(dll_path: &Path) -> io::Result<()> {
     let dll_path_str = dll_path.to_string_lossy();
     let params = format!("/s \"{}\"", dll_path_str);
 
@@ -57,17 +60,17 @@ pub fn register_ime(dll_path: &Path) -> std::io::Result<()> {
     let verb = null_terminated_wide("runas");
     let parameters = null_terminated_wide(&params);
 
-    let mut sei: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
-    sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    let mut sei: SHELLEXECUTEINFOW = unsafe { mem::zeroed() };
+    sei.cbSize = mem::size_of::<SHELLEXECUTEINFOW>() as u32;
     sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-    sei.hwnd = HWND(std::ptr::null_mut());
+    sei.hwnd = HWND(ptr::null_mut());
     sei.lpVerb = PCWSTR(verb.as_ptr());
     sei.lpFile = PCWSTR(file.as_ptr());
     sei.lpParameters = PCWSTR(parameters.as_ptr());
     sei.nShow = 0;
 
     unsafe { ShellExecuteExW(&mut sei) }.map_err(|e| {
-        std::io::Error::other(format!(
+        io::Error::other(format!(
             "Failed to launch regsvr32 with elevated privileges: {}",
             e
         ))
@@ -76,7 +79,7 @@ pub fn register_ime(dll_path: &Path) -> std::io::Result<()> {
     // hProcess is only valid when SEE_MASK_NOCLOSEPROCESS is set
     let h_process = sei.hProcess;
     if h_process.is_invalid() {
-        return Err(std::io::Error::other(
+        return Err(io::Error::other(
             "ShellExecuteExW did not return a process handle",
         ));
     }
@@ -89,8 +92,8 @@ pub fn register_ime(dll_path: &Path) -> std::io::Result<()> {
         code
     } else {
         let _ = unsafe { CloseHandle(h_process) };
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
+        return Err(io::Error::new(
+            ErrorKind::TimedOut,
             "regsvr32 did not complete within 30 seconds",
         ));
     };
@@ -98,7 +101,7 @@ pub fn register_ime(dll_path: &Path) -> std::io::Result<()> {
     let _ = unsafe { CloseHandle(h_process) };
 
     if exit_code != 0 {
-        return Err(std::io::Error::other(format!(
+        return Err(io::Error::other(format!(
             "regsvr32 exited with code {}",
             exit_code
         )));

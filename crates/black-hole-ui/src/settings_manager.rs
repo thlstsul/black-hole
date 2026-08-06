@@ -1,6 +1,9 @@
 use black_hole_shared::Settings;
+use serde_json::{from_str, to_string_pretty};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::PathBuf;
+use tracing::{error, info, warn};
 
 /// 设置管理器：负责设置的加载、保存和默认值
 pub struct SettingsManager {
@@ -33,22 +36,22 @@ impl SettingsManager {
         if let Some(parent) = path.parent()
             && let Err(e) = fs::create_dir_all(parent)
         {
-            tracing::error!("Failed to create config directory {:?}: {}", parent, e);
+            error!("Failed to create config directory {:?}: {}", parent, e);
             return false;
         }
 
-        let json = match serde_json::to_string_pretty(&self.settings) {
+        let json = match to_string_pretty(&self.settings) {
             Ok(j) => j,
             Err(e) => {
-                tracing::error!("Failed to serialize settings: {}", e);
+                error!("Failed to serialize settings: {}", e);
                 return false;
             }
         };
         if let Err(e) = fs::write(path, json) {
-            tracing::error!("Failed to write settings to {:?}: {}", path, e);
+            error!("Failed to write settings to {:?}: {}", path, e);
             return false;
         }
-        tracing::info!("Settings saved to {:?}", path);
+        info!("Settings saved to {:?}", path);
         true
     }
 
@@ -58,24 +61,24 @@ impl SettingsManager {
 
     fn load_from_disk(path: &PathBuf) -> Settings {
         match fs::read_to_string(path) {
-            Ok(content) => match serde_json::from_str::<Settings>(&content) {
+            Ok(content) => match from_str::<Settings>(&content) {
                 Ok(settings) => {
-                    tracing::info!("Loaded settings from {:?}", path);
+                    info!("Loaded settings from {:?}", path);
                     return settings;
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    warn!(
                         "Failed to parse settings file {:?}: {}, using defaults",
                         path,
                         e
                     );
                 }
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tracing::info!("No settings file found at {:?}, using defaults", path);
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                info!("No settings file found at {:?}, using defaults", path);
             }
             Err(e) => {
-                tracing::warn!(
+                warn!(
                     "Failed to read settings file {:?}: {}, using defaults",
                     path,
                     e

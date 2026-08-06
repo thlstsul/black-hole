@@ -12,14 +12,26 @@ use crate::{Dictionary, LanguageModel};
 use black_hole_shared::Candidate;
 use pinyin::ToPinyin;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeSet, HashMap, HashSet};
+#[cfg(test)]
+use std::env;
+use std::fs;
+use std::hash::{Hash, Hasher};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
+use tracing::{debug, error, info};
 
 use ::rime_dict::{
-    DictYaml, Prism, PrismBuilder, SpellingAlgebra, SyllableId, Table, TableBuilder, crc32,
+    DictYaml, Error, INDEX_CODE_MAX_LENGTH, Prism, PrismBuilder, SpellingAlgebra, SyllableId, Table,
+    TableBuilder, crc32,
 };
 use self_cell::self_cell;
+#[cfg(test)]
+use tempfile::{NamedTempFile, tempdir};
 
 // 自引用缓存：owner 持有表字节，dependent 借用字节保存解析后的 `Table`。
 // 避免每次查询重新解析 58MB 表（实测 `Table::load` 约 3-7ms/次，
@@ -69,18 +81,18 @@ struct PrefixLookupStats {
     /// 多音节前缀查询返回的原始词条总数
     entries: usize,
     /// `Table::query_prefix` 累计耗时
-    query_elapsed: std::time::Duration,
+    query_elapsed: Duration,
 }
 
 /// RIME 词库加载错误
 #[derive(Debug, thiserror::Error)]
 pub enum RimeDictError {
     #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
     #[error("Parse error: {0}")]
     Parse(String),
     #[error("rime-dict error: {0}")]
-    RimeDict(#[from] ::rime_dict::Error),
+    RimeDict(#[from] Error),
 }
 
 /// 基于 rime-dict 二进制格式（.prism.bin + .table.bin）的词典
@@ -161,24 +173,24 @@ impl RimeDict {
     ) -> Result<Self, RimeDictError> {
         let src_path = src_path.as_ref();
         let cache_dir = cache_dir.as_ref();
-        let _ = std::fs::create_dir_all(cache_dir);
+        let _ = fs::create_dir_all(cache_dir);
 
         let (prism_path, table_path) = cache_paths(src_path, cache_dir);
 
         if cache_is_valid(&prism_path, &table_path, src_path) {
-            tracing::info!("Using cached rime dictionary: {}", table_path.display());
-            let prism_bin = std::fs::read(&prism_path)?;
-            let table_bin = std::fs::read(&table_path)?;
+            info!("Using cached rime dictionary: {}", table_path.display());
+            let prism_bin = fs::read(&prism_path)?;
+            let table_bin = fs::read(&table_path)?;
             return Self::from_bins(prism_bin, table_bin);
         }
 
-        tracing::info!("Compiling rime dictionary from: {}", src_path.display());
+        info!("Compiling rime dictionary from: {}", src_path.display());
         let (entries, checksum) = load_dict_entries(src_path)?;
         let dict = Self::compile(&entries, checksum)?;
 
         // 缓存写出失败不阻塞加载
-        let _ = std::fs::write(&prism_path, dict.prism_cell.borrow_owner());
-        let _ = std::fs::write(&table_path, dict.table_cell.borrow_owner());
+        let _ = fs::write(&prism_path, dict.prism_cell.borrow_owner());
+        let _ = fs::write(&table_path, dict.table_cell.borrow_owner());
 
         Ok(dict)
     }
@@ -202,7 +214,7 @@ impl RimeDict {
                 Some(dict)
             }
             Err(e) => {
-                tracing::error!("Failed to load RIME dictionary: {}", e);
+                error!("Failed to load RIME dictionary: {}", e);
                 None
             }
         }
@@ -453,7 +465,7 @@ impl RimeDict {
                 return;
             }
         }
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let mut entries = self.query_prefix_resolved(ids);
         stats.query_elapsed += t.elapsed();
         stats.queries += 1;
@@ -486,7 +498,7 @@ impl RimeDict {
                     .map(|t| (t, weight as i64))
             })
             .collect();
-        out.sort_by_key(|e| std::cmp::Reverse(e.1));
+        out.sort_by_key(|e| Reverse(e.1));
         // 每路只保留 top N：最终 top-100 中的词条在其所在路径内的排名
         // 必然不高于全局排名，按路径截断不会丢失最终 top-100
         // （后续跨路径去重会取每个文本的最高分）。
@@ -505,7 +517,7 @@ impl RimeDict {
         let mut i = 0;
         while let Ok(Some(entry)) = accessor.entry_at(i) {
             // 四级以上长词条需按完整编码过滤（query_phrases 只索引前三级）
-            let matches = if ids.len() > ::rime_dict::INDEX_CODE_MAX_LENGTH {
+            let matches = if ids.len() > INDEX_CODE_MAX_LENGTH {
                 accessor.code_for(i).map(|c| c == ids).unwrap_or(false)
             } else {
                 true
@@ -519,7 +531,7 @@ impl RimeDict {
             }
             i += 1;
         }
-        out.sort_by_key(|c| std::cmp::Reverse(c.score));
+        out.sort_by_key(|c| Reverse(c.score));
         out
     }
 }
@@ -552,7 +564,7 @@ impl Dictionary for RimeDict {
             return Vec::new();
         }
 
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let mut stats = PrefixLookupStats::default();
         let mut paths: usize = 0;
         let mut results: Vec<(String, i64)> = Vec::new();
@@ -651,7 +663,7 @@ impl Dictionary for RimeDict {
         out.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.text.cmp(&b.text)));
         out.truncate(PREFIX_RESULT_LIMIT);
 
-        tracing::debug!(
+        debug!(
             "prefix_lookup: code='{}', paths={}, queries={}, cache_hits={}, entries={}, query_us={}, total_us={}",
             code,
             paths,
@@ -688,7 +700,7 @@ const _: () = {
 
 /// 收集词条中的不重复音节（排序，下标即音节 id；与 TableBin 内部排序一致）
 fn collect_syllabary(entries: &[RawEntry]) -> Vec<String> {
-    let mut set = std::collections::BTreeSet::new();
+    let mut set = BTreeSet::new();
     for entry in entries {
         for syl in entry.code.split_whitespace() {
             if !syl.is_empty() {
@@ -727,7 +739,7 @@ fn parse_dict_content(content: &str) -> Result<DictYaml, RimeDictError> {
 
 /// 加载词库及全部 import 的词条，返回 `(去重词条, 源文件 CRC-32)`
 fn load_dict_entries(src_path: &Path) -> Result<(Vec<RawEntry>, u32), RimeDictError> {
-    let content = std::fs::read_to_string(src_path)?;
+    let content = fs::read_to_string(src_path)?;
     let checksum = crc32(content.as_bytes());
 
     let mut visited = HashSet::new();
@@ -779,7 +791,7 @@ fn load_entries_recursive(
         };
         // 与 RIME 行为一致：导入文件不存在时静默跳过
         if let Some(p) = import_path {
-            let import_content = std::fs::read_to_string(&p)?;
+            let import_content = fs::read_to_string(&p)?;
             load_entries_recursive(&p, &import_content, visited, entries, seen)?;
         }
     }
@@ -788,9 +800,6 @@ fn load_entries_recursive(
 
 /// 缓存文件路径：以源文件路径哈希为名，保证稳定且唯一
 fn cache_paths(src_path: &Path, cache_dir: &Path) -> (PathBuf, PathBuf) {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
     let canonical = src_path
         .canonicalize()
         .unwrap_or_else(|_| src_path.to_path_buf());
@@ -829,7 +838,7 @@ fn cache_is_valid(prism_path: &Path, table_path: &Path, src_path: &Path) -> bool
     if let Some(dir) = src_path.parent() {
         let mut stack = vec![dir.to_path_buf()];
         while let Some(d) = stack.pop() {
-            let Ok(rd) = std::fs::read_dir(&d) else {
+            let Ok(rd) = fs::read_dir(&d) else {
                 continue;
             };
             for entry in rd.flatten() {
@@ -970,7 +979,7 @@ mod tests {
 
     #[test]
     fn test_rime_dict_basic() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut tmp = NamedTempFile::new().unwrap();
         write!(
             tmp,
             "# Rime dict\n\
@@ -995,7 +1004,7 @@ mod tests {
 
     #[test]
     fn test_rime_dict_without_yaml_header() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut tmp = NamedTempFile::new().unwrap();
         writeln!(tmp, "你好\tni hao\t10").unwrap();
 
         let dict = RimeDict::from_rime_dict(tmp.path()).unwrap();
@@ -1007,7 +1016,7 @@ mod tests {
 
     #[test]
     fn test_rime_dict_default_weight() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut tmp = NamedTempFile::new().unwrap();
         writeln!(tmp, "世界\thello").unwrap();
 
         let dict = RimeDict::from_rime_dict(tmp.path()).unwrap();
@@ -1018,13 +1027,13 @@ mod tests {
 
     #[test]
     fn test_rime_dict_import_tables() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir().unwrap();
 
         let sub_path = dir.path().join("sub.dict.yaml");
-        std::fs::write(&sub_path, "吧\tb\t5\n把\tb\t3\n").unwrap();
+        fs::write(&sub_path, "吧\tb\t5\n把\tb\t3\n").unwrap();
 
         let main_path = dir.path().join("main.dict.yaml");
-        std::fs::write(
+        fs::write(
             &main_path,
             "---\n\
              name: main\n\
@@ -1049,7 +1058,7 @@ mod tests {
     #[test]
     fn test_rime_dict_single_column_yaml_skipped() {
         // .dict.yaml 缺省布局下的单列条目：按 RIME 惯例跳过
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut tmp = NamedTempFile::new().unwrap();
         write!(
             tmp,
             "---\n\
@@ -1069,7 +1078,7 @@ mod tests {
     #[test]
     fn test_rime_dict_headerless_txt_auto_pinyin() {
         // 无头纯码表：单列词条自动生成拼音编码
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut tmp = NamedTempFile::new().unwrap();
         write!(tmp, "打印\n输入法\n").unwrap();
 
         let dict = RimeDict::from_rime_dict(tmp.path()).unwrap();
@@ -1084,7 +1093,7 @@ mod tests {
 
     #[test]
     fn test_rime_dict_single_column_non_hanzi() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut tmp = NamedTempFile::new().unwrap();
         write!(tmp, "M1\n3G\n3D打印\n").unwrap();
 
         // 非汉字单列条目应被静默跳过，不 panic、不报错
@@ -1095,7 +1104,7 @@ mod tests {
 
     #[test]
     fn test_rime_dict_columns_text_weight() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut tmp = NamedTempFile::new().unwrap();
         write!(
             tmp,
             "---\n\
@@ -1124,17 +1133,17 @@ mod tests {
 
     #[test]
     fn test_rime_dict_circular_import() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir().unwrap();
 
         let a_path = dir.path().join("a.dict.yaml");
         let b_path = dir.path().join("b.dict.yaml");
 
-        std::fs::write(
+        fs::write(
             &a_path,
             "---\nname: a\nimport_tables:\n- b\n...\n啊\ta\t1\n",
         )
         .unwrap();
-        std::fs::write(
+        fs::write(
             &b_path,
             "---\nname: b\nimport_tables:\n- a\n...\n吧\tb\t2\n",
         )
@@ -1148,9 +1157,9 @@ mod tests {
 
     #[test]
     fn test_rime_dict_cached_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir().unwrap();
         let src = dir.path().join("main.dict.yaml");
-        std::fs::write(
+        fs::write(
             &src,
             "啊\ta\t1\n爱\tai\t100\n中文\tzhong wen\t90\n中国\tzhong guo\t80\n",
         )
@@ -1170,14 +1179,14 @@ mod tests {
     #[test]
     fn test_real_dict_contains_tan_chars() {
         // 使用实际 RIME 词库验证 tan 读音包含碳、炭等常见字
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = env::current_dir().unwrap();
         let dict_path = cwd.join("../../assets/dicts/rime_ice.dict.yaml");
         if !dict_path.exists() {
             println!("跳过测试：实际词库文件不存在于 {:?}", dict_path);
             return;
         }
 
-        let dict = RimeDict::from_rime_dict_cached(&dict_path, std::env::temp_dir()).unwrap();
+        let dict = RimeDict::from_rime_dict_cached(&dict_path, env::temp_dir()).unwrap();
         let candidates = dict.lookup("tan");
         let texts: Vec<&str> = candidates.iter().map(|c| c.text.as_str()).collect();
 
@@ -1218,9 +1227,9 @@ mod tests {
 
     #[test]
     fn test_rime_dict_shared() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir().unwrap();
         let src = dir.path().join("main.dict.yaml");
-        std::fs::write(&src, "啊\ta\t1\n").unwrap();
+        fs::write(&src, "啊\ta\t1\n").unwrap();
         let cache_dir = dir.path().join("cache");
 
         let d1 = RimeDict::shared(&src, &cache_dir).unwrap();

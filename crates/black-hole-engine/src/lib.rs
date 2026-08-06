@@ -1,5 +1,3 @@
-use black_hole_shared::{Candidate, EngineCommand, InputContext, KeyEvent, SchemeId, SchemeResult};
-
 pub mod builder;
 pub mod graph_decoder;
 pub mod language_model;
@@ -15,6 +13,7 @@ pub mod shuangpin_scheme;
 pub mod syllable_graph;
 pub mod user_dict;
 
+use black_hole_shared::{Candidate, EngineCommand, InputContext, KeyEvent, SchemeId, SchemeResult};
 pub use builder::EngineBuilder;
 pub use graph_decoder::{DecodeResult, GraphDecoder, ScoringConfig, ScoringConfigBuilder};
 pub use language_model::LanguageModel;

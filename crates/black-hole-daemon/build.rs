@@ -1,12 +1,13 @@
 // build.rs - Embed icon resource into Windows executable.
 // Used for installer DisplayIcon and taskbar/desktop icons.
 
+use std::env;
 use std::path::PathBuf;
 
 fn main() {
     #[cfg(target_os = "windows")]
     {
-        let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+        let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
         let ico = manifest_dir.join("../../assets/icons/black-hole.ico");
         let png = manifest_dir.join("../../assets/icons/black-hole.png");
 

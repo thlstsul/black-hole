@@ -7,19 +7,26 @@
 use black_hole_shared::{Candidate, SchemeId};
 use rime_dict::UserDb;
 use std::collections::HashMap;
+#[cfg(test)]
+use std::env;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::process;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tracing::warn;
 
 /// 上屏落盘的防抖间隔：间隔内多次上屏只合并写一次全量文件，
 /// 避免每次上屏在 UI 线程同步写盘（写盘前可调用 `flush` 强制落盘）
-const SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const SAVE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// 全局用户词典实例
 static GLOBAL_USER_DICT: OnceLock<Arc<Mutex<UserDictionary>>> = OnceLock::new();
 
 /// 初始化全局用户词典。应在应用启动时调用一次。
-pub fn init_global_user_dict(dir: impl AsRef<Path>) -> std::io::Result<()> {
+pub fn init_global_user_dict(dir: impl AsRef<Path>) -> io::Result<()> {
     let dict = UserDictionary::open(dir)?;
     let _ = GLOBAL_USER_DICT.set(Arc::new(Mutex::new(dict)));
     Ok(())
@@ -61,9 +68,9 @@ pub struct UserDictionary {
 
 impl UserDictionary {
     /// 打开用户数据目录，加载已有的 `.userdb.txt` 快照
-    pub fn open<P: AsRef<Path>>(dir: P) -> std::io::Result<Self> {
+    pub fn open<P: AsRef<Path>>(dir: P) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&dir)?;
+        fs::create_dir_all(&dir)?;
         let mut dict = Self {
             pinyin: UserDb::new(),
             shuangpin: UserDb::new(),
@@ -105,11 +112,11 @@ impl UserDictionary {
     fn load(&mut self, scheme: SchemeId) {
         let Some(ref dir) = self.dir else { return };
         let path = dir.join(userdb_file_name(scheme));
-        let Ok(txt) = std::fs::read_to_string(&path) else {
+        let Ok(txt) = fs::read_to_string(&path) else {
             return;
         };
         if let Err(e) = self.db_mut(scheme).import_txt(&txt) {
-            tracing::warn!("Failed to parse user dict {:?}: {}", path, e);
+            warn!("Failed to parse user dict {:?}: {}", path, e);
         }
         // 重建按编码索引，供 lookup 免全表扫描
         self.rebuild_index(scheme);
@@ -132,8 +139,8 @@ impl UserDictionary {
     fn save(&self, scheme: SchemeId) {
         let Some(ref dir) = self.dir else { return };
         let path = dir.join(userdb_file_name(scheme));
-        if let Err(e) = std::fs::write(&path, self.db(scheme).export_txt()) {
-            tracing::warn!("Failed to save user dict {:?}: {}", path, e);
+        if let Err(e) = fs::write(&path, self.db(scheme).export_txt()) {
+            warn!("Failed to save user dict {:?}: {}", path, e);
         }
     }
 
@@ -219,9 +226,8 @@ mod tests {
 
     #[test]
     fn test_persistence_roundtrip() {
-        let dir =
-            std::env::temp_dir().join(format!("black-hole_userdb_test_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = env::temp_dir().join(format!("black-hole_userdb_test_{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
 
         {
             let mut dict = UserDictionary::open(&dir).unwrap();
@@ -239,9 +245,9 @@ mod tests {
         assert_eq!(candidates[0].score, 2);
         assert_eq!(dict.lookup(SchemeId::Shuangpin, "wo")[0].text, "我");
 
-        let txt = std::fs::read_to_string(dir.join("pinyin.userdb.txt")).unwrap();
+        let txt = fs::read_to_string(dir.join("pinyin.userdb.txt")).unwrap();
         assert_eq!(txt, "ni hao\t你好\t2\n");
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
