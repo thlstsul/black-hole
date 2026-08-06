@@ -14,8 +14,8 @@ use eframe::{
     App, CreationContext, EventLoopBuilder, EventLoopBuilderHook, Frame, NativeOptions,
     WgpuConfiguration,
 };
-use egui::Frame as EguiFrame;
-use egui::{
+use eframe::egui::Frame as EguiFrame;
+use eframe::egui::{
     Align, Color32, Context, CornerRadius, FontData, FontDefinitions, FontFamily, Label, Layout,
     Margin, Pos2, Rect, RichText, ScrollArea, Ui, Vec2, ViewportBuilder, ViewportCommand, Visuals,
 };

@@ -9,6 +9,12 @@ use std::path::PathBuf;
 fn main() {
     #[cfg(target_os = "windows")]
     {
+        // Suppress LNK4104: link.exe wants the OLE-only exports
+        // (DllGetClassObject / DllCanUnloadNow / DllRegisterServer /
+        // DllUnregisterServer) marked PRIVATE, but they are consumed via
+        // GetProcAddress by COM/regsvr32, so the warning is harmless.
+        println!("cargo::rustc-cdylib-link-arg=/IGNORE:4104");
+
         let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
         let ico = manifest_dir.join("../../assets/icons/black-hole.ico");
 

@@ -9,7 +9,7 @@ license.workspace = true
 crate-type = ["lib", "cdylib"]
 
 [build-dependencies]
-winresource = "0.1"
+winresource = { workspace = true }
 
 [dependencies]
 black-hole-shared = { workspace = true }

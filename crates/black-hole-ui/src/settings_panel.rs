@@ -7,7 +7,7 @@ use crate::theme_visuals;
 use eframe::{
     App, EventLoopBuilder, EventLoopBuilderHook, Frame, NativeOptions, run_native,
 };
-use egui::{DragValue, Margin, ScrollArea, Ui, ViewportBuilder, ViewportCommand};
+use eframe::egui::{DragValue, Margin, ScrollArea, Ui, ViewportBuilder, ViewportCommand};
 use tracing::{error, info};
 #[cfg(target_os = "windows")]
 use winit::platform::windows::EventLoopBuilderExtWindows;
