@@ -3,7 +3,7 @@ use black_hole_shared::candidate_layout::{
     layout_candidates_into_rows_excluding,
 };
 use black_hole_shared::{Candidate, InputContext, Theme, UiCommand};
-pub use candidate_window_cross::run_candidate_window;
+pub use candidate_window::run_candidate_window;
 use eframe::egui_wgpu::{WgpuSetup, WgpuSetupCreateNew};
 use eframe::run_native;
 use eframe::wgpu::{
@@ -41,7 +41,7 @@ use windows::Win32::Graphics::Gdi::{
 #[cfg(target_os = "windows")]
 use winit::platform::windows::EventLoopBuilderExtWindows;
 
-mod candidate_window_cross;
+mod candidate_window;
 pub mod settings_manager;
 pub mod settings_panel;
 
