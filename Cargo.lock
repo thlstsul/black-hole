@@ -430,6 +430,7 @@ dependencies = [
 name = "black-hole-ui"
 version = "0.1.0"
 dependencies = [
+ "black-hole-platform",
  "black-hole-shared",
  "directories",
  "eframe",

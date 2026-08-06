@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+black-hole-platform = { workspace = true }
 black-hole-shared = { workspace = true }
 directories = "6.0"
 eframe = { version = "0.35", default-features = false, features = ["wgpu"] }
