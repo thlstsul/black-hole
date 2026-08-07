@@ -19,6 +19,10 @@ pub(crate) struct AppState {
     should_exit: bool,
     theme: Theme,
     expanded: bool,
+    /// 候选文字字号（设置项，热更新生效）
+    font_size: u32,
+    /// 最大候选数（设置项，热更新生效）
+    max_candidates: usize,
 }
 
 impl Default for AppState {
@@ -34,6 +38,8 @@ impl Default for AppState {
             should_exit: false,
             theme: Theme::Light,
             expanded: false,
+            font_size: 14,
+            max_candidates: 9,
         }
     }
 }
@@ -93,6 +99,11 @@ impl App for ImeUiApp {
         }
 
         if state.visible && !state.candidates.is_empty() {
+            // 显示窗口：完整列表保留在 state 中，渲染仅取包含选中项的窗口，
+            // 使高亮与引擎实际选择保持一致
+            let (win_start, win_end) = display_window(&state);
+            let win = &state.candidates[win_start..win_end];
+            let win_selected = state.selected_index - win_start;
             let (desired_width, desired_height) = estimate_window_size(&state);
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(
                 desired_width,
@@ -160,11 +171,10 @@ impl App for ImeUiApp {
                         ui.spacing_mut().item_spacing.y = 6.0;
 
                         // 第一行：选中候选
-                        if !state.candidates.is_empty()
-                            && state.selected_index < state.candidates.len()
-                        {
-                            let selected = &state.candidates[state.selected_index];
+                        if !win.is_empty() {
+                            let selected = &win[win_selected];
                             let text = selected.text.clone();
+                            let selected_font = selected_font_size(state.font_size);
 
                             EguiFrame::new()
                                 .fill(highlight_color)
@@ -175,7 +185,7 @@ impl App for ImeUiApp {
                                         ui.add(
                                             Label::new(
                                                 RichText::new(&text)
-                                                    .size(24.0)
+                                                    .size(selected_font)
                                                     .color(Color32::WHITE),
                                             )
                                             .selectable(false),
@@ -188,9 +198,9 @@ impl App for ImeUiApp {
 
                         if state.expanded {
                             // 展开状态：可滚动的多行不规则网格（排除首选词，第一行已单独展示）
-                            if state.candidates.len() > 1 {
+                            if win.len() > 1 {
                                 let rows = layout_candidates_into_rows_excluding(
-                                    &state.candidates,
+                                    win,
                                     EXPANDED_AVAILABLE_WIDTH,
                                     ITEM_SPACING,
                                     Some(0),
@@ -199,13 +209,11 @@ impl App for ImeUiApp {
                                     .max_height(SCROLL_AREA_MAX_HEIGHT)
                                     .show(ui, |ui| {
                                         for row in rows {
-                                            let is_selected_row =
-                                                row.contains(&state.selected_index);
+                                            let is_selected_row = row.contains(&win_selected);
                                             ui.horizontal(|ui| {
                                                 ui.spacing_mut().item_spacing.x = ITEM_SPACING;
                                                 for (col, i) in row.iter().enumerate() {
-                                                    let is_selected =
-                                                        *i == state.selected_index;
+                                                    let is_selected = *i == win_selected;
                                                     let (lc, tc, bg) = if is_selected {
                                                         (
                                                             Color32::WHITE,
@@ -224,10 +232,11 @@ impl App for ImeUiApp {
                                                                 render_candidate_item(
                                                                     ui,
                                                                     col + 1,
-                                                                    &state.candidates[*i],
+                                                                    &win[*i],
                                                                     tc,
                                                                     lc,
                                                                     is_selected_row,
+                                                                    state.font_size,
                                                                 );
                                                             });
                                                         });
@@ -244,9 +253,9 @@ impl App for ImeUiApp {
                             }
                         } else {
                             // 折叠状态：第二行显示网格布局的第一行（排除首选词）
-                            if state.candidates.len() > 1 {
+                            if win.len() > 1 {
                                 let rows = layout_candidates_into_rows_excluding(
-                                    &state.candidates,
+                                    win,
                                     EXPANDED_AVAILABLE_WIDTH,
                                     ITEM_SPACING,
                                     Some(0),
@@ -255,7 +264,7 @@ impl App for ImeUiApp {
                                     ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing.x = ITEM_SPACING;
                                         for (col, i) in first_row.iter().enumerate() {
-                                            let is_selected = *i == state.selected_index;
+                                            let is_selected = *i == win_selected;
                                             let (tc, lc) = if is_selected {
                                                 (Color32::WHITE, Color32::WHITE)
                                             } else {
@@ -275,10 +284,11 @@ impl App for ImeUiApp {
                                                         render_candidate_item(
                                                             ui,
                                                             col + 1,
-                                                            &state.candidates[*i],
+                                                            &win[*i],
                                                             tc,
                                                             lc,
                                                             true,
+                                                            state.font_size,
                                                         );
                                                     });
                                                 });
@@ -377,6 +387,16 @@ fn get_screen_rect(frame: &Frame) -> Option<Rect> {
     }
 }
 
+/// 选中候选（首行）字号：在基础字号上放大，保持与候选项的视觉层级
+fn selected_font_size(font_size: u32) -> f32 {
+    font_size as f32 + 10.0
+}
+
+/// 候选项字号：基础字号 + 少量补偿（与历史硬编码 16px 对齐）
+fn item_font_size(font_size: u32) -> f32 {
+    font_size as f32 + 2.0
+}
+
 fn render_candidate_item(
     ui: &mut Ui,
     display_number: usize,
@@ -384,6 +404,7 @@ fn render_candidate_item(
     text_color: Color32,
     label_color: Color32,
     show_label: bool,
+    font_size: u32,
 ) {
     // 无论是否显示序号，均使用固定尺寸，确保布局完全一致
     let label_text = if show_label {
@@ -391,36 +412,61 @@ fn render_candidate_item(
     } else {
         String::new()
     };
+    let item_font = item_font_size(font_size);
     ui.spacing_mut().item_spacing.x = 0.0;
     ui.add_sized(
         [20.0, 14.0],
         Label::new(RichText::new(label_text).size(14.0).color(label_color)).selectable(false),
     );
     ui.add(
-        Label::new(RichText::new(&candidate.text).size(16.0).color(text_color))
-            .selectable(false),
+        Label::new(
+            RichText::new(&candidate.text)
+                .size(item_font)
+                .color(text_color),
+        )
+        .selectable(false),
     );
+}
+
+/// 计算当前应渲染的候选下标窗口 [start, end)：最多 max_candidates 项，
+/// 且始终包含引擎的选中索引，保证 UI 高亮与引擎实际选择一致。
+fn display_window(state: &AppState) -> (usize, usize) {
+    let len = state.candidates.len();
+    let max = state.max_candidates.max(1);
+    if len <= max {
+        return (0, len);
+    }
+    // 选中索引超出首屏窗口时，窗口跟随滚动以包含选中项
+    let end = (state.selected_index + 1).max(max).min(len);
+    let start = end - max;
+    (start, end)
 }
 
 fn estimate_window_size(state: &AppState) -> (f32, f32) {
     let frame_padding = 20.0; // 外层 Frame inner_margin 10 * 2
     let row_spacing = 12.0; // 行间距
-    let candidate_row_height = 30.0; // 16px 字体 + Frame inner_margin 4+4 + 余量
+    // 候选项行高：字号 + Frame inner_margin 4+4 + 余量
+    let candidate_row_height = item_font_size(state.font_size) + 14.0;
 
-    let first_row_height = if state.candidates.is_empty() {
+    // 只按当前显示窗口估算尺寸，避免隐藏候选撑高窗口
+    let (win_start, win_end) = display_window(state);
+    let win = &state.candidates[win_start..win_end];
+
+    let first_row_height = if win.is_empty() {
         0.0
     } else {
-        42.0 // 24px 字体 + inner_margin 6+6 + 少量余量
+        // 选中项行高：字号 + inner_margin 6+6 + 少量余量
+        selected_font_size(state.font_size) + 18.0
     };
 
     let total_width = CANDIDATE_WINDOW_WIDTH;
 
-    let total_height = if state.candidates.is_empty() {
+    let total_height = if win.is_empty() {
         0.0
     } else if state.expanded {
         // 展开状态：根据实际行数计算内容高度，避免固定留白（排除首选词）
         let rows = layout_candidates_into_rows_excluding(
-            &state.candidates,
+            win,
             EXPANDED_AVAILABLE_WIDTH,
             ITEM_SPACING,
             Some(0),
@@ -430,17 +476,17 @@ fn estimate_window_size(state: &AppState) -> (f32, f32) {
         let content_height = if rows.len() <= 1 {
             rows.len() as f32 * candidate_row_height
         } else {
-            rows.len() as f32 * candidate_row_height
-                + (rows.len() - 1) as f32 * inter_row_spacing
+            rows.len() as f32 * candidate_row_height + (rows.len() - 1) as f32 * inter_row_spacing
         };
         let scroll_height = content_height.min(SCROLL_AREA_MAX_HEIGHT);
         (first_row_height + scroll_height + row_spacing + frame_padding).max(64.0)
     } else {
         // 折叠状态：第一行 + 第二行（如果有）+ padding
-        let second_row_height = if state.candidates.len() <= 1 {
+        let second_row_height = if win.len() <= 1 {
             0.0
         } else {
-            32.0 // 16px 字体 + 上下余量
+            // 候选项行高：字号 + 上下余量
+            item_font_size(state.font_size) + 16.0
         };
         (first_row_height + second_row_height + row_spacing + frame_padding).max(64.0)
     };
@@ -449,9 +495,13 @@ fn estimate_window_size(state: &AppState) -> (f32, f32) {
 }
 
 /// 启动候选窗口事件循环（阻塞当前线程）
-pub fn run_candidate_window(ui_rx: Receiver<UiCommand>, initial_theme: Theme) {
+pub fn run_candidate_window(
+    ui_rx: Receiver<UiCommand>,
+    initial_theme: Theme,
+    initial_cw: CandidateWindowSettings,
+) {
     let result = catch_unwind(AssertUnwindSafe(|| {
-        run_candidate_window_inner(ui_rx, initial_theme);
+        run_candidate_window_inner(ui_rx, initial_theme, initial_cw);
     }));
     let Err(e) = result else {
         return;
@@ -466,11 +516,17 @@ pub fn run_candidate_window(ui_rx: Receiver<UiCommand>, initial_theme: Theme) {
     error!(msg, "run_candidate_window panicked");
 }
 
-fn run_candidate_window_inner(ui_rx: Receiver<UiCommand>, initial_theme: Theme) {
+fn run_candidate_window_inner(
+    ui_rx: Receiver<UiCommand>,
+    initial_theme: Theme,
+    initial_cw: CandidateWindowSettings,
+) {
     info!("run_candidate_window: starting");
 
     let state = Arc::new(Mutex::new(AppState {
         theme: initial_theme,
+        font_size: initial_cw.font_size,
+        max_candidates: initial_cw.max_candidates,
         ..AppState::default()
     }));
     let state_for_thread = Arc::clone(&state);
@@ -505,8 +561,7 @@ fn run_candidate_window_inner(ui_rx: Receiver<UiCommand>, initial_theme: Theme) 
                 },
                 device_descriptor: Arc::new(|_adapter| DeviceDescriptor {
                     memory_hints: MemoryHints::Manual {
-                        suballocated_device_memory_block_size: 4 * 1024 * 1024
-                            ..16 * 1024 * 1024,
+                        suballocated_device_memory_block_size: 4 * 1024 * 1024..16 * 1024 * 1024,
                     },
                     ..Default::default()
                 }),
@@ -551,9 +606,20 @@ fn run_candidate_window_inner(ui_rx: Receiver<UiCommand>, initial_theme: Theme) 
                             }
                             s.visible = true;
                             s.code = code;
+                            // 保留引擎的完整候选列表与真实选中索引；渲染时按
+                            // max_candidates 仅显示一个包含选中项的窗口，避免截断
+                            // 导致 UI 高亮与引擎实际提交的候选不一致。
                             s.candidates = candidates;
-                            s.selected_index = selected_index;
+                            s.selected_index =
+                                selected_index.min(s.candidates.len().saturating_sub(1));
                             s.expanded = expanded;
+                            should_repaint = true;
+                        }
+                        UiCommand::SetCandidateWindowSettings(cw) => {
+                            s.font_size = cw.font_size;
+                            s.max_candidates = cw.max_candidates.max(1);
+                            // 完整列表与选中索引均保留，显示窗口在渲染时按
+                            // 新的 max_candidates 即时重算，无需在此截断
                             should_repaint = true;
                         }
                         UiCommand::UpdatePosition { context } => {

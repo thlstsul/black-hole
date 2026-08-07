@@ -510,8 +510,7 @@ impl<'a> GraphDecoder<'a> {
             // 未能覆盖到 end，返回空表示失败
             debug!(
                 "fallback_for_range: failed to cover to end={}, pos={}",
-                end,
-                pos
+                end, pos
             );
             Vec::new()
         } else {

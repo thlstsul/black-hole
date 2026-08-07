@@ -2,8 +2,13 @@ use black_hole_shared::candidate_layout::{
     CANDIDATE_WINDOW_WIDTH, EXPANDED_AVAILABLE_WIDTH, ITEM_SPACING,
     layout_candidates_into_rows_excluding,
 };
-use black_hole_shared::{Candidate, InputContext, Theme, UiCommand};
+use black_hole_shared::{Candidate, CandidateWindowSettings, InputContext, Theme, UiCommand};
 pub use candidate_window::run_candidate_window;
+use eframe::egui::Frame as EguiFrame;
+use eframe::egui::{
+    Align, Color32, Context, CornerRadius, FontData, FontDefinitions, FontFamily, Label, Layout,
+    Margin, Pos2, Rect, RichText, ScrollArea, Ui, Vec2, ViewportBuilder, ViewportCommand, Visuals,
+};
 use eframe::egui_wgpu::{WgpuSetup, WgpuSetupCreateNew};
 use eframe::run_native;
 use eframe::wgpu::{
@@ -13,11 +18,6 @@ use eframe::wgpu::{
 use eframe::{
     App, CreationContext, EventLoopBuilder, EventLoopBuilderHook, Frame, NativeOptions,
     WgpuConfiguration,
-};
-use eframe::egui::Frame as EguiFrame;
-use eframe::egui::{
-    Align, Color32, Context, CornerRadius, FontData, FontDefinitions, FontFamily, Label, Layout,
-    Margin, Pos2, Rect, RichText, ScrollArea, Ui, Vec2, ViewportBuilder, ViewportCommand, Visuals,
 };
 #[cfg(target_os = "windows")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};

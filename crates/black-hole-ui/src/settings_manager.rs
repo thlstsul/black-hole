@@ -30,6 +30,29 @@ impl SettingsManager {
         &mut self.settings
     }
 
+    /// 配置文件完整路径（供 daemon 监听变更时使用）
+    pub fn config_path(&self) -> &PathBuf {
+        &self.config_path
+    }
+
+    /// 重新从磁盘加载设置（供 daemon 热更新轮询使用）。
+    ///
+    /// 读取或解析失败时返回 `None`，调用方应保留当前内存中的值，
+    /// 避免把损坏/半写的文件当成有效设置覆盖运行时状态。
+    pub fn try_reload(&self) -> Option<Settings> {
+        let content = fs::read_to_string(&self.config_path).ok()?;
+        match from_str::<Settings>(&content) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!(
+                    "Failed to parse settings file {:?}: {}, keeping current",
+                    self.config_path, e
+                );
+                None
+            }
+        }
+    }
+
     /// 保存当前设置到磁盘，失败时记录错误
     pub fn save(&mut self) -> bool {
         let path = &self.config_path;
@@ -69,8 +92,7 @@ impl SettingsManager {
                 Err(e) => {
                     warn!(
                         "Failed to parse settings file {:?}: {}, using defaults",
-                        path,
-                        e
+                        path, e
                     );
                 }
             },
@@ -80,8 +102,7 @@ impl SettingsManager {
             Err(e) => {
                 warn!(
                     "Failed to read settings file {:?}: {}, using defaults",
-                    path,
-                    e
+                    path, e
                 );
             }
         }

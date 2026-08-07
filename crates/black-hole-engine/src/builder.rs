@@ -1,5 +1,5 @@
 use crate::{Engine, SchemeRegistry, default_user_dict_dir, init_global_user_dict};
-use black_hole_shared::SchemeId;
+use black_hole_shared::{KeyBindings, SchemeId};
 use tracing::warn;
 
 /// 引擎构建器
@@ -18,6 +18,7 @@ use tracing::warn;
 pub struct EngineBuilder {
     dict_path: Option<String>,
     scheme_id: SchemeId,
+    key_bindings: KeyBindings,
 }
 
 impl Default for EngineBuilder {
@@ -32,6 +33,7 @@ impl EngineBuilder {
         Self {
             dict_path: None,
             scheme_id: SchemeId::Pinyin,
+            key_bindings: KeyBindings::default(),
         }
     }
 
@@ -53,6 +55,12 @@ impl EngineBuilder {
         self
     }
 
+    /// 指定按键绑定（默认使用内置默认值）
+    pub fn key_bindings(mut self, bindings: KeyBindings) -> Self {
+        self.key_bindings = bindings;
+        self
+    }
+
     /// 构建引擎实例
     pub fn build(self) -> Engine {
         // 初始化全局用户词典
@@ -60,8 +68,7 @@ impl EngineBuilder {
         if let Err(e) = init_global_user_dict(&user_dict_dir) {
             warn!(
                 "Failed to initialize user dictionary at {:?}: {}",
-                user_dict_dir,
-                e
+                user_dict_dir, e
             );
         }
 
@@ -72,6 +79,8 @@ impl EngineBuilder {
         };
 
         let scheme = registry.create_scheme(self.scheme_id);
-        Engine::with_registry(scheme, registry)
+        let mut engine = Engine::with_registry(scheme, registry);
+        engine.set_key_bindings(self.key_bindings);
+        engine
     }
 }

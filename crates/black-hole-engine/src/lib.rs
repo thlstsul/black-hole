@@ -13,7 +13,11 @@ pub mod shuangpin_scheme;
 pub mod syllable_graph;
 pub mod user_dict;
 
-use black_hole_shared::{Candidate, EngineCommand, InputContext, KeyEvent, SchemeId, SchemeResult};
+use std::borrow::Cow;
+
+use black_hole_shared::{
+    Candidate, EngineCommand, InputContext, KeyBindings, KeyEvent, SchemeId, SchemeResult,
+};
 pub use builder::EngineBuilder;
 pub use graph_decoder::{DecodeResult, GraphDecoder, ScoringConfig, ScoringConfigBuilder};
 pub use language_model::LanguageModel;
@@ -120,6 +124,8 @@ pub fn sort_candidates(
 pub struct Engine {
     scheme: Box<dyn InputScheme>,
     registry: SchemeRegistry,
+    /// 用户自定义按键绑定（设置面板可实时更新）
+    key_bindings: KeyBindings,
 }
 
 impl Engine {
@@ -127,16 +133,31 @@ impl Engine {
         Self {
             scheme,
             registry: SchemeRegistry::new(),
+            key_bindings: KeyBindings::default(),
         }
     }
 
     pub fn with_registry(scheme: Box<dyn InputScheme>, registry: SchemeRegistry) -> Self {
-        Self { scheme, registry }
+        Self {
+            scheme,
+            registry,
+            key_bindings: KeyBindings::default(),
+        }
+    }
+
+    /// 设置按键绑定（启动时由构建器传入，运行时由 UpdateKeyBindings 命令热更新）
+    pub fn set_key_bindings(&mut self, bindings: KeyBindings) {
+        self.key_bindings = bindings;
     }
 
     pub fn process(&mut self, cmd: &EngineCommand, ctx: &InputContext) -> SchemeResult {
         match cmd {
-            EngineCommand::Key(key) => self.scheme.handle_key(key, ctx),
+            EngineCommand::Key(key) => {
+                // 先把用户绑定键归一化为方案内部标准键名（如 ArrowDown/Space/Escape），
+                // 使绑定修改对输入方案透明，无需改动各方案内部的按键处理。
+                let normalized = self.normalize_key(key);
+                self.scheme.handle_key(&normalized, ctx)
+            }
             EngineCommand::SelectCandidate(idx) => self
                 .scheme
                 .select_candidate(*idx)
@@ -149,7 +170,55 @@ impl Engine {
                 self.scheme = self.registry.create_scheme(*id);
                 SchemeResult::Ignored
             }
+            EngineCommand::UpdateKeyBindings(bindings) => {
+                self.key_bindings = bindings.clone();
+                SchemeResult::Ignored
+            }
             _ => SchemeResult::Ignored,
+        }
+    }
+
+    /// 将用户自定义按键绑定映射为方案内部使用的标准键名
+    ///
+    /// 仅当按键处于"纯净"状态（未按住 Ctrl/Alt/Meta）时才改写，
+    /// 以免吞掉系统/应用的组合快捷键；对单个字母的绑定，按住 Shift
+    /// 或处于 CapsLock 时也不改写，保留方案层的临时英文输入逻辑。
+    /// 未命中绑定时不克隆按键，直接借用原事件，避免逐键分配。
+    fn normalize_key<'a>(&self, key: &'a KeyEvent) -> Cow<'a, KeyEvent> {
+        let m = key.modifiers;
+        if m.ctrl || m.alt || m.meta {
+            return Cow::Borrowed(key);
+        }
+        let plain = key.key.as_str();
+        // 单个字母的绑定在 Shift/CapsLock 下不改写（临时英文模式由方案层处理）
+        let remappable = |binding: &str| {
+            let is_letter = {
+                let mut chars = binding.chars();
+                matches!((chars.next(), chars.next()), (Some(c), None) if c.is_ascii_alphabetic())
+            };
+            !is_letter || (!m.shift && !m.capslock)
+        };
+        let canonical = if plain == self.key_bindings.next_candidate
+            && remappable(&self.key_bindings.next_candidate)
+        {
+            Some("ArrowDown")
+        } else if plain == self.key_bindings.prev_candidate
+            && remappable(&self.key_bindings.prev_candidate)
+        {
+            Some("ArrowUp")
+        } else if plain == self.key_bindings.commit && remappable(&self.key_bindings.commit) {
+            Some("Space")
+        } else if plain == self.key_bindings.cancel && remappable(&self.key_bindings.cancel) {
+            Some("Escape")
+        } else {
+            None
+        };
+        if let Some(name) = canonical {
+            let mut k = key.clone();
+            k.key = name.to_string();
+            Cow::Owned(k)
+        } else {
+            Cow::Borrowed(key)
         }
     }
 
@@ -159,5 +228,130 @@ impl Engine {
 
     pub fn current_scheme_name(&self) -> &str {
         self.scheme.name()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use black_hole_shared::{KeyState, Modifiers};
+
+    fn plain_key(key: &str) -> KeyEvent {
+        KeyEvent {
+            key: key.to_string(),
+            modifiers: Modifiers {
+                shift: false,
+                ctrl: false,
+                alt: false,
+                meta: false,
+                capslock: false,
+            },
+            state: KeyState::Press,
+        }
+    }
+
+    fn modified_key(key: &str, modifier: fn(&mut Modifiers)) -> KeyEvent {
+        let mut e = plain_key(key);
+        modifier(&mut e.modifiers);
+        e
+    }
+
+    fn custom_bindings() -> KeyBindings {
+        KeyBindings {
+            next_candidate: "j".to_string(),
+            prev_candidate: "k".to_string(),
+            commit: "f".to_string(),
+            cancel: "d".to_string(),
+            switch_scheme: "Ctrl+Shift+F12".to_string(),
+        }
+    }
+
+    #[test]
+    fn default_bindings_remap_to_canonical_keys() {
+        let engine = Engine::new(Box::new(PinyinScheme::new()));
+        for (input, expected) in [
+            ("ArrowDown", "ArrowDown"),
+            ("ArrowUp", "ArrowUp"),
+            ("Space", "Space"),
+            ("Escape", "Escape"),
+        ] {
+            let key = plain_key(input);
+            let normalized = engine.normalize_key(&key);
+            assert_eq!(normalized.key, expected, "默认绑定应归一化为 {expected}");
+        }
+    }
+
+    #[test]
+    fn custom_bindings_remap_to_canonical_keys() {
+        let mut engine = Engine::new(Box::new(PinyinScheme::new()));
+        engine.set_key_bindings(custom_bindings());
+        for (input, expected) in [
+            ("j", "ArrowDown"),
+            ("k", "ArrowUp"),
+            ("f", "Space"),
+            ("d", "Escape"),
+        ] {
+            let key = plain_key(input);
+            let normalized = engine.normalize_key(&key);
+            assert_eq!(normalized.key, expected, "自定义绑定应归一化为 {expected}");
+        }
+    }
+
+    #[test]
+    fn non_bound_keys_pass_through_unchanged() {
+        let mut engine = Engine::new(Box::new(PinyinScheme::new()));
+        engine.set_key_bindings(custom_bindings());
+        for input in ["a", "ArrowLeft", "Tab"] {
+            let key = plain_key(input);
+            let normalized = engine.normalize_key(&key);
+            assert_eq!(normalized.key, input, "未绑定的键应原样通过");
+        }
+    }
+
+    #[test]
+    fn ctrl_alt_meta_held_keys_are_not_remapped() {
+        let mut engine = Engine::new(Box::new(PinyinScheme::new()));
+        engine.set_key_bindings(custom_bindings());
+        // 按住 Ctrl/Alt/Meta 时即使按键匹配绑定也不改写，保留系统快捷键
+        for modifier in [
+            |m: &mut Modifiers| m.ctrl = true,
+            |m: &mut Modifiers| m.alt = true,
+            |m: &mut Modifiers| m.meta = true,
+        ] {
+            let key = modified_key("j", modifier);
+            let normalized = engine.normalize_key(&key);
+            assert_eq!(normalized.key, "j", "按住修饰键时不应改写绑定键");
+        }
+    }
+
+    #[test]
+    fn letter_binding_not_remapped_under_shift_or_capslock() {
+        let mut engine = Engine::new(Box::new(PinyinScheme::new()));
+        engine.set_key_bindings(custom_bindings());
+        // 字母绑定在 Shift/CapsLock 下不改写，保留方案层的临时英文输入逻辑
+        for modifier in [
+            |m: &mut Modifiers| m.shift = true,
+            |m: &mut Modifiers| m.capslock = true,
+        ] {
+            let key = modified_key("j", modifier);
+            let normalized = engine.normalize_key(&key);
+            assert_eq!(normalized.key, "j", "Shift/CapsLock 下的字母绑定不应改写");
+        }
+    }
+
+    #[test]
+    fn update_key_bindings_hot_updates_mapping() {
+        let mut engine = Engine::new(Box::new(PinyinScheme::new()));
+        let ctx = InputContext::default();
+        // 默认绑定下 "j" 不是绑定键，原样通过
+        assert_eq!(engine.normalize_key(&plain_key("j")).key, "j");
+        // 热更新绑定后，"j" 应归一化为 ArrowDown
+        engine.process(&EngineCommand::UpdateKeyBindings(custom_bindings()), &ctx);
+        assert_eq!(engine.normalize_key(&plain_key("j")).key, "ArrowDown");
+        // 旧的默认绑定 ArrowDown 不再匹配自定义绑定，应原样通过
+        assert_eq!(
+            engine.normalize_key(&plain_key("ArrowDown")).key,
+            "ArrowDown"
+        );
     }
 }

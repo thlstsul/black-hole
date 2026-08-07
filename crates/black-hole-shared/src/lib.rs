@@ -138,7 +138,11 @@ pub enum EngineCommand {
     SetContext(InputContext),
     SelectCandidate(usize),
     SwitchScheme(SchemeId),
+    /// 运行时热更新按键绑定（设置面板实时生效）
+    UpdateKeyBindings(KeyBindings),
     Reset,
+    /// daemon → 引擎线程：退出信号（唤醒阻塞的 recv，使引擎线程及时结束）
+    Shutdown,
 }
 
 /// 引擎 → UI 的命令
@@ -161,6 +165,8 @@ pub enum UiCommand {
     SetAutoStart(bool),
     SetTheme(Theme),
     SwitchScheme(SchemeId),
+    /// daemon → 候选窗线程：热更新候选窗参数（字号、最大候选数等）
+    SetCandidateWindowSettings(CandidateWindowSettings),
     Exit,
 }
 

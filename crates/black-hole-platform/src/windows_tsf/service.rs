@@ -1,3 +1,4 @@
+use super::super::ipc::{IpcRequest, IpcResponse, read_response, send_request};
 use super::caret::LayoutChangeEditSession;
 use super::commit::CancelCompositionEditSession;
 use super::dll_release;
@@ -6,7 +7,6 @@ use super::hook::{
 };
 use super::key_event::{KeyHandlerEditSession, virtual_key_to_key_event};
 use super::langbar::BlackHoleLangBarItem;
-use super::super::ipc::{IpcRequest, IpcResponse, read_response, send_request};
 use super::{ServiceInner, ensure_ipc_connection, send_ui_command_inner};
 use black_hole_shared::{KeyState, UiCommand};
 use std::mem::ManuallyDrop;
@@ -104,8 +104,7 @@ impl BlackHoleTextService {
                 inner.current_theme = theme;
                 info!(
                     "Synced settings from daemon: scheme={:?}, theme={:?}",
-                    scheme_id,
-                    theme
+                    scheme_id, theme
                 );
             }
         }
@@ -402,9 +401,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
             }
         }
 
-        if let Some(evt) =
-            virtual_key_to_key_event(vk, wparam, lparam, KeyState::Press)
-        {
+        if let Some(evt) = virtual_key_to_key_event(vk, wparam, lparam, KeyState::Press) {
             let is_composing = self.is_composing();
             let is_input_char = evt.key.len() == 1 && {
                 let ch = evt.key.chars().next().unwrap();
@@ -452,12 +449,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         Ok(BOOL(0))
     }
 
-    fn OnKeyDown(
-        &self,
-        pic: Ref<'_, ITfContext>,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> Result<BOOL> {
+    fn OnKeyDown(&self, pic: Ref<'_, ITfContext>, wparam: WPARAM, lparam: LPARAM) -> Result<BOOL> {
         // 英文模式下不处理任何按键。
         {
             let inner = self.inner.lock().unwrap();
@@ -481,12 +473,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
             Some(evt) => evt,
             None => {
                 let vk = VIRTUAL_KEY(wparam.0 as u16);
-                match virtual_key_to_key_event(
-                    vk,
-                    wparam,
-                    lparam,
-                    KeyState::Press,
-                ) {
+                match virtual_key_to_key_event(vk, wparam, lparam, KeyState::Press) {
                     Some(evt) => evt,
                     None => return Ok(BOOL(0)),
                 }
@@ -527,20 +514,11 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         if hr.is_ok() { Ok(BOOL(1)) } else { Ok(BOOL(0)) }
     }
 
-    fn OnKeyUp(
-        &self,
-        _pic: Ref<'_, ITfContext>,
-        _wparam: WPARAM,
-        _lparam: LPARAM,
-    ) -> Result<BOOL> {
+    fn OnKeyUp(&self, _pic: Ref<'_, ITfContext>, _wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
         Ok(BOOL(0))
     }
 
-    fn OnPreservedKey(
-        &self,
-        _pic: Ref<'_, ITfContext>,
-        _rguid: *const GUID,
-    ) -> Result<BOOL> {
+    fn OnPreservedKey(&self, _pic: Ref<'_, ITfContext>, _rguid: *const GUID) -> Result<BOOL> {
         Ok(BOOL(0))
     }
 }

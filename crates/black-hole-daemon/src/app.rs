@@ -1,12 +1,26 @@
 use crate::args::DaemonArgs;
 use black_hole_engine::{Engine, EngineBuilder};
-use black_hole_platform::auto_start::set_auto_start;
 use black_hole_platform::PlatformIme;
-use black_hole_shared::{EngineCommand, InputContext, SchemeId, SchemeResult, Theme, UiCommand};
+use black_hole_platform::auto_start::set_auto_start;
+#[cfg(target_os = "linux")]
+use black_hole_platform::linux_ibus::auto_register::{
+    is_registered as is_registered_linux, register_ime as register_ime_linux,
+};
+#[cfg(target_os = "windows")]
+use black_hole_platform::windows_tsf::auto_register::{is_registered, register_ime};
+#[cfg(target_os = "linux")]
+use black_hole_platform::{LinuxIbusIme, PlatformError as LinuxPlatformError};
+#[cfg(target_os = "windows")]
+use black_hole_platform::{PlatformError as WindowsPlatformError, WindowsTsfIme};
+use black_hole_shared::{
+    EngineCommand, InputContext, SchemeId, SchemeResult, Settings, Theme, UiCommand,
+};
 use black_hole_ui::{SettingsManager, run_candidate_window, run_settings_panel};
 use clap::Parser;
+use notify::Watcher;
 use std::env;
 use std::error::Error;
+use std::fs;
 use std::io;
 use std::mem::discriminant;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -24,17 +38,6 @@ use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry;
 use tracing_subscriber::util::SubscriberInitExt;
-#[cfg(target_os = "windows")]
-use black_hole_platform::windows_tsf::auto_register::{is_registered, register_ime};
-#[cfg(target_os = "windows")]
-use black_hole_platform::{PlatformError as WindowsPlatformError, WindowsTsfIme};
-#[cfg(target_os = "linux")]
-use black_hole_platform::linux_ibus::auto_register::{is_registered as is_registered_linux, register_ime as register_ime_linux};
-#[cfg(target_os = "linux")]
-use black_hole_platform::{LinuxIbusIme, PlatformError as LinuxPlatformError};
-
-/// 全局退出标志，由信号处理器设置
-static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 
 /// 应用生命周期管理器
 ///
@@ -77,9 +80,7 @@ impl App {
 
         info!(
             "resolved scheme: CLI={:?}, settings={:?}, effective={:?}",
-            args.scheme,
-            settings_scheme,
-            default_scheme,
+            args.scheme, settings_scheme, default_scheme,
         );
 
         let dict_path = args.dict_path.or_else(|| {
@@ -95,6 +96,7 @@ impl App {
             EngineBuilder::new()
                 .scheme(default_scheme)
                 .dictionary_opt(dict_path)
+                .key_bindings(settings_mgr.settings().key_bindings.clone())
                 .build(),
         ));
 
@@ -102,7 +104,7 @@ impl App {
         let (engine_tx, engine_rx) = mpsc::channel::<EngineCommand>();
         let (platform_tx, platform_rx) = mpsc::channel::<SchemeResult>();
 
-        Self::setup_signal_handler();
+        Self::setup_signal_handler(ui_tx.clone());
 
         let default_theme = settings_mgr.settings().theme;
 
@@ -110,10 +112,16 @@ impl App {
         let current_settings: Arc<Mutex<(SchemeId, Theme)>> =
             Arc::new(Mutex::new((default_scheme, default_theme)));
 
+        // 最后已生效设置：dispatch 持久化时同步更新，watcher 据此跳过 daemon 自身写入，
+        // 避免设置面板/托盘改一项设置触发两次热应用
+        let last_applied_settings: Arc<Mutex<Settings>> =
+            Arc::new(Mutex::new(settings_mgr.settings().clone()));
+
         // UI 渲染线程（只处理候选窗相关命令）
         let (ui_render_tx, ui_render_rx) = mpsc::channel::<UiCommand>();
+        let initial_cw = settings_mgr.settings().candidate_window.clone();
         let ui_handle = thread::spawn(move || {
-            run_candidate_window(ui_render_rx, default_theme);
+            run_candidate_window(ui_render_rx, default_theme, initial_cw);
         });
 
         // 引擎线程（带 panic 恢复）
@@ -128,6 +136,7 @@ impl App {
         let ui_render_tx_for_shutdown = ui_render_tx.clone();
         let ui_tx_for_platform = ui_tx.clone();
         let current_for_dispatch = Arc::clone(&current_settings);
+        let last_applied_for_dispatch = Arc::clone(&last_applied_settings);
 
         // 平台线程（后台运行，避免阻塞主线程）
         let _platform_handle = thread::spawn(move || {
@@ -138,20 +147,94 @@ impl App {
             }
         });
 
-        // 主线程：分发 UI 命令并等待退出信号（Ctrl+C 或语言栏 Exit）
-        while !SHOULD_EXIT.load(Ordering::Relaxed) {
-            while let Ok(cmd) = ui_rx.try_recv() {
-                Self::dispatch_ui_command(
-                    cmd,
-                    &engine_tx_for_ui_dispatch,
-                    &ui_render_tx,
-                    &current_for_dispatch,
-                );
+        // 设置热更新线程：阻塞在 watch_rx 上，独立于主循环处理 settings.json 变更，
+        // 设置面板保存后实时热应用。主循环只需专注分发 UI 命令。
+        let watch_config_path = settings_mgr.config_path().clone();
+        let watch_engine_tx = engine_tx_for_ui_dispatch.clone();
+        let watch_ui_render_tx = ui_render_tx.clone();
+        let watch_current = Arc::clone(&current_for_dispatch);
+        let watch_last_applied = Arc::clone(&last_applied_settings);
+        // 停止信号：graceful_shutdown 置位后，watch 线程在 recv_timeout 超时醒来退出
+        let watch_stop = Arc::new(AtomicBool::new(false));
+        let watch_stop_flag = Arc::clone(&watch_stop);
+        let watch_handle = thread::spawn(move || {
+            let settings_mgr = SettingsManager::new();
+            let (watch_tx, watch_rx) = mpsc::channel::<notify::Result<notify::Event>>();
+            let mut watcher = match notify::recommended_watcher(watch_tx) {
+                Ok(w) => w,
+                Err(e) => {
+                    warn!("Failed to create settings watcher: {}", e);
+                    return;
+                }
+            };
+            if let Some(config_dir) = watch_config_path.parent() {
+                // 目录可能尚不存在（首次运行未保存过设置），先创建再监听；
+                // 监听目录而非文件本身，避免编辑器原子保存（rename 替换）时丢失事件。
+                if let Err(e) = fs::create_dir_all(config_dir) {
+                    warn!("Failed to create config dir {:?}: {}", config_dir, e);
+                }
+                if let Err(e) = watcher.watch(config_dir, notify::RecursiveMode::NonRecursive) {
+                    warn!("Failed to watch config dir {:?}: {}", config_dir, e);
+                }
             }
-            thread::sleep(Duration::from_millis(100));
+            // 外层 Ok 表示通道正常；notify 的错误事件（如监视目录被删除重建）
+            // 通过 Ok(Err) 送达，记录日志后继续，避免热更新循环永久退出。
+            // 用 recv_timeout 周期性检查停止信号，使 graceful_shutdown 能 join 本线程。
+            while !watch_stop_flag.load(Ordering::Relaxed) {
+                match watch_rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(Ok(event)) => {
+                        if event.paths.iter().any(|p| p == &watch_config_path)
+                            && let Some(new_settings) = settings_mgr.try_reload()
+                        {
+                            // 以共享基线比较：daemon 自身保存（dispatch）会同步该基线，
+                            // 因此可跳过自身写入引发的重复热应用
+                            let last_applied = watch_last_applied.lock().unwrap().clone();
+                            if new_settings != last_applied {
+                                info!("Settings changed on disk, applying hot update");
+                                Self::apply_settings_hot(
+                                    &new_settings,
+                                    &last_applied,
+                                    &watch_engine_tx,
+                                    &watch_ui_render_tx,
+                                    &watch_current,
+                                );
+                                *watch_last_applied.lock().unwrap() = new_settings;
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Settings watcher error event, continuing: {:?}", e);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        });
+
+        // 主循环：阻塞在 ui_rx.recv() 上分发 UI 命令，等待退出事件
+        // （Ctrl+C 或语言栏 Exit），退出信号统一经 UiCommand::Exit 事件传播。
+        while let Ok(cmd) = ui_rx.recv() {
+            if cmd == UiCommand::Exit {
+                info!("UI dispatch: exit requested");
+                break;
+            }
+            Self::dispatch_ui_command(
+                cmd,
+                &engine_tx_for_ui_dispatch,
+                &ui_render_tx,
+                &current_for_dispatch,
+                &last_applied_for_dispatch,
+            );
         }
 
-        Self::graceful_shutdown(ui_render_tx_for_shutdown, ui_handle, engine_handle);
+        Self::graceful_shutdown(
+            engine_tx_for_ui_dispatch,
+            ui_render_tx_for_shutdown,
+            ui_handle,
+            engine_handle,
+            watch_handle,
+            watch_stop,
+        );
 
         info!("Black-Hole IME daemon exited.");
         Ok(())
@@ -172,11 +255,7 @@ impl App {
         registry()
             .with(EnvFilter::from_default_env())
             .with(fmt::layer().with_writer(io::stdout))
-            .with(
-                fmt::layer()
-                    .with_writer(non_blocking)
-                    .with_ansi(false),
-            )
+            .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
             .init();
 
         guard
@@ -238,10 +317,11 @@ impl App {
     // 信号处理
     // ------------------------------------------------------------------
 
-    fn setup_signal_handler() {
-        let result = ctrlc::set_handler(|| {
+    fn setup_signal_handler(ui_tx: mpsc::Sender<UiCommand>) {
+        let result = ctrlc::set_handler(move || {
             info!("Received interrupt signal, requesting shutdown...");
-            SHOULD_EXIT.store(true, Ordering::SeqCst);
+            // ctrlc 回调运行在专用线程上，可安全发送事件
+            let _ = ui_tx.send(UiCommand::Exit);
         });
         if let Err(e) = result {
             warn!("Failed to register Ctrl+C handler: {}", e);
@@ -261,15 +341,12 @@ impl App {
         let result = catch_unwind(AssertUnwindSafe(|| {
             let mut ctx = InputContext::default();
             while let Ok(cmd) = engine_rx.recv() {
-                if SHOULD_EXIT.load(Ordering::Relaxed) {
-                    info!("Engine thread received exit request");
+                if cmd == EngineCommand::Shutdown {
+                    info!("Engine thread received shutdown request");
                     break;
                 }
 
-                debug!(
-                    "engine_thread start: cmd={:?}",
-                    discriminant(&cmd)
-                );
+                debug!("engine_thread start: cmd={:?}", discriminant(&cmd));
 
                 let result = Self::process_engine_command(&engine, &mut ctx, cmd, &ui_tx);
 
@@ -304,6 +381,7 @@ impl App {
         engine_tx: &mpsc::Sender<EngineCommand>,
         ui_render_tx: &mpsc::Sender<UiCommand>,
         current_settings: &Arc<Mutex<(SchemeId, Theme)>>,
+        last_applied: &Arc<Mutex<Settings>>,
     ) {
         match cmd {
             UiCommand::ShowSettings => {
@@ -311,10 +389,7 @@ impl App {
                 // winit 0.30 每进程仅允许一个事件循环，候选窗已占用 daemon 进程内的，
                 // 设置面板须以独立进程（--settings-panel）方式运行。
                 if let Ok(exe) = env::current_exe() {
-                    if let Err(e) = Command::new(exe)
-                        .arg("--settings-panel")
-                        .spawn()
-                    {
+                    if let Err(e) = Command::new(exe).arg("--settings-panel").spawn() {
                         error!("Failed to spawn settings panel: {}", e);
                     }
                 } else {
@@ -327,6 +402,8 @@ impl App {
                 // 持久化到设置，使重启后保持本次选择
                 let mut settings_mgr = SettingsManager::new();
                 settings_mgr.settings_mut().default_scheme = scheme_id;
+                // 先同步"最后已生效设置"基线，再落盘，watcher 可识别本次为自身写入而跳过
+                *last_applied.lock().unwrap() = settings_mgr.settings().clone();
                 settings_mgr.save();
                 // 同步共享状态，使平台线程（IPC GetSettings）返回最新值
                 {
@@ -338,6 +415,7 @@ impl App {
                 info!("UI dispatch: set theme to {:?}", theme);
                 let mut settings_mgr = SettingsManager::new();
                 settings_mgr.settings_mut().theme = theme;
+                *last_applied.lock().unwrap() = settings_mgr.settings().clone();
                 settings_mgr.save();
                 // 同步共享状态
                 {
@@ -355,16 +433,71 @@ impl App {
                 // 持久化到设置，使重启后保持本次选择
                 let mut settings_mgr = SettingsManager::new();
                 settings_mgr.settings_mut().auto_start = enabled;
+                *last_applied.lock().unwrap() = settings_mgr.settings().clone();
                 settings_mgr.save();
             }
             UiCommand::Exit => {
+                // 主循环在分发前已拦截 Exit 并结束事件循环，正常不会到达此处；
+                // 保留分支以穷尽匹配，并防止误转发到候选窗线程。
                 info!("UI dispatch: exit requested");
-                SHOULD_EXIT.store(true, Ordering::SeqCst);
             }
             other => {
                 // 候选窗等命令转发给 UI 渲染线程
                 let _ = ui_render_tx.send(other);
             }
+        }
+    }
+
+    /// 热应用磁盘上的新设置（设置面板保存后由主循环轮询触发）。
+    ///
+    /// 只对发生变化的部分生效，避免无谓的命令/重建开销：
+    /// - 主题：同步共享状态并通知候选窗线程
+    /// - 默认方案：通知引擎线程切换方案
+    /// - 自启动：平台写入（注册表 Run 键 / XDG autostart 文件）
+    /// - 候选窗参数：通知候选窗线程热更新字号/最大候选数
+    /// - 按键绑定：通知引擎线程热更新按键映射
+    fn apply_settings_hot(
+        new: &Settings,
+        old: &Settings,
+        engine_tx: &mpsc::Sender<EngineCommand>,
+        ui_render_tx: &mpsc::Sender<UiCommand>,
+        current_settings: &Arc<Mutex<(SchemeId, Theme)>>,
+    ) {
+        if new.theme != old.theme {
+            info!("Hot applying theme: {:?}", new.theme);
+            {
+                let mut cur = current_settings.lock().unwrap();
+                cur.1 = new.theme;
+            }
+            let _ = ui_render_tx.send(UiCommand::SetTheme(new.theme));
+        }
+
+        if new.default_scheme != old.default_scheme {
+            info!("Hot applying scheme: {:?}", new.default_scheme);
+            let _ = engine_tx.send(EngineCommand::SwitchScheme(new.default_scheme));
+            {
+                let mut cur = current_settings.lock().unwrap();
+                cur.0 = new.default_scheme;
+            }
+        }
+
+        if new.auto_start != old.auto_start {
+            info!("Hot applying auto start: {}", new.auto_start);
+            if let Err(e) = set_auto_start(new.auto_start) {
+                warn!("Failed to set auto start ({}): {}", new.auto_start, e);
+            }
+        }
+
+        if new.candidate_window != old.candidate_window {
+            info!("Hot applying candidate window settings");
+            let _ = ui_render_tx.send(UiCommand::SetCandidateWindowSettings(
+                new.candidate_window.clone(),
+            ));
+        }
+
+        if new.key_bindings != old.key_bindings {
+            info!("Hot applying key bindings");
+            let _ = engine_tx.send(EngineCommand::UpdateKeyBindings(new.key_bindings.clone()));
         }
     }
 
@@ -409,6 +542,17 @@ impl App {
                 // 发送 Ignored 会污染共享响应通道，导致后续按键请求/响应错位。
                 None
             }
+            EngineCommand::UpdateKeyBindings(bindings) => {
+                let mut engine = engine.lock().unwrap();
+                engine.process(&EngineCommand::UpdateKeyBindings(bindings), ctx);
+                // 与 SwitchScheme 同理：由 daemon 主循环触发，无需响应。
+                None
+            }
+            EngineCommand::Shutdown => {
+                // 引擎线程循环已拦截 Shutdown 并退出，正常不会到达此处；
+                // 保留分支以穷尽匹配。
+                None
+            }
         }
     }
 
@@ -417,15 +561,31 @@ impl App {
     // ------------------------------------------------------------------
 
     fn graceful_shutdown(
+        engine_tx: mpsc::Sender<EngineCommand>,
         ui_tx: mpsc::Sender<UiCommand>,
         ui_handle: thread::JoinHandle<()>,
         engine_handle: thread::JoinHandle<()>,
+        watch_handle: thread::JoinHandle<()>,
+        watch_stop: Arc<AtomicBool>,
     ) {
         info!("Shutting down daemon...");
+
+        // 停止设置热更新线程：置位停止信号，其 recv_timeout 循环会退出
+        watch_stop.store(true, Ordering::Relaxed);
+
+        // 通知引擎线程退出：发送 Shutdown 唤醒其阻塞的 recv，使其及时结束
+        if engine_tx.send(EngineCommand::Shutdown).is_err() {
+            warn!("Engine channel closed, engine thread may have already exited");
+        }
 
         // 通知 UI 退出
         if ui_tx.send(UiCommand::Exit).is_err() {
             warn!("UI channel closed, UI thread may have already exited");
+        }
+
+        // 等待设置热更新线程结束（5 秒超时）
+        if !Self::join_with_timeout(watch_handle, "SettingsWatcher", Duration::from_secs(5)) {
+            warn!("Settings watcher thread did not exit within timeout");
         }
 
         // 等待引擎线程结束（5 秒超时）
@@ -440,11 +600,7 @@ impl App {
     }
 
     /// 等待线程结束，带超时
-    fn join_with_timeout(
-        handle: thread::JoinHandle<()>,
-        name: &str,
-        timeout: Duration,
-    ) -> bool {
+    fn join_with_timeout(handle: thread::JoinHandle<()>, name: &str, timeout: Duration) -> bool {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let result = handle.join();
