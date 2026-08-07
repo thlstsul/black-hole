@@ -284,24 +284,24 @@ pub(crate) fn send_ui_command_inner(inner_arc: &Arc<Mutex<ServiceInner>>, cmd: U
 // ---------------------------------------------------------------------------
 
 pub struct WindowsTsfIme {
-    /// 运行时方案/主题状态，daemon 每次切换方案/主题时同步更新
-    current: Arc<Mutex<(SchemeId, Theme)>>,
+    /// 运行时方案/主题/中英模式状态，daemon 每次切换时同步更新
+    current: Arc<Mutex<(SchemeId, Theme, bool)>>,
 }
 
 impl WindowsTsfIme {
-    /// 使用共享状态创建。`current` 会被 daemon 在每次方案/主题切换时自动更新。
-    pub fn new(current: Arc<Mutex<(SchemeId, Theme)>>) -> Self {
+    /// 使用共享状态创建。`current` 会被 daemon 在每次方案/主题/中英模式切换时自动更新。
+    pub fn new(current: Arc<Mutex<(SchemeId, Theme, bool)>>) -> Self {
         Self { current }
     }
 
     /// 创建时指定初始值（内部创建共享状态）。
     pub fn new_with_values(default_scheme: SchemeId, default_theme: Theme) -> Self {
         Self {
-            current: Arc::new(Mutex::new((default_scheme, default_theme))),
+            current: Arc::new(Mutex::new((default_scheme, default_theme, false))),
         }
     }
 
-    pub fn current(&self) -> &Arc<Mutex<(SchemeId, Theme)>> {
+    pub fn current(&self) -> &Arc<Mutex<(SchemeId, Theme, bool)>> {
         &self.current
     }
 }
@@ -352,7 +352,7 @@ fn handle_ipc_client(
     engine_tx: Sender<EngineCommand>,
     platform_rx: Arc<Mutex<Receiver<SchemeResult>>>,
     ui_tx: Sender<UiCommand>,
-    current: Arc<Mutex<(SchemeId, Theme)>>,
+    current: Arc<Mutex<(SchemeId, Theme, bool)>>,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
@@ -400,8 +400,12 @@ fn handle_ipc_client(
                 let _ = ui_tx.send(ui_cmd);
             }
             IpcRequest::GetSettings => {
-                let (scheme_id, theme) = *current.lock().unwrap();
-                let response = IpcResponse::Settings { scheme_id, theme };
+                let (scheme_id, theme, english) = *current.lock().unwrap();
+                let response = IpcResponse::Settings {
+                    scheme_id,
+                    theme,
+                    english,
+                };
                 let json = to_string(&response)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 writeln!(writer, "{}", json)?;

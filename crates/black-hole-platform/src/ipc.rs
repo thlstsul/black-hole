@@ -40,6 +40,8 @@ pub enum IpcResponse {
     Settings {
         scheme_id: SchemeId,
         theme: Theme,
+        /// 全局中英文输入模式：true=英文，false=中文
+        english: bool,
     },
 }
 

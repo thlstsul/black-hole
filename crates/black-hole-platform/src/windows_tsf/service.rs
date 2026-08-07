@@ -90,22 +90,46 @@ impl BlackHoleTextService {
         }
     }
 
-    /// 向 daemon 查询当前的 scheme 和 theme 设置，并更新 ServiceInner，
-    /// 使托盘菜单能勾选正确的选项。
+    /// 向 daemon 查询当前的 scheme、theme 和全局中英模式，并更新 ServiceInner，
+    /// 使托盘菜单能勾选正确的选项、跨进程（管理员/普通）保持中英模式一致。
     fn sync_settings_from_daemon(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(ref mut conn) = inner.ipc_conn {
-            let request = IpcRequest::GetSettings;
-            if send_request(&mut conn.writer, &request).is_ok()
-                && let Ok(IpcResponse::Settings { scheme_id, theme }) =
-                    read_response(&mut conn.reader)
-            {
-                inner.current_scheme = scheme_id;
-                inner.current_theme = theme;
+        let english = {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(ref mut conn) = inner.ipc_conn {
+                let request = IpcRequest::GetSettings;
+                if send_request(&mut conn.writer, &request).is_ok()
+                    && let Ok(IpcResponse::Settings {
+                        scheme_id,
+                        theme,
+                        english,
+                    }) = read_response(&mut conn.reader)
+                {
+                    inner.current_scheme = scheme_id;
+                    inner.current_theme = theme;
+                    info!(
+                        "Synced settings from daemon: scheme={:?}, theme={:?}, english={}",
+                        scheme_id, theme, english
+                    );
+                    Some(english)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        // 先释放 inner 锁再应用模式切换：on_input_mode_toggled 内部会重新加锁。
+        if let Some(english) = english {
+            let changed = {
+                let mut inner = self.inner.lock().unwrap();
+                inner.mode_switch.set_english(english).is_some()
+            };
+            if changed {
                 info!(
-                    "Synced settings from daemon: scheme={:?}, theme={:?}",
-                    scheme_id, theme
+                    "Input mode synced from daemon: {}",
+                    if english { "英文" } else { "中文" }
                 );
+                apply_input_mode_toggle(&self.inner, english);
             }
         }
     }
@@ -379,6 +403,9 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         // 进程不同，GetForegroundWindow 不可靠，钩子依赖此处的焦点状态判定前台。
         if fforeground.as_bool() {
             set_foreground_thread(unsafe { GetCurrentThreadId() });
+            // 获得焦点时从 daemon 同步全局中英模式：管理员/普通进程
+            // 各自持有本地状态，切换进程时以此保持一致。
+            self.sync_settings_from_daemon();
         } else {
             clear_foreground_thread();
         }

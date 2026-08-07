@@ -210,6 +210,8 @@ impl BlackHoleLangBarItem {
         };
         if let Some(english) = toggled {
             apply_input_mode_toggle(&self.inner, english);
+            // 上报 daemon 持久化并更新全局状态，供其它进程（管理员/普通）同步
+            self.send_ui_command(UiCommand::SetInputMode(english));
         }
     }
 

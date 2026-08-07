@@ -108,9 +108,12 @@ impl App {
 
         let default_theme = settings_mgr.settings().theme;
 
-        // 运行时方案/主题状态，平台线程通过 IPC GetSettings 读取，dispatch 时同步更新
-        let current_settings: Arc<Mutex<(SchemeId, Theme)>> =
-            Arc::new(Mutex::new((default_scheme, default_theme)));
+        // 运行时方案/主题/中英模式状态，平台线程通过 IPC GetSettings 读取，dispatch 时同步更新
+        let current_settings: Arc<Mutex<(SchemeId, Theme, bool)>> = Arc::new(Mutex::new((
+            default_scheme,
+            default_theme,
+            settings_mgr.settings().english_mode,
+        )));
 
         // 最后已生效设置：dispatch 持久化时同步更新，watcher 据此跳过 daemon 自身写入，
         // 避免设置面板/托盘改一项设置触发两次热应用
@@ -380,7 +383,7 @@ impl App {
         cmd: UiCommand,
         engine_tx: &mpsc::Sender<EngineCommand>,
         ui_render_tx: &mpsc::Sender<UiCommand>,
-        current_settings: &Arc<Mutex<(SchemeId, Theme)>>,
+        current_settings: &Arc<Mutex<(SchemeId, Theme, bool)>>,
         last_applied: &Arc<Mutex<Settings>>,
     ) {
         match cmd {
@@ -436,6 +439,19 @@ impl App {
                 *last_applied.lock().unwrap() = settings_mgr.settings().clone();
                 settings_mgr.save();
             }
+            UiCommand::SetInputMode(english) => {
+                info!("UI dispatch: set input mode english={}", english);
+                // 持久化到设置，使重启后保持本次选择
+                let mut settings_mgr = SettingsManager::new();
+                settings_mgr.settings_mut().english_mode = english;
+                *last_applied.lock().unwrap() = settings_mgr.settings().clone();
+                settings_mgr.save();
+                // 同步共享状态，使平台线程（IPC GetSettings）返回最新值
+                {
+                    let mut cur = current_settings.lock().unwrap();
+                    cur.2 = english;
+                }
+            }
             UiCommand::Exit => {
                 // 主循环在分发前已拦截 Exit 并结束事件循环，正常不会到达此处；
                 // 保留分支以穷尽匹配，并防止误转发到候选窗线程。
@@ -456,12 +472,13 @@ impl App {
     /// - 自启动：平台写入（注册表 Run 键 / XDG autostart 文件）
     /// - 候选窗参数：通知候选窗线程热更新字号/最大候选数
     /// - 按键绑定：通知引擎线程热更新按键映射
+    /// - 中英模式：同步共享状态，供各进程 TSF 实例获得焦点时同步
     fn apply_settings_hot(
         new: &Settings,
         old: &Settings,
         engine_tx: &mpsc::Sender<EngineCommand>,
         ui_render_tx: &mpsc::Sender<UiCommand>,
-        current_settings: &Arc<Mutex<(SchemeId, Theme)>>,
+        current_settings: &Arc<Mutex<(SchemeId, Theme, bool)>>,
     ) {
         if new.theme != old.theme {
             info!("Hot applying theme: {:?}", new.theme);
@@ -498,6 +515,14 @@ impl App {
         if new.key_bindings != old.key_bindings {
             info!("Hot applying key bindings");
             let _ = engine_tx.send(EngineCommand::UpdateKeyBindings(new.key_bindings.clone()));
+        }
+
+        if new.english_mode != old.english_mode {
+            info!("Hot applying input mode english={}", new.english_mode);
+            {
+                let mut cur = current_settings.lock().unwrap();
+                cur.2 = new.english_mode;
+            }
         }
     }
 
@@ -628,7 +653,7 @@ fn run_platform(
     engine_tx: mpsc::Sender<EngineCommand>,
     platform_rx: mpsc::Receiver<SchemeResult>,
     ui_tx: mpsc::Sender<UiCommand>,
-    current_settings: Arc<Mutex<(SchemeId, Theme)>>,
+    current_settings: Arc<Mutex<(SchemeId, Theme, bool)>>,
 ) -> Result<(), WindowsPlatformError> {
     let mut platform = WindowsTsfIme::new(current_settings);
     platform.run(engine_tx, platform_rx, ui_tx)?;
@@ -640,7 +665,7 @@ fn run_platform(
     engine_tx: mpsc::Sender<EngineCommand>,
     platform_rx: mpsc::Receiver<SchemeResult>,
     ui_tx: mpsc::Sender<UiCommand>,
-    _current_settings: Arc<Mutex<(SchemeId, Theme)>>,
+    _current_settings: Arc<Mutex<(SchemeId, Theme, bool)>>,
 ) -> Result<(), LinuxPlatformError> {
     let mut platform = LinuxIbusIme::new();
     platform.run(engine_tx, platform_rx, ui_tx)?;

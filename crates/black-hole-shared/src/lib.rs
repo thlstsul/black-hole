@@ -165,6 +165,9 @@ pub enum UiCommand {
     SetAutoStart(bool),
     SetTheme(Theme),
     SwitchScheme(SchemeId),
+    /// 中英文输入模式切换：TSF 实例切换后上报 daemon，
+    /// daemon 持久化并更新共享状态，供其它进程同步。
+    SetInputMode(bool),
     /// daemon → 候选窗线程：热更新候选窗参数（字号、最大候选数等）
     SetCandidateWindowSettings(CandidateWindowSettings),
     Exit,
@@ -180,6 +183,10 @@ pub struct Settings {
     /// 是否开机自启动（登录时自动运行守护进程）
     #[serde(default)]
     pub auto_start: bool,
+    /// 中英文输入模式：true=英文，false=中文。
+    /// 由 daemon 全局持有并持久化，各进程 TSF 实例启动/获得焦点时同步。
+    #[serde(default)]
+    pub english_mode: bool,
 }
 
 impl Default for Settings {
@@ -190,6 +197,7 @@ impl Default for Settings {
             candidate_window: CandidateWindowSettings::default(),
             key_bindings: KeyBindings::default(),
             auto_start: false,
+            english_mode: false,
         }
     }
 }

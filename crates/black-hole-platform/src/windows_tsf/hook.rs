@@ -26,7 +26,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::ServiceInner;
+use super::send_ui_command_inner;
 use super::service::apply_input_mode_toggle;
+use black_hole_shared::UiCommand;
 use tracing::{debug, warn};
 
 /// 当前进程内所有已激活的文本服务实例（线程 id → 弱引用）。
@@ -259,5 +261,7 @@ fn on_ctrl_released() {
             if english { "英文" } else { "中文" }
         );
         apply_input_mode_toggle(&inner, english);
+        // 上报 daemon 持久化并更新全局状态，供其它进程（管理员/普通）同步
+        send_ui_command_inner(&inner, UiCommand::SetInputMode(english));
     }
 }
