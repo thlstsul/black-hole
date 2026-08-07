@@ -57,6 +57,7 @@ impl LinuxIbusIme {
             ui_tx: Mutex::new(ui_tx),
             context: Mutex::new(InputContext::default()),
             mode_switch: Mutex::new(InputModeSwitch::default()),
+            last_code: Mutex::new(None),
             conn: conn.clone(),
         };
 
@@ -80,12 +81,35 @@ struct IbusEngine {
     context: Mutex<InputContext>,
     /// 中英文模式切换状态机（Ctrl 键触发）
     mode_switch: Mutex<InputModeSwitch>,
+    /// 最近一次 composition 的编码（切英文模式时上屏保留）
+    last_code: Mutex<Option<String>>,
     conn: Connection,
 }
 
 impl IbusEngine {
-    /// 模式切换后的收尾：重置引擎并向面板广播新的 InputMode 属性。
+    /// 模式切换后的收尾：切英文模式时先上屏保留输入框内容，
+    /// 然后重置引擎并向面板广播新的 InputMode 属性。
     async fn apply_mode_change(&self, english: bool) {
+        // 切换到英文模式时，把输入框中的编码上屏，避免输入丢失。
+        if english {
+            let code = self.last_code.lock().unwrap().take();
+            if let Some(code) = code.filter(|c| !c.is_empty()) {
+                let ibus_text = (code.as_str(), Vec::<(u32, u32, u32, u32)>::new());
+                let variant = Value::from(ibus_text);
+                let _ = self
+                    .conn
+                    .emit_signal(
+                        None::<&str>,
+                        "/org/freedesktop/IBus/Engine/Black-Hole",
+                        "org.freedesktop.IBus.Engine",
+                        "CommitText",
+                        &variant,
+                    )
+                    .await;
+            }
+        } else {
+            *self.last_code.lock().unwrap() = None;
+        }
         // 取消未完成的输入并重置引擎（幂等）。
         // daemon 处理 Reset 时会自行隐藏候选窗。
         let sent = {
@@ -174,6 +198,8 @@ impl IbusEngine {
 
         match result {
             SchemeResult::Committed { text } => {
+                // 已上屏，清空记录的编码，避免切换模式时重复上屏
+                *self.last_code.lock().unwrap() = None;
                 // 发送 CommitText DBus 信号
                 let ibus_text = (text.as_str(), Vec::<(u32, u32, u32, u32)>::new());
                 let variant = Value::from(ibus_text);
@@ -197,6 +223,8 @@ impl IbusEngine {
                 selected_index,
                 expanded,
             } => {
+                // 记录当前编码，供切换英文模式时上屏保留
+                *self.last_code.lock().unwrap() = Some(code.clone());
                 // 通过 channel 发送 UI 更新
                 let ui_tx = self.ui_tx.lock().unwrap();
                 let ctx = self.context.lock().unwrap().clone();
@@ -229,6 +257,8 @@ impl IbusEngine {
     async fn focus_out(&self) {}
 
     async fn reset(&self) {
+        // 引擎已重置，清空记录的编码
+        *self.last_code.lock().unwrap() = None;
         // 发送 Reset 命令到引擎线程并读取响应
         {
             let engine_tx = self.engine_tx.lock().unwrap();

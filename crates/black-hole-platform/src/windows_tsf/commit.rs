@@ -204,6 +204,64 @@ pub(crate) fn apply_result(
 // Cancel composition edit session
 // ---------------------------------------------------------------------------
 
+/// 结束进行中的 composition，但保留已输入文本（相当于上屏），
+/// 用于切换到英文模式时保留输入框中的内容。
+#[implement(ITfEditSession)]
+pub(crate) struct CommitCompositionEditSession {
+    pub(crate) inner_arc: Arc<Mutex<ServiceInner>>,
+}
+
+impl ITfEditSession_Impl for CommitCompositionEditSession_Impl {
+    fn DoEditSession(&self, ec: u32) -> Result<()> {
+        let (composition, ctx, layout_cookie) = {
+            let inner = self.inner_arc.lock().unwrap();
+            let comp = inner.composition.clone();
+            let ctx = inner.context.clone();
+            let cookie = inner.layout_sink_cookie;
+            (comp, ctx, cookie)
+        };
+
+        if let Some(comp) = composition {
+            let _ = (|| -> Result<()> {
+                let Some(ctx) = ctx.as_ref() else {
+                    return Ok(());
+                };
+                let range = unsafe { comp.GetRange()? };
+                // 保留当前文本，仅结束 composition（相当于上屏）
+                let _ = unsafe { comp.EndComposition(ec) };
+
+                let Ok(collapsed) = (unsafe { range.Clone() }) else {
+                    return Ok(());
+                };
+                let _ = unsafe { collapsed.Collapse(ec, TF_ANCHOR_END) };
+                let mut sel = TF_SELECTION {
+                    range: mem::ManuallyDrop::new(Some(collapsed)),
+                    style: TF_SELECTIONSTYLE {
+                        ase: TF_AE_NONE,
+                        fInterimChar: BOOL(0),
+                    },
+                };
+                let _ = unsafe { ctx.SetSelection(ec, slice::from_ref(&sel)) };
+                let _ = unsafe { mem::ManuallyDrop::take(&mut sel.range) };
+                Ok(())
+            })();
+
+            let mut inner = self.inner_arc.lock().unwrap();
+            inner.composition = None;
+            inner.last_caret_pos = None;
+            if let Some(cookie) = layout_cookie
+                && let Some(ref ctx) = ctx
+                && let Ok(source) = ctx.cast::<ITfSource>()
+            {
+                let _ = unsafe { source.UnadviseSink(cookie) };
+            }
+            inner.layout_sink_cookie = None;
+        }
+
+        Ok(())
+    }
+}
+
 #[implement(ITfEditSession)]
 pub(crate) struct CancelCompositionEditSession {
     pub(crate) inner_arc: Arc<Mutex<ServiceInner>>,

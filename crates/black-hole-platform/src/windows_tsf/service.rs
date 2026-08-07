@@ -1,6 +1,6 @@
 use super::super::ipc::{IpcRequest, IpcResponse, read_response, send_request};
 use super::caret::LayoutChangeEditSession;
-use super::commit::CancelCompositionEditSession;
+use super::commit::{CancelCompositionEditSession, CommitCompositionEditSession};
 use super::dll_release;
 use super::hook::{
     clear_foreground_thread, register_service, set_foreground_thread, unregister_service,
@@ -123,8 +123,9 @@ impl BlackHoleTextService {
         send_ui_command_inner(&self.inner, cmd);
     }
 
-    /// Send Reset to the engine and cancel any active composition.
-    fn send_reset(&self) {
+    /// Send Reset to the engine and end any active composition.
+    /// `preserve_input` 为 true 时保留输入框中的文本（相当于上屏），否则清空取消。
+    fn send_reset(&self, preserve_input: bool) {
         let (ctx_opt, client_id) = {
             let mut inner = self.inner.lock().unwrap();
             if let Some(ref mut conn) = inner.ipc_conn {
@@ -136,10 +137,17 @@ impl BlackHoleTextService {
         };
 
         if let Some(ctx) = ctx_opt {
-            let session = CancelCompositionEditSession {
-                inner_arc: self.inner.clone(),
+            let edit_session: ITfEditSession = if preserve_input {
+                CommitCompositionEditSession {
+                    inner_arc: self.inner.clone(),
+                }
+                .into()
+            } else {
+                CancelCompositionEditSession {
+                    inner_arc: self.inner.clone(),
+                }
+                .into()
             };
-            let edit_session: ITfEditSession = session.into();
             let _ = unsafe {
                 ctx.RequestEditSession(client_id, &edit_session, TF_ES_SYNC | TF_ES_READWRITE)
             };
@@ -157,15 +165,16 @@ impl BlackHoleTextService {
         }
     }
 
-    /// 中英文模式切换后的收尾工作：取消进行中的 composition、
+    /// 中英文模式切换后的收尾工作：结束进行中的 composition、
     /// 重置引擎状态、同步系统输入法状态并刷新语言栏图标。
+    /// 切换到英文模式时保留输入框中的内容（上屏），切回中文时清空取消。
     fn on_input_mode_toggled(&self, english: bool) {
         info!(
             "Input mode toggled: {}",
             if english { "英文" } else { "中文" }
         );
-        // 取消未完成的输入并重置引擎（两个方向均为幂等操作）。
-        self.send_reset();
+        // 结束未完成的输入并重置引擎：切英文时保留输入框内容，切中文时取消。
+        self.send_reset(english);
         // 写入系统键盘 compartment，供其它应用感知当前输入法状态。
         self.sync_input_mode_compartments(english);
         let sink = {
@@ -341,7 +350,7 @@ impl ITfTextInputProcessor_Impl for BlackHoleTextService_Impl {
             info!("Language bar item removed");
         }
 
-        self.send_reset();
+        self.send_reset(false);
         self.disconnect_ipc();
         unregister_service(unsafe { GetCurrentThreadId() });
         let mut inner = self.inner.lock().unwrap();
@@ -374,7 +383,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
             clear_foreground_thread();
         }
         if !fforeground.as_bool() {
-            self.send_reset();
+            self.send_reset(false);
         }
         Ok(())
     }
@@ -614,7 +623,7 @@ impl ITfThreadMgrEventSink_Impl for BlackHoleTextService_Impl {
             let mut inner = self.inner.lock().unwrap();
             inner.last_caret_pos = None;
         }
-        self.send_reset();
+        self.send_reset(false);
         Ok(())
     }
 
