@@ -6,7 +6,19 @@ use crate::settings_manager::SettingsManager;
 use crate::theme_visuals;
 use eframe::egui::{DragValue, Margin, ScrollArea, Ui, ViewportBuilder, ViewportCommand};
 use eframe::{App, EventLoopBuilder, EventLoopBuilderHook, Frame, NativeOptions, run_native};
+#[cfg(target_os = "windows")]
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+#[cfg(target_os = "windows")]
+use std::ffi::c_void;
 use tracing::{error, info};
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::HWND;
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::WindowsAndMessaging::{
+    BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+};
 #[cfg(target_os = "windows")]
 use winit::platform::windows::EventLoopBuilderExtWindows;
 
@@ -15,6 +27,8 @@ pub struct SettingsPanelApp {
     last_theme: Theme,
     feedback: Option<String>,
     feedback_timer: f64,
+    /// 打开面板后强制窗口前台聚焦（Windows 前台锁需逐帧重试）
+    focus_retries: u32,
 }
 
 impl SettingsPanelApp {
@@ -25,6 +39,7 @@ impl SettingsPanelApp {
             last_theme,
             feedback: None,
             feedback_timer: 0.0,
+            focus_retries: 0,
         }
     }
 
@@ -78,8 +93,17 @@ impl SettingsPanelApp {
 }
 
 impl App for SettingsPanelApp {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut Frame) {
+    fn ui(&mut self, ui: &mut Ui, frame: &mut Frame) {
         let ctx = ui.ctx().clone();
+
+        // 强制前台聚焦：daemon 为后台进程，拉起的设置面板默认拿不到焦点
+        #[cfg(target_os = "windows")]
+        if self.focus_retries < 30 {
+            self.focus_retries += 1;
+            if !force_foreground(frame) {
+                ctx.request_repaint(); // 窗口尚未就绪/聚焦，下一帧继续
+            }
+        }
 
         let current_theme = self.settings_mgr.settings().theme;
         if current_theme != self.last_theme {
@@ -288,6 +312,45 @@ impl App for SettingsPanelApp {
     }
 }
 
+/// 强制窗口置为前台并获得键盘焦点。
+/// 返回是否已成功聚焦（前台窗口即本窗口）。
+#[cfg(target_os = "windows")]
+fn force_foreground(frame: &Frame) -> bool {
+    let Some(window) = frame.winit_window() else {
+        return false;
+    };
+    let Ok(handle) = window.window_handle() else {
+        return false;
+    };
+    let RawWindowHandle::Win32(h) = handle.as_raw() else {
+        return false;
+    };
+
+    let hwnd = HWND(h.hwnd.get() as *mut c_void);
+    unsafe {
+        // 前台锁：仅前台进程（或其直接启动的进程）可调用 SetForegroundWindow。
+        // daemon 为后台进程，其拉起的设置面板默认拿不到焦点；经典解法是
+        // AttachThreadInput 将本线程输入队列挂到前台窗口线程后即可抢占前台。
+        let foreground = GetForegroundWindow();
+        let foreground_thread = GetWindowThreadProcessId(foreground, None);
+        let current_thread = GetCurrentThreadId();
+        if foreground_thread != 0 && foreground_thread != current_thread {
+            let _ = AttachThreadInput(current_thread, foreground_thread, true);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = AttachThreadInput(current_thread, foreground_thread, false);
+        } else {
+            let _ = SetForegroundWindow(hwnd);
+        }
+        let _ = BringWindowToTop(hwnd);
+        GetForegroundWindow() == hwnd
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn force_foreground(_frame: &Frame) -> bool {
+    true
+}
+
 /// 运行设置面板（阻塞当前线程）
 pub fn run_settings_panel(settings_mgr: SettingsManager) {
     // daemon 在后台线程中调用本函数；Windows 上 winit 默认要求事件循环
@@ -303,7 +366,8 @@ pub fn run_settings_panel(settings_mgr: SettingsManager) {
     let options = NativeOptions {
         viewport: ViewportBuilder::default()
             .with_inner_size([480.0, 360.0])
-            .with_title("黑洞输入法设置"),
+            .with_title("黑洞输入法设置")
+            .with_active(true),
         event_loop_builder,
         ..Default::default()
     };
