@@ -17,13 +17,12 @@ use std::process;
 const SIZES: [u16; 5] = [256, 64, 48, 32, 16];
 
 fn main() {
-    let repo_root =
-        PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into()))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf();
+    let repo_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into()))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
 
     let args: Vec<String> = env::args().collect();
     let svg_path = args

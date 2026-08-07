@@ -90,8 +90,7 @@ impl From<IpcResponse> for SchemeResult {
 
 /// IPC 通信辅助函数：发送请求到 stream
 pub fn send_request<W: Write>(writer: &mut W, request: &IpcRequest) -> Result<(), io::Error> {
-    let json = to_string(request)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let json = to_string(request).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     writeln!(writer, "{}", json)?;
     writer.flush()?;
     Ok(())
@@ -101,8 +100,8 @@ pub fn send_request<W: Write>(writer: &mut W, request: &IpcRequest) -> Result<()
 pub fn read_response<R: BufRead>(reader: &mut R) -> Result<IpcResponse, io::Error> {
     let mut line = String::new();
     reader.read_line(&mut line)?;
-    let response: IpcResponse = from_str(line.trim())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let response: IpcResponse =
+        from_str(line.trim()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(response)
 }
 

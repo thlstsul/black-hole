@@ -6,8 +6,8 @@ use std::env;
 use std::mem;
 use std::slice;
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ, RegCloseKey,
-    RegCreateKeyW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ, RegCloseKey, RegCreateKeyW,
+    RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
 use windows_core::PCWSTR;
 
@@ -23,11 +23,7 @@ unsafe fn open_run_key(create: bool) -> Result<HKEY, PlatformError> {
     let result = unsafe {
         if create {
             // RegCreateKeyW 等价于带 KEY_ALL_ACCESS 的打开/创建
-            RegCreateKeyW(
-                HKEY_CURRENT_USER,
-                PCWSTR(key_w.as_ptr()),
-                &mut hkey,
-            )
+            RegCreateKeyW(HKEY_CURRENT_USER, PCWSTR(key_w.as_ptr()), &mut hkey)
         } else {
             RegOpenKeyExW(
                 HKEY_CURRENT_USER,
@@ -65,18 +61,10 @@ pub(super) fn set(enabled: bool) -> Result<(), PlatformError> {
         if enabled {
             let value_w = current_exe_quoted()?;
             let hkey = open_run_key(true)?;
-            let bytes = slice::from_raw_parts(
-                value_w.as_ptr() as *const u8,
-                value_w.len() * 2,
-            );
+            let bytes = slice::from_raw_parts(value_w.as_ptr() as *const u8, value_w.len() * 2);
             let name_w = value_name_w();
-            let result = RegSetValueExW(
-                hkey,
-                PCWSTR(name_w.as_ptr()),
-                Some(0),
-                REG_SZ,
-                Some(bytes),
-            );
+            let result =
+                RegSetValueExW(hkey, PCWSTR(name_w.as_ptr()), Some(0), REG_SZ, Some(bytes));
             let _ = RegCloseKey(hkey);
             if result.0 != 0 {
                 return Err(PlatformError::Other(format!(

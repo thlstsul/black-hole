@@ -1,10 +1,10 @@
+#[cfg(test)]
+use crate::RawEntry;
+use crate::punctuation::convert_punctuation;
 use crate::{
     CandidateRanker, Codec, CodecState, Dictionary, GraphDecoder, InputScheme, RimeDict,
     ShuangpinCodec, SimpleRanker, UserDictionary, global_user_dict, sort_candidates,
 };
-use crate::punctuation::convert_punctuation;
-#[cfg(test)]
-use crate::RawEntry;
 use black_hole_shared::candidate_layout::{
     EXPANDED_AVAILABLE_WIDTH, GridDirection, digit_to_candidate_index_excluding,
     navigate_grid_excluding,

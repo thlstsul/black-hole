@@ -225,7 +225,10 @@ pub(crate) fn try_reconnect_ipc(inner_arc: &Arc<Mutex<ServiceInner>>) -> bool {
     let addr: SocketAddr = match IPC_SERVER_ADDR.parse() {
         Ok(a) => a,
         Err(_) => {
-            error!("try_reconnect_ipc: invalid IPC address: {}", IPC_SERVER_ADDR);
+            error!(
+                "try_reconnect_ipc: invalid IPC address: {}",
+                IPC_SERVER_ADDR
+            );
             return false;
         }
     };
@@ -242,7 +245,10 @@ pub(crate) fn try_reconnect_ipc(inner_arc: &Arc<Mutex<ServiceInner>>) -> bool {
                 writer: stream,
                 reader,
             });
-            info!("try_reconnect_ipc: connected to daemon at {}", IPC_SERVER_ADDR);
+            info!(
+                "try_reconnect_ipc: connected to daemon at {}",
+                IPC_SERVER_ADDR
+            );
             true
         }
         Err(e) => {

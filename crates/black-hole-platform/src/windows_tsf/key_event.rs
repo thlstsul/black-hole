@@ -1,14 +1,14 @@
 use super::commit::apply_result;
 use super::{ServiceInner, try_reconnect_ipc};
-use black_hole_shared::{KeyEvent, KeyState, Modifiers};
 use crate::ipc::{IpcRequest, read_response, send_request};
+use black_hole_shared::{KeyEvent, KeyState, Modifiers};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 use tracing::{error, warn};
 use windows::Win32::Foundation::{E_UNEXPECTED, LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT,
-    VK_SHIFT, VK_SPACE, VK_UP, VIRTUAL_KEY,
+    GetAsyncKeyState, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN,
+    VK_RIGHT, VK_SHIFT, VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::TextServices::{ITfEditSession, ITfEditSession_Impl};
 use windows_core::{BOOL, Error, Result, implement};
@@ -87,12 +87,8 @@ pub(crate) fn virtual_key_to_key_event(
         }
     };
 
-    let shift =
-        unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) }
-            < 0;
-    let ctrl = unsafe {
-        GetAsyncKeyState(VK_CONTROL.0 as i32)
-    } < 0;
+    let shift = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } < 0;
+    let ctrl = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0;
     let alt = unsafe { GetAsyncKeyState(0x12i32) } < 0;
     let capslock = (kbd_state[0x14] & 0x01) != 0;
 

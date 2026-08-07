@@ -7,8 +7,8 @@ use std::slice;
 use std::sync::{Arc, Mutex};
 use windows::Win32::UI::TextServices::{
     ITfCompositionSink, ITfContext, ITfContextComposition, ITfEditSession, ITfEditSession_Impl,
-    ITfInsertAtSelection, ITfSource, ITfTextLayoutSink, TF_AE_NONE, TF_ANCHOR_END, TF_IAS_QUERYONLY,
-    TF_SELECTION, TF_SELECTIONSTYLE,
+    ITfInsertAtSelection, ITfSource, ITfTextLayoutSink, TF_AE_NONE, TF_ANCHOR_END,
+    TF_IAS_QUERYONLY, TF_SELECTION, TF_SELECTIONSTYLE,
 };
 use windows_core::{BOOL, Interface, Result, implement};
 
@@ -172,9 +172,7 @@ pub(crate) fn apply_result(
                 let Ok(collapsed) = (unsafe { range.Clone() }) else {
                     return Ok(());
                 };
-                let _ = unsafe {
-                    collapsed.Collapse(ec, TF_ANCHOR_END)
-                };
+                let _ = unsafe { collapsed.Collapse(ec, TF_ANCHOR_END) };
                 let mut sel = TF_SELECTION {
                     range: mem::ManuallyDrop::new(Some(collapsed)),
                     style: TF_SELECTIONSTYLE {

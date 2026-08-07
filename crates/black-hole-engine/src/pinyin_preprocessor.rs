@@ -181,10 +181,7 @@ mod tests {
 
         let variants = preprocessor.preprocess("zhong");
         // 确保没有重复
-        let unique_count = variants
-            .iter()
-            .collect::<HashSet<_>>()
-            .len();
+        let unique_count = variants.iter().collect::<HashSet<_>>().len();
         assert_eq!(variants.len(), unique_count);
     }
 }

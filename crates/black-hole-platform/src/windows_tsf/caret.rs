@@ -11,8 +11,8 @@ use windows::Win32::UI::TextServices::{
 use windows::Win32::UI::WindowsAndMessaging::{
     GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
 };
-use windows_core::{BOOL, Result};
 use windows_core::implement;
+use windows_core::{BOOL, Result};
 
 /// Get the screen coordinates of the current caret position.
 ///

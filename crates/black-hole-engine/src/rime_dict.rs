@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info};
 
 use ::rime_dict::{
-    DictYaml, Error, INDEX_CODE_MAX_LENGTH, Prism, PrismBuilder, SpellingAlgebra, SyllableId, Table,
-    TableBuilder, crc32,
+    DictYaml, Error, INDEX_CODE_MAX_LENGTH, Prism, PrismBuilder, SpellingAlgebra, SyllableId,
+    Table, TableBuilder, crc32,
 };
 use self_cell::self_cell;
 #[cfg(test)]
@@ -1209,7 +1209,10 @@ mod tests {
         // 同时测试 prefix_lookup
         let prefix_candidates = dict.prefix_lookup("tan");
         let prefix_texts: Vec<&str> = prefix_candidates.iter().map(|c| c.text.as_str()).collect();
-        println!("\nprefix_lookup('tan') returned {} candidates", prefix_candidates.len());
+        println!(
+            "\nprefix_lookup('tan') returned {} candidates",
+            prefix_candidates.len()
+        );
         for (i, c) in prefix_candidates.iter().enumerate() {
             println!("  {}: {} (score={})", i, c.text, c.score);
         }

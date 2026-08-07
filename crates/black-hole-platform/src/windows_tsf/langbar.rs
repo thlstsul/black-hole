@@ -7,8 +7,8 @@
 
 use super::service::apply_input_mode_toggle;
 use super::{CLSID_BLACKHOLE_TIP, ServiceInner, send_ui_command_inner};
-use black_hole_shared::{SchemeId, Theme, UiCommand};
 use crate::auto_start::is_auto_start;
+use black_hole_shared::{SchemeId, Theme, UiCommand};
 use std::ffi::c_void;
 use std::mem;
 use std::ptr;
@@ -43,7 +43,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WINDOW_EX_STYLE, WM_NULL, WS_POPUP,
 };
 use windows_core::{
-    BOOL, BSTR, GUID, Interface, IUnknown, PCSTR, PCWSTR, Ref, Result, implement, w,
+    BOOL, BSTR, GUID, IUnknown, Interface, PCSTR, PCWSTR, Ref, Result, implement, w,
 };
 
 // ---------------------------------------------------------------------------
@@ -495,12 +495,7 @@ impl ITfLangBarItem_Impl for BlackHoleLangBarItem_Impl {
 }
 
 impl ITfLangBarItemButton_Impl for BlackHoleLangBarItem_Impl {
-    fn OnClick(
-        &self,
-        click: TfLBIClick,
-        pt: &POINT,
-        _prcarea: *const RECT,
-    ) -> Result<()> {
+    fn OnClick(&self, click: TfLBIClick, pt: &POINT, _prcarea: *const RECT) -> Result<()> {
         debug!("LangBarItem::OnClick called: click={:?}", click.0);
         // Windows 8+ 对 GUID_LBI_INPUTMODE 项通常走 OnClick 而不是 InitMenu，
         // 因此左右键统一弹出上下文菜单。
@@ -658,11 +653,7 @@ impl ITfLangBarItemButton_Impl for BlackHoleLangBarItem_Impl {
 }
 
 impl ITfSource_Impl for BlackHoleLangBarItem_Impl {
-    fn AdviseSink(
-        &self,
-        riid: *const GUID,
-        punk: Ref<'_, IUnknown>,
-    ) -> Result<u32> {
+    fn AdviseSink(&self, riid: *const GUID, punk: Ref<'_, IUnknown>) -> Result<u32> {
         let riid_safe = unsafe { riid.as_ref().copied() };
         debug!("LangBarItem::AdviseSink called: riid={:?}", riid_safe);
 
@@ -741,11 +732,7 @@ fn add_submenu(menu: &ITfMenu, flags: u32, text: &str) -> Result<ITfMenu> {
 // 图标辅助函数
 // ---------------------------------------------------------------------------
 
-fn render_scheme_icon(
-    scheme: SchemeId,
-    theme: Theme,
-    english: bool,
-) -> Result<HICON> {
+fn render_scheme_icon(scheme: SchemeId, theme: Theme, english: bool) -> Result<HICON> {
     const SIZE: i32 = 16;
     const PX_COUNT: usize = (SIZE * SIZE) as usize;
 

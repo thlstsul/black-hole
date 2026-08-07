@@ -8,10 +8,7 @@ use tracing::info;
 use tracing_subscriber::fmt;
 
 fn main() {
-    fmt()
-        .with_target(false)
-        .without_time()
-        .init();
+    fmt().with_target(false).without_time().init();
 
     let args: Vec<String> = env::args().collect();
     let mut dict_path: Option<&str> = None;

@@ -80,12 +80,13 @@ pub(crate) fn unregister_service(thread_id: u32) {
     };
     if empty
         && let Ok(mut hook_guard) = HOOK.lock()
-            && let Some(raw) = hook_guard.take() {
-                let hook = HHOOK(raw as *mut c_void);
-                unsafe {
-                    let _ = UnhookWindowsHookEx(hook);
-                }
-            }
+        && let Some(raw) = hook_guard.take()
+    {
+        let hook = HHOOK(raw as *mut c_void);
+        unsafe {
+            let _ = UnhookWindowsHookEx(hook);
+        }
+    }
 }
 
 /// 安装 WH_KEYBOARD_LL 钩子（进程内幂等）。

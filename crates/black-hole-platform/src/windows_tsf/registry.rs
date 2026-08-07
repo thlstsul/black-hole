@@ -219,11 +219,10 @@ extern "system" fn DllRegisterServer() -> HRESULT {
                 }
             }
 
-            if let Ok(profiles) = CoCreateInstance::<
-                Option<&IUnknown>,
-                ITfInputProcessorProfiles,
-            >(
-                &CLSID_TF_INPUTPROCESSORPROFILES, None, CLSCTX_INPROC_SERVER
+            if let Ok(profiles) = CoCreateInstance::<Option<&IUnknown>, ITfInputProcessorProfiles>(
+                &CLSID_TF_INPUTPROCESSORPROFILES,
+                None,
+                CLSCTX_INPROC_SERVER,
             ) {
                 let _ = profiles.Register(&CLSID_BLACKHOLE_TIP);
             }

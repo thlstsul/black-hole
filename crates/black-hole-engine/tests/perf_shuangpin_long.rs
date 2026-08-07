@@ -39,7 +39,8 @@ fn real_dict() -> Arc<RimeDict> {
     );
     let cache_dir = default_user_dict_dir().join("cache");
     Arc::new(
-        RimeDict::from_rime_dict_cached(dict_path, &cache_dir).expect("failed to load rime_ice dict"),
+        RimeDict::from_rime_dict_cached(dict_path, &cache_dir)
+            .expect("failed to load rime_ice dict"),
     )
 }
 
@@ -95,8 +96,7 @@ fn bench_shuangpin_long_input() {
     // 回归断言：排除冷启动首键后，42 键输入逐键平均应可控。
     // 修复前该输入平均约 990ms/键（最大 3s），阈值放宽到 50ms 仍能抓住回归。
     let steady: Vec<_> = per_key.iter().skip(1).collect();
-    let avg_ms =
-        steady.iter().map(|d| d.as_secs_f64()).sum::<f64>() / steady.len() as f64 * 1000.0;
+    let avg_ms = steady.iter().map(|d| d.as_secs_f64()).sum::<f64>() / steady.len() as f64 * 1000.0;
     println!("[极长] 除首键外平均 {:.2}ms/键", avg_ms);
     assert!(
         avg_ms < 50.0,
