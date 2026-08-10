@@ -428,15 +428,20 @@ fn render_candidate_item(
     );
 }
 
-/// 计算当前应渲染的候选下标窗口 [start, end)：最多 max_candidates 项，
-/// 且始终包含引擎的选中索引，保证 UI 高亮与引擎实际选择一致。
+/// 计算当前应渲染的候选下标窗口 [start, end)：
+/// - 展开状态：返回完整列表，由 ScrollArea 负责滚动，避免候选被截断
+/// - 折叠状态：最多 max_candidates 项，且始终包含引擎的选中索引，
+///   保证 UI 高亮与引擎实际选择一致。
 fn display_window(state: &AppState) -> (usize, usize) {
     let len = state.candidates.len();
+    if state.expanded {
+        return (0, len);
+    }
     let max = state.max_candidates.max(1);
     if len <= max {
         return (0, len);
     }
-    // 选中索引超出首屏窗口时，窗口跟随滚动以包含选中项
+    // 折叠状态：选中索引超出首屏窗口时，窗口跟随滚动以包含选中项
     let end = (state.selected_index + 1).max(max).min(len);
     let start = end - max;
     (start, end)
