@@ -2,6 +2,7 @@
 
 mod app;
 mod args;
+mod completion;
 
 use std::process;
 

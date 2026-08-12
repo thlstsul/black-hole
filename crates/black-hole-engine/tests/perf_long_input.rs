@@ -24,11 +24,7 @@ fn key_event(key: &str) -> KeyEvent {
 }
 
 fn ctx() -> InputContext {
-    InputContext {
-        caret_x: 0,
-        caret_y: 0,
-        caret_h: 20,
-    }
+    InputContext::caret(0, 0, 20)
 }
 
 /// 加载真实词库（rime_ice，复用 daemon 的缓存目录）

@@ -87,6 +87,10 @@ impl SettingsPanelApp {
                 b.switch_scheme = defaults.switch_scheme;
                 restored = true;
             }
+            if b.commit_sentence.trim().is_empty() {
+                b.commit_sentence = defaults.commit_sentence;
+                restored = true;
+            }
         }
         restored
     }
@@ -212,6 +216,12 @@ impl App for SettingsPanelApp {
                             bindings_commit |= resp.lost_focus();
                         });
                         ui.horizontal(|ui| {
+                            ui.label("整句上屏:");
+                            let resp =
+                                ui.text_edit_singleline(&mut settings.key_bindings.commit_sentence);
+                            bindings_commit |= resp.lost_focus();
+                        });
+                        ui.horizontal(|ui| {
                             ui.label("取消:");
                             let resp = ui.text_edit_singleline(&mut settings.key_bindings.cancel);
                             bindings_commit |= resp.lost_focus();
@@ -219,6 +229,66 @@ impl App for SettingsPanelApp {
                         // 说明：切换方案组合键（默认 Ctrl+Shift+F12）当前未被引擎消费，
                         // 平台层也会丢弃功能键事件，故不提供编辑器，避免无效配置项。
                         ui.label("提示：切换方案快捷键暂不支持自定义");
+                    });
+
+                    ui.add_space(8.0);
+
+                    ui.group(|ui| {
+                        ui.label("整句补全（LLM）");
+                        ui.horizontal(|ui| {
+                            changed |= ui
+                                .checkbox(&mut settings.llm_completion.enabled, "启用 LLM 整句补全")
+                                .changed();
+                        });
+                        ui.label("补全请求会将当前选中词发送到以下端点，请确认隐私策略后再开启。");
+                        ui.horizontal(|ui| {
+                            ui.label("端点:");
+                            changed |= ui
+                                .text_edit_singleline(&mut settings.llm_completion.endpoint)
+                                .changed();
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("模型:");
+                            changed |= ui
+                                .text_edit_singleline(&mut settings.llm_completion.model)
+                                .changed();
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("API Key:");
+                            changed |= ui
+                                .text_edit_singleline(&mut settings.llm_completion.api_key)
+                                .changed();
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("最大 Tokens:");
+                            changed |= ui
+                                .add(
+                                    DragValue::new(&mut settings.llm_completion.max_tokens)
+                                        .speed(8)
+                                        .range(16..=1024),
+                                )
+                                .changed();
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("温度:");
+                            changed |= ui
+                                .add(
+                                    DragValue::new(&mut settings.llm_completion.temperature)
+                                        .speed(0.05)
+                                        .range(0.0..=1.5),
+                                )
+                                .changed();
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("超时(ms):");
+                            changed |= ui
+                                .add(
+                                    DragValue::new(&mut settings.llm_completion.timeout_ms)
+                                        .speed(500)
+                                        .range(500..=60000),
+                                )
+                                .changed();
+                        });
                     });
                 }
 

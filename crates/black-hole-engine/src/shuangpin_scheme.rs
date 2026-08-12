@@ -9,7 +9,9 @@ use black_hole_shared::candidate_layout::{
     EXPANDED_AVAILABLE_WIDTH, GridDirection, digit_to_candidate_index_excluding,
     navigate_grid_excluding,
 };
-use black_hole_shared::{Candidate, InputContext, KeyEvent, KeyState, SchemeId, SchemeResult};
+use black_hole_shared::{
+    Candidate, CompletionHint, InputContext, KeyEvent, KeyState, SchemeId, SchemeResult,
+};
 use rustc_hash::FxHashMap;
 use std::collections::HashSet;
 #[cfg(test)]
@@ -32,6 +34,8 @@ pub struct ShuangpinScheme {
     last_query: Option<(String, Vec<Candidate>)>,
     expanded: bool,
     selected_index: usize,
+    /// LLM 整句补全结果（异步到达，Tab 提交时校验后拼入上屏文本）
+    completion: Option<CompletionHint>,
     /// 临时英文输入缓冲（大写字母开头时进入）
     english_buffer: Option<String>,
 }
@@ -53,6 +57,7 @@ impl ShuangpinScheme {
             last_query: None,
             expanded: false,
             selected_index: 0,
+            completion: None,
             english_buffer: None,
         }
     }
@@ -67,6 +72,7 @@ impl ShuangpinScheme {
             last_query: None,
             expanded: false,
             selected_index: 0,
+            completion: None,
             english_buffer: None,
         }
     }
@@ -382,6 +388,31 @@ impl InputScheme for ShuangpinScheme {
                 self.selected_index = 0;
                 return SchemeResult::Committed { text };
             }
+            "Tab" => {
+                // 整句上屏：校验 LLM 补全仍匹配当前编码与选中项，匹配则拼入
+                let candidates = self.current_candidates();
+                if candidates.is_empty() {
+                    return SchemeResult::Ignored;
+                }
+                let idx = self.selected_index.min(candidates.len().saturating_sub(1));
+                let base = candidates[idx].text.clone();
+                // 只记录选中词部分上屏词频，LLM 预测的补全部分不写入用户词典，
+                // 避免模型输出污染候选排序（须在 base 被 move 进 text 前记录）
+                self.record_user_commit(&base);
+                let text = if let Some(hint) = &self.completion
+                    && hint.matches(self.codec.code(), self.selected_index)
+                {
+                    format!("{}{}", base, hint.text)
+                } else {
+                    base
+                };
+                self.codec.reset();
+                self.expanded = false;
+                self.selected_index = 0;
+                self.last_query = None;
+                self.completion = None;
+                return SchemeResult::Committed { text };
+            }
             "ArrowLeft" => {
                 let candidates = self.current_candidates();
                 if candidates.is_empty() || !self.expanded {
@@ -592,11 +623,16 @@ impl InputScheme for ShuangpinScheme {
         Some(SchemeResult::Committed { text })
     }
 
+    fn update_completion(&mut self, completion: Option<CompletionHint>) {
+        self.completion = completion;
+    }
+
     fn reset(&mut self) {
         self.codec.reset();
         self.last_query = None;
         self.expanded = false;
         self.selected_index = 0;
+        self.completion = None;
         self.english_buffer = None;
     }
 }
@@ -642,11 +678,7 @@ mod tests {
         let dict = build_dict(&[("le", "了", 100), ("leng", "冷", 200)]);
 
         let mut scheme = ShuangpinScheme::with_dictionary(Box::new(dict));
-        let ctx = InputContext {
-            caret_x: 0,
-            caret_y: 0,
-            caret_h: 20,
-        };
+        let ctx = InputContext::caret(0, 0, 20);
 
         // 双拼输入 "le" -> 全拼 "le"
         for ch in ["l", "e"] {
@@ -670,11 +702,7 @@ mod tests {
     fn test_shuangpin_le_builtin_dict() {
         // 使用内置词典测试
         let mut scheme = ShuangpinScheme::new();
-        let ctx = InputContext {
-            caret_x: 0,
-            caret_y: 0,
-            caret_h: 20,
-        };
+        let ctx = InputContext::caret(0, 0, 20);
 
         // 双拼输入 "le" -> 全拼 "le"
         for ch in ["l", "e"] {
@@ -702,11 +730,7 @@ mod tests {
 
         let dict = RimeDict::from_rime_dict_cached(dict_path, env::temp_dir()).unwrap();
         let mut scheme = ShuangpinScheme::with_dictionary(Box::new(dict));
-        let ctx = InputContext {
-            caret_x: 0,
-            caret_y: 0,
-            caret_h: 20,
-        };
+        let ctx = InputContext::caret(0, 0, 20);
 
         // 双拼输入 "le" -> 全拼 "le"
         for ch in ["l", "e"] {
@@ -730,11 +754,7 @@ mod tests {
         let dict = build_dict(&[("leng", "冷", 200), ("lei", "类", 150)]);
 
         let mut scheme = ShuangpinScheme::with_dictionary(Box::new(dict));
-        let ctx = InputContext {
-            caret_x: 0,
-            caret_y: 0,
-            caret_h: 20,
-        };
+        let ctx = InputContext::caret(0, 0, 20);
 
         for ch in ["l", "e"] {
             let _ = scheme.handle_key(&key_event(ch), &ctx);
@@ -758,11 +778,7 @@ mod tests {
             return;
         }
 
-        let ctx = InputContext {
-            caret_x: 0,
-            caret_y: 0,
-            caret_h: 20,
-        };
+        let ctx = InputContext::caret(0, 0, 20);
 
         // 手动加载外部词典，分别构建拼音和双拼引擎（避免用户词典干扰）
         let cache_dir = env::temp_dir();
@@ -817,11 +833,7 @@ mod tests {
         let user_dict = Arc::new(Mutex::new(UserDictionary::open_in_memory()));
         let mut scheme =
             ShuangpinScheme::with_dictionary(Box::new(dict)).with_user_dict(user_dict.clone());
-        let ctx = InputContext {
-            caret_x: 0,
-            caret_y: 0,
-            caret_h: 20,
-        };
+        let ctx = InputContext::caret(0, 0, 20);
 
         // 第一次输入 uu -> shu
         for ch in ["u", "u"] {
@@ -873,11 +885,7 @@ mod tests {
             ("ni", "嫟", 100),
         ]);
         let mut scheme = ShuangpinScheme::with_dictionary(Box::new(dict));
-        let ctx = InputContext {
-            caret_x: 0,
-            caret_y: 0,
-            caret_h: 20,
-        };
+        let ctx = InputContext::caret(0, 0, 20);
 
         for ch in ["n", "i"] {
             let _ = scheme.handle_key(&key_event(ch), &ctx);
@@ -903,5 +911,50 @@ mod tests {
             let texts: Vec<&str> = candidates.iter().map(|c| c.text.as_str()).collect();
             assert_eq!(initial_texts, texts, "导航 {} 后候选顺序发生变动", key);
         }
+    }
+
+    #[test]
+    fn test_shuangpin_tab_commits_with_completion() {
+        let dict = build_dict(&[("shu", "书", 200)]);
+        let mut scheme = ShuangpinScheme::with_dictionary(Box::new(dict));
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 输入 uu -> shu，首选应为 "书"
+        for ch in ["u", "u"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+
+        // 先给一个不匹配的编码（错误编码），Tab 应回退为仅选中词
+        scheme.update_completion(Some(CompletionHint {
+            code: "yy".to_string(),
+            selected_index: 0,
+            text: "本".to_string(),
+        }));
+        let result = scheme.handle_key(&key_event("Tab"), &ctx);
+        assert_eq!(
+            result,
+            SchemeResult::Committed {
+                text: "书".to_string()
+            },
+            "编码不匹配时 Tab 应回退为仅提交选中词"
+        );
+
+        // 重新输入 uu，给正确编码的补全：uu + 首选索引 0，补全 "本"
+        for ch in ["u", "u"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        scheme.update_completion(Some(CompletionHint {
+            code: "uu".to_string(),
+            selected_index: 0,
+            text: "本".to_string(),
+        }));
+        let result = scheme.handle_key(&key_event("Tab"), &ctx);
+        assert_eq!(
+            result,
+            SchemeResult::Committed {
+                text: "书本".to_string()
+            },
+            "编码匹配时 Tab 应将选中词与补全拼为整句上屏"
+        );
     }
 }

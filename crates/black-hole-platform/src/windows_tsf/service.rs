@@ -449,6 +449,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
                     "Backspace"
                         | "Enter"
                         | "Space"
+                        | "Tab"
                         | "ArrowLeft"
                         | "ArrowRight"
                         | "ArrowUp"

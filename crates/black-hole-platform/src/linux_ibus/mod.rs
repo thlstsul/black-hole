@@ -244,11 +244,7 @@ impl IbusEngine {
     /// 更新光标位置
     async fn set_cursor_location(&self, x: i32, y: i32, _w: i32, h: i32) {
         let engine_tx = self.engine_tx.lock().unwrap();
-        let ctx = InputContext {
-            caret_x: x,
-            caret_y: y,
-            caret_h: h,
-        };
+        let ctx = InputContext::caret(x, y, h);
         *self.context.lock().unwrap() = ctx.clone();
         let _ = engine_tx.send(EngineCommand::SetContext(ctx));
     }
@@ -325,6 +321,7 @@ fn convert_keyval(keyval: u32, state: u32) -> Option<KeyEvent> {
         0xFF08 => "Backspace".to_string(),
         0xFF0D => "Enter".to_string(),
         0xFF1B => "Escape".to_string(),
+        0xFF09 => "Tab".to_string(),
         0x0020 => "Space".to_string(),
         0xFF52 => "ArrowUp".to_string(),
         0xFF54 => "ArrowDown".to_string(),

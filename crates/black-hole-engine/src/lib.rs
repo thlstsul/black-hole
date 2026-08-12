@@ -16,7 +16,8 @@ pub mod user_dict;
 use std::borrow::Cow;
 
 use black_hole_shared::{
-    Candidate, EngineCommand, InputContext, KeyBindings, KeyEvent, SchemeId, SchemeResult,
+    Candidate, CompletionHint, EngineCommand, InputContext, KeyBindings, KeyEvent, SchemeId,
+    SchemeResult,
 };
 pub use builder::EngineBuilder;
 pub use graph_decoder::{DecodeResult, GraphDecoder, ScoringConfig, ScoringConfigBuilder};
@@ -42,6 +43,8 @@ pub trait InputScheme: Send {
     fn handle_key(&mut self, key: &KeyEvent, ctx: &InputContext) -> SchemeResult;
     fn select_candidate(&mut self, index: usize) -> Option<SchemeResult>;
     fn reset(&mut self);
+    /// 接收 LLM 整句补全结果（异步到达），供 Tab 上屏时校验后拼入
+    fn update_completion(&mut self, _completion: Option<CompletionHint>) {}
 }
 
 /// 编解码器：将原始按键序列转换为方案内部编码
@@ -174,6 +177,10 @@ impl Engine {
                 self.key_bindings = bindings.clone();
                 SchemeResult::Ignored
             }
+            EngineCommand::UpdateCompletion(completion) => {
+                self.scheme.update_completion(completion.clone());
+                SchemeResult::Ignored
+            }
             _ => SchemeResult::Ignored,
         }
     }
@@ -210,6 +217,10 @@ impl Engine {
             Some("Space")
         } else if plain == self.key_bindings.cancel && remappable(&self.key_bindings.cancel) {
             Some("Escape")
+        } else if plain == self.key_bindings.commit_sentence
+            && remappable(&self.key_bindings.commit_sentence)
+        {
+            Some("Tab")
         } else {
             None
         };
@@ -263,6 +274,7 @@ mod tests {
             commit: "f".to_string(),
             cancel: "d".to_string(),
             switch_scheme: "Ctrl+Shift+F12".to_string(),
+            commit_sentence: "Tab".to_string(),
         }
     }
 

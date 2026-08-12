@@ -9,7 +9,9 @@ use black_hole_shared::candidate_layout::{
     EXPANDED_AVAILABLE_WIDTH, GridDirection, digit_to_candidate_index_excluding,
     navigate_grid_excluding,
 };
-use black_hole_shared::{Candidate, InputContext, KeyEvent, KeyState, SchemeId, SchemeResult};
+use black_hole_shared::{
+    Candidate, CompletionHint, InputContext, KeyEvent, KeyState, SchemeId, SchemeResult,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 #[cfg(test)]
 use std::env;
@@ -38,6 +40,8 @@ pub struct PinyinScheme {
     expanded: bool,
     /// 当前选中的候选索引
     selected_index: usize,
+    /// LLM 整句补全结果（异步到达，Tab 提交时校验后拼入上屏文本）
+    completion: Option<CompletionHint>,
     /// 临时英文输入缓冲（大写字母开头时进入）
     english_buffer: Option<String>,
 }
@@ -64,6 +68,7 @@ impl PinyinScheme {
             cached_version: 0,
             expanded: false,
             selected_index: 0,
+            completion: None,
             english_buffer: None,
         }
     }
@@ -82,6 +87,7 @@ impl PinyinScheme {
             cached_version: 0,
             expanded: false,
             selected_index: 0,
+            completion: None,
             english_buffer: None,
         }
     }
@@ -401,6 +407,32 @@ impl InputScheme for PinyinScheme {
                 self.selected_index = 0;
                 SchemeResult::Committed { text }
             }
+            "Tab" => {
+                // 整句上屏：校验 LLM 补全仍匹配当前编码与选中项，匹配则拼入
+                let candidates = self.current_candidates();
+                if candidates.is_empty() {
+                    return SchemeResult::Ignored;
+                }
+                let idx = self.selected_index.min(candidates.len().saturating_sub(1));
+                let base = candidates[idx].text.clone();
+                // 只记录选中词部分上屏词频，LLM 预测的补全部分不写入用户词典，
+                // 避免模型输出污染候选排序（须在 base 被 move 进 text 前记录）
+                self.record_user_commit(&base);
+                let text = if let Some(hint) = &self.completion
+                    && hint.matches(&self.codec.full_code(), self.selected_index)
+                {
+                    format!("{}{}", base, hint.text)
+                } else {
+                    base
+                };
+                self.codec.reset();
+                self.input_version += 1;
+                self.expanded = false;
+                self.selected_index = 0;
+                self.last_query = None;
+                self.completion = None;
+                SchemeResult::Committed { text }
+            }
             "ArrowLeft" => {
                 let candidates = self.current_candidates();
                 if candidates.is_empty() || !self.expanded {
@@ -613,12 +645,17 @@ impl InputScheme for PinyinScheme {
         Some(SchemeResult::Committed { text })
     }
 
+    fn update_completion(&mut self, completion: Option<CompletionHint>) {
+        self.completion = completion;
+    }
+
     fn reset(&mut self) {
         self.codec.reset();
         self.input_version += 1;
         self.last_query = None; // 清除缓存
         self.expanded = false;
         self.selected_index = 0;
+        self.completion = None;
         self.english_buffer = None;
     }
 }
@@ -674,11 +711,7 @@ mod tests {
     fn test_pinyin_scheme_spaced_code_lookup() {
         let dict = build_dict_with_spaced_code();
         let mut scheme = PinyinScheme::with_dictionary(dict);
-        let ctx = InputContext {
-            caret_x: 0,
-            caret_y: 0,
-            caret_h: 20,
-        };
+        let ctx = InputContext::caret(0, 0, 20);
 
         // 输入 "zhongwen"
         for ch in ["z", "h", "o", "n", "g", "w", "e", "n"] {
@@ -701,11 +734,7 @@ mod tests {
     fn test_pinyin_scheme_single_syllable() {
         let dict = build_dict_with_spaced_code();
         let mut scheme = PinyinScheme::with_dictionary(dict);
-        let ctx = InputContext {
-            caret_x: 0,
-            caret_y: 0,
-            caret_h: 20,
-        };
+        let ctx = InputContext::caret(0, 0, 20);
 
         let result = scheme.handle_key(&key_event("a"), &ctx);
         if let SchemeResult::Composing { candidates, .. } = result {
@@ -719,11 +748,7 @@ mod tests {
     fn test_first_char_shows_candidates() {
         let dict = build_dict_with_spaced_code();
         let mut scheme = PinyinScheme::with_dictionary(dict);
-        let ctx = InputContext {
-            caret_x: 0,
-            caret_y: 0,
-            caret_h: 20,
-        };
+        let ctx = InputContext::caret(0, 0, 20);
 
         // 输入第一个字符 "z"，应能匹配到 "zhong" 前缀的候选 "中"
         let result = scheme.handle_key(&key_event("z"), &ctx);
@@ -747,11 +772,7 @@ mod tests {
     fn test_pinyin_scheme_multi_syllable() {
         let dict = build_dict_with_spaced_code();
         let mut scheme = PinyinScheme::with_dictionary(dict);
-        let ctx = InputContext {
-            caret_x: 0,
-            caret_y: 0,
-            caret_h: 20,
-        };
+        let ctx = InputContext::caret(0, 0, 20);
 
         // 输入 "abafu"
         for ch in ["a", "b", "a", "f", "u"] {
@@ -781,11 +802,7 @@ mod tests {
         ]);
 
         let mut scheme = PinyinScheme::with_dictionary(dict);
-        let ctx = InputContext {
-            caret_x: 0,
-            caret_y: 0,
-            caret_h: 20,
-        };
+        let ctx = InputContext::caret(0, 0, 20);
 
         // 输入 "zhuang"
         for ch in ["z", "h", "u", "a", "n", "g"] {
@@ -808,11 +825,7 @@ mod tests {
         let dict = build_dict(&[("zw", "中文", 50), ("zhong wen", "中文", 100)]);
 
         let mut scheme = PinyinScheme::with_dictionary(dict);
-        let ctx = InputContext {
-            caret_x: 0,
-            caret_y: 0,
-            caret_h: 20,
-        };
+        let ctx = InputContext::caret(0, 0, 20);
 
         // 输入 "zhongwen" 会生成简拼 "zw"
         for ch in ["z", "h", "o", "n", "g", "w", "e", "n"] {
@@ -851,11 +864,7 @@ mod tests {
     fn test_sentence_building_two_syllables() {
         let dict = build_dict_for_sentence_tests();
         let mut scheme = PinyinScheme::with_dictionary(dict);
-        let ctx = InputContext {
-            caret_x: 0,
-            caret_y: 0,
-            caret_h: 20,
-        };
+        let ctx = InputContext::caret(0, 0, 20);
 
         // 输入 "zhongguo"
         for ch in ["z", "h", "o", "n", "g", "g", "u"] {
@@ -884,11 +893,7 @@ mod tests {
     fn test_sentence_building_four_syllables() {
         let dict = build_dict_for_sentence_tests();
         let mut scheme = PinyinScheme::with_dictionary(dict);
-        let ctx = InputContext {
-            caret_x: 0,
-            caret_y: 0,
-            caret_h: 20,
-        };
+        let ctx = InputContext::caret(0, 0, 20);
 
         // 输入 "zhongguorenmin"
         for ch in [
@@ -939,11 +944,7 @@ mod tests {
         ]);
 
         let mut scheme = PinyinScheme::with_dictionary(dict);
-        let ctx = InputContext {
-            caret_x: 0,
-            caret_y: 0,
-            caret_h: 20,
-        };
+        let ctx = InputContext::caret(0, 0, 20);
 
         // 输入 "zhong"
         for ch in ["z", "h", "o", "n", "g"] {
@@ -981,11 +982,7 @@ mod tests {
         ]);
 
         let mut scheme = PinyinScheme::with_dictionary(dict);
-        let ctx = InputContext {
-            caret_x: 0,
-            caret_y: 0,
-            caret_h: 20,
-        };
+        let ctx = InputContext::caret(0, 0, 20);
 
         // 输入 "zhong"
         for ch in ["z", "h", "o", "n", "g"] {
@@ -1021,11 +1018,7 @@ mod tests {
 
         let dict = Arc::new(RimeDict::from_rime_dict_cached(dict_path, env::temp_dir()).unwrap());
         let mut scheme = PinyinScheme::with_dictionary(dict);
-        let ctx = InputContext {
-            caret_x: 0,
-            caret_y: 0,
-            caret_h: 20,
-        };
+        let ctx = InputContext::caret(0, 0, 20);
 
         // 输入 "zhong"
         for ch in ["z", "h", "o", "n", "g"] {
@@ -1063,11 +1056,7 @@ mod tests {
         ]);
 
         let mut scheme = PinyinScheme::with_dictionary(dict);
-        let ctx = InputContext {
-            caret_x: 0,
-            caret_y: 0,
-            caret_h: 20,
-        };
+        let ctx = InputContext::caret(0, 0, 20);
 
         // 输入 "zhongguo"
         for ch in ["z", "h", "o", "n", "g", "g", "u"] {
@@ -1106,11 +1095,7 @@ mod tests {
         ]);
 
         let mut scheme = PinyinScheme::with_dictionary(dict);
-        let ctx = InputContext {
-            caret_x: 0,
-            caret_y: 0,
-            caret_h: 20,
-        };
+        let ctx = InputContext::caret(0, 0, 20);
 
         // 输入 "abafu"
         for ch in ["a", "b", "a", "f", "u"] {
@@ -1133,5 +1118,135 @@ mod tests {
         } else {
             panic!("输入 abafu 后应处于 Composing 状态");
         }
+    }
+
+    #[test]
+    fn test_tab_commits_with_completion() {
+        let dict = build_dict(&[("zhong guo", "中国", 100), ("ren min", "人民", 100)]);
+        let mut scheme = PinyinScheme::with_dictionary(dict);
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 输入 "zhongguo"，首选应为 "中国"
+        let composing = {
+            for ch in ["z", "h", "o", "n", "g", "g", "u"] {
+                let _ = scheme.handle_key(&key_event(ch), &ctx);
+            }
+            scheme.handle_key(&key_event("o"), &ctx)
+        };
+        let first = match &composing {
+            SchemeResult::Composing { candidates, .. } if !candidates.is_empty() => {
+                candidates[0].text.clone()
+            }
+            other => panic!("输入 zhongguo 后应处于 Composing 状态，实际: {:?}", other),
+        };
+        assert_eq!(first, "中国");
+
+        // LLM 补全异步到达：编码 zhongguo、首选索引 0，补全 "人民"
+        scheme.update_completion(Some(CompletionHint {
+            code: "zhongguo".to_string(),
+            selected_index: 0,
+            text: "人民".to_string(),
+        }));
+
+        // 按 Tab：选中词 + 补全整句上屏
+        let result = scheme.handle_key(&key_event("Tab"), &ctx);
+        assert_eq!(
+            result,
+            SchemeResult::Committed {
+                text: "中国人民".to_string()
+            },
+            "Tab 应将选中词与补全拼为整句上屏"
+        );
+    }
+
+    #[test]
+    fn test_tab_falls_back_without_completion() {
+        let dict = build_dict(&[("zhong guo", "中国", 100)]);
+        let mut scheme = PinyinScheme::with_dictionary(dict);
+        let ctx = InputContext::caret(0, 0, 20);
+
+        for ch in ["z", "h", "o", "n", "g", "g", "u", "o"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+
+        // 无补全时 Tab 与 Space 行为一致：仅提交选中词
+        let result = scheme.handle_key(&key_event("Tab"), &ctx);
+        assert_eq!(
+            result,
+            SchemeResult::Committed {
+                text: "中国".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_tab_ignores_stale_completion() {
+        let dict = build_dict(&[("zhong guo", "中国", 100)]);
+        let mut scheme = PinyinScheme::with_dictionary(dict);
+        let ctx = InputContext::caret(0, 0, 20);
+
+        for ch in ["z", "h", "o", "n", "g", "g", "u", "o"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+
+        // 补全对应的编码与当前编码不一致（输入已变化），应视为过期丢弃
+        scheme.update_completion(Some(CompletionHint {
+            code: "zhong".to_string(),
+            selected_index: 0,
+            text: "国人".to_string(),
+        }));
+
+        let result = scheme.handle_key(&key_event("Tab"), &ctx);
+        assert_eq!(
+            result,
+            SchemeResult::Committed {
+                text: "中国".to_string()
+            },
+            "过期补全不应拼入上屏文本"
+        );
+    }
+
+    #[test]
+    fn test_tab_no_candidates_ignored() {
+        let dict = build_dict(&[("zhong guo", "中国", 100)]);
+        let mut scheme = PinyinScheme::with_dictionary(dict);
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 未输入任何编码时按 Tab 应 Ignored（不吞掉应用的 Tab 焦点切换）
+        assert_eq!(
+            scheme.handle_key(&key_event("Tab"), &ctx),
+            SchemeResult::Ignored
+        );
+    }
+
+    #[test]
+    fn test_reset_clears_completion() {
+        let dict = build_dict(&[("zhong guo", "中国", 100)]);
+        let mut scheme = PinyinScheme::with_dictionary(dict);
+        let ctx = InputContext::caret(0, 0, 20);
+
+        for ch in ["z", "h", "o", "n", "g", "g", "u", "o"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        scheme.update_completion(Some(CompletionHint {
+            code: "zhongguo".to_string(),
+            selected_index: 0,
+            text: "人民".to_string(),
+        }));
+        scheme.reset();
+
+        // reset 清空编码与补全；重新输入同样的编码后按 Tab，
+        // 补全已被清空，应只提交选中词"中国"
+        for ch in ["z", "h", "o", "n", "g", "g", "u", "o"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let result = scheme.handle_key(&key_event("Tab"), &ctx);
+        assert_eq!(
+            result,
+            SchemeResult::Committed {
+                text: "中国".to_string()
+            },
+            "reset 后补全应被清空"
+        );
     }
 }

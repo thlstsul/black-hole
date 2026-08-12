@@ -130,11 +130,7 @@ pub(crate) fn apply_result(
                 let mut inner = inner_arc.lock().unwrap();
                 inner.last_caret_pos = Some((caret_x, caret_y, caret_h));
                 drop(inner);
-                let context = InputContext {
-                    caret_x,
-                    caret_y,
-                    caret_h,
-                };
+                let context = InputContext::caret(caret_x, caret_y, caret_h);
                 let cmd = UiCommand::ShowCandidates {
                     code: code.clone(),
                     candidates: candidates.clone(),

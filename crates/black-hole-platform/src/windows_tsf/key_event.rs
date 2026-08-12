@@ -1,14 +1,15 @@
+use super::caret::read_surrounding_text;
 use super::commit::apply_result;
 use super::{ServiceInner, try_reconnect_ipc};
 use crate::ipc::{IpcRequest, read_response, send_request};
-use black_hole_shared::{KeyEvent, KeyState, Modifiers};
+use black_hole_shared::{InputContext, KeyEvent, KeyState, Modifiers};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 use tracing::{error, warn};
 use windows::Win32::Foundation::{E_UNEXPECTED, LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN,
-    VK_RIGHT, VK_SHIFT, VK_SPACE, VK_UP,
+    VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::TextServices::{ITfEditSession, ITfEditSession_Impl};
 use windows_core::{BOOL, Error, Result, implement};
@@ -67,6 +68,7 @@ pub(crate) fn virtual_key_to_key_event(
         VK_ESCAPE => "Escape".to_string(),
         VK_RETURN => "Enter".to_string(),
         VK_SPACE => "Space".to_string(),
+        VK_TAB => "Tab".to_string(),
         VK_LEFT => "ArrowLeft".to_string(),
         VK_RIGHT => "ArrowRight".to_string(),
         VK_UP => "ArrowUp".to_string(),
@@ -169,7 +171,25 @@ fn handle_key_event_internal(
     let result = catch_unwind(AssertUnwindSafe(|| {
         let mut inner = service.lock().unwrap();
         let ctx = inner.context.clone().ok_or(E_UNEXPECTED)?;
+        let composition = inner.composition.clone();
+        let last_caret_pos = inner.last_caret_pos;
         let conn = inner.ipc_conn.as_mut().ok_or(E_UNEXPECTED)?;
+
+        // 读取光标周围文本并同步给 daemon（供整句补全提供上下文）。
+        // SetContext 为单向请求（daemon 不写响应），随后 KeyEvent 正常请求-响应。
+        // 读取失败时静默跳过，不影响按键管线。
+        if let Some((caret_x, caret_y, caret_h)) = last_caret_pos {
+            let (preceding_text, following_text) =
+                read_surrounding_text(ec, &ctx, composition.as_ref());
+            let set_ctx = IpcRequest::SetContext(InputContext {
+                caret_x,
+                caret_y,
+                caret_h,
+                preceding_text,
+                following_text,
+            });
+            let _ = send_request(&mut conn.writer, &set_ctx);
+        }
 
         let request = IpcRequest::KeyEvent(key_event.clone());
         send_request(&mut conn.writer, &request).map_err(|_| E_UNEXPECTED)?;

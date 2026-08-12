@@ -26,11 +26,7 @@ fn builtin_scheme() -> PinyinScheme {
 fn test_performance_si_input() {
     // 测试输入 "si" 时的性能
     let mut scheme = builtin_scheme();
-    let ctx = InputContext {
-        caret_x: 0,
-        caret_y: 0,
-        caret_h: 20,
-    };
+    let ctx = InputContext::caret(0, 0, 20);
 
     let start = Instant::now();
 
@@ -55,11 +51,7 @@ fn test_performance_si_input() {
 fn test_performance_shu_input() {
     // 测试输入 "shu" 时的性能
     let mut scheme = builtin_scheme();
-    let ctx = InputContext {
-        caret_x: 0,
-        caret_y: 0,
-        caret_h: 20,
-    };
+    let ctx = InputContext::caret(0, 0, 20);
 
     let start = Instant::now();
 
@@ -86,11 +78,7 @@ fn test_performance_shu_input() {
 fn test_performance_shi_input() {
     // 测试输入 "shi" 时的性能（这是一个特别容易卡顿的例子）
     let mut scheme = builtin_scheme();
-    let ctx = InputContext {
-        caret_x: 0,
-        caret_y: 0,
-        caret_h: 20,
-    };
+    let ctx = InputContext::caret(0, 0, 20);
 
     let start = Instant::now();
 
@@ -117,11 +105,7 @@ fn test_performance_shi_input() {
 fn test_performance_zhuang_input() {
     // 测试输入 "zhuang" 时的性能（6个字母，容易产生大量切分）
     let mut scheme = builtin_scheme();
-    let ctx = InputContext {
-        caret_x: 0,
-        caret_y: 0,
-        caret_h: 20,
-    };
+    let ctx = InputContext::caret(0, 0, 20);
 
     let start = Instant::now();
 
@@ -145,11 +129,7 @@ fn test_performance_zhuang_input() {
 fn test_performance_delete_si() {
     // 测试删除 "si" 的 "i" 时的性能
     let mut scheme = builtin_scheme();
-    let ctx = InputContext {
-        caret_x: 0,
-        caret_y: 0,
-        caret_h: 20,
-    };
+    let ctx = InputContext::caret(0, 0, 20);
 
     // 先输入 "si"
     let _ = scheme.handle_key(&key_event("s"), &ctx);
@@ -174,11 +154,7 @@ fn test_performance_delete_si() {
 fn test_performance_delete_shu() {
     // 测试删除 "shu" 的 "u" 时的性能
     let mut scheme = builtin_scheme();
-    let ctx = InputContext {
-        caret_x: 0,
-        caret_y: 0,
-        caret_h: 20,
-    };
+    let ctx = InputContext::caret(0, 0, 20);
 
     // 先输入 "shu"
     let _ = scheme.handle_key(&key_event("s"), &ctx);
@@ -204,11 +180,7 @@ fn test_performance_delete_shu() {
 fn test_performance_delete_shi() {
     // 测试删除 "shi" 的 "i" 时的性能（特别容易卡顿的例子）
     let mut scheme = builtin_scheme();
-    let ctx = InputContext {
-        caret_x: 0,
-        caret_y: 0,
-        caret_h: 20,
-    };
+    let ctx = InputContext::caret(0, 0, 20);
 
     // 先输入 "shi"
     let _ = scheme.handle_key(&key_event("s"), &ctx);

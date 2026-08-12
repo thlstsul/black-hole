@@ -23,6 +23,15 @@ pub(crate) struct AppState {
     font_size: u32,
     /// 最大候选数（设置项，热更新生效）
     max_candidates: usize,
+    /// LLM 整句补全文本（首行选中词后的灰色 ghost text）
+    completion: Option<String>,
+    /// 补全对应的编码串，与当前 code 比对避免异步结果错位显示
+    completion_code: String,
+    /// 补全对应的选中候选索引，与当前 selected_index 比对：
+    /// 导航到其它选项时旧补全自动失效，新选中项由新请求的补全接管
+    completion_index: usize,
+    /// "整句上屏"实际绑定的按键名（daemon 同步，默认 Tab），首行提示用
+    commit_sentence: String,
 }
 
 impl Default for AppState {
@@ -40,6 +49,10 @@ impl Default for AppState {
             expanded: false,
             font_size: 14,
             max_candidates: 9,
+            completion: None,
+            completion_code: String::new(),
+            completion_index: 0,
+            commit_sentence: "Tab".to_string(),
         }
     }
 }
@@ -170,28 +183,62 @@ impl App for ImeUiApp {
                     ui.with_layout(Layout::top_down(Align::Min), |ui| {
                         ui.spacing_mut().item_spacing.y = 6.0;
 
-                        // 第一行：选中候选
+                        // 第一行：选中词 + LLM 整句补全 ghost text。
+                        // 选中词单独使用高亮块（仅首选未导航时）；补全部分
+                        // 放在高亮块之外的普通背景上、以灰色显示，绝不呈现高亮。
                         if !win.is_empty() {
                             let selected = &win[win_selected];
                             let text = selected.text.clone();
                             let selected_font = selected_font_size(state.font_size);
+                            // 仅当首选被选中（未导航到其它行）时保持高亮样式
+                            let is_first = win_selected == 0;
 
-                            EguiFrame::new()
-                                .fill(highlight_color)
-                                .corner_radius(CornerRadius::same(6))
-                                .inner_margin(Margin::same(8))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                // 选中词：独立高亮块（白字）或普通块（正文色）
+                                EguiFrame::new()
+                                    .fill(if is_first { highlight_color } else { bg_color })
+                                    .corner_radius(CornerRadius::same(6))
+                                    .inner_margin(Margin::same(8))
+                                    .show(ui, |ui| {
                                         ui.add(
                                             Label::new(
-                                                RichText::new(&text)
-                                                    .size(selected_font)
-                                                    .color(Color32::WHITE),
+                                                RichText::new(&text).size(selected_font).color(
+                                                    if is_first {
+                                                        Color32::WHITE
+                                                    } else {
+                                                        text_color
+                                                    },
+                                                ),
                                             )
                                             .selectable(false),
                                         );
                                     });
-                                });
+                                // LLM 补全：仅当与当前编码及当前选中项一致时展示，
+                                // 避免异步错位；始终以普通灰色显示（不在高亮块内）。
+                                if state.completion_code == state.code
+                                    && state.completion_index == state.selected_index
+                                    && let Some(completion) = &state.completion
+                                {
+                                    ui.add(
+                                        Label::new(
+                                            RichText::new(completion)
+                                                .size(selected_font)
+                                                .color(text_color.gamma_multiply(0.45)),
+                                        )
+                                        .selectable(false)
+                                        .truncate(),
+                                    );
+                                    ui.add(
+                                        Label::new(
+                                            RichText::new(&state.commit_sentence)
+                                                .size(11.0)
+                                                .color(label_color),
+                                        )
+                                        .selectable(false),
+                                    );
+                                }
+                            });
 
                             ui.add_space(6.0);
                         }
@@ -627,6 +674,10 @@ fn run_candidate_window_inner(
                             // 新的 max_candidates 即时重算，无需在此截断
                             should_repaint = true;
                         }
+                        UiCommand::SetCommitSentenceKey(key) => {
+                            s.commit_sentence = key;
+                            should_repaint = true;
+                        }
                         UiCommand::UpdatePosition { context } => {
                             if s.visible {
                                 s.caret_x = context.caret_x;
@@ -636,11 +687,28 @@ fn run_candidate_window_inner(
                         }
                         UiCommand::HideCandidates => {
                             s.visible = false;
+                            // 清空补全状态，防止重打相同编码时旧 ghost text 重现
+                            s.completion = None;
+                            s.completion_code.clear();
                             should_repaint = false;
                         }
                         UiCommand::CommitText(_) => {
                             s.visible = false;
+                            // 上屏后清空补全状态：旧补全与已提交内容分离，
+                            // 重打相同编码且新补全未到达时不再显示过期 ghost text
+                            s.completion = None;
+                            s.completion_code.clear();
                             should_repaint = false;
+                        }
+                        UiCommand::Completion {
+                            code,
+                            selected_index,
+                            text,
+                        } => {
+                            s.completion_code = code;
+                            s.completion_index = selected_index;
+                            s.completion = text;
+                            should_repaint = true;
                         }
                         UiCommand::SetTheme(theme) => {
                             s.theme = theme;

@@ -54,11 +54,7 @@ fn main() {
         builder = builder.dictionary(path);
     }
     let mut engine = builder.build();
-    let ctx = InputContext {
-        caret_x: 0,
-        caret_y: 0,
-        caret_h: 0,
-    };
+    let ctx = InputContext::caret(0, 0, 0);
 
     loop {
         print!("[{}] > ", engine.current_scheme_name());

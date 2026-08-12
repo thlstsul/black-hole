@@ -34,12 +34,50 @@ pub struct Candidate {
     pub score: i64,
 }
 
+/// 整句补全提示（LLM 异步返回后回传给引擎，Tab 提交时校验使用）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionHint {
+    /// 发起请求时的编码串（如拼音 "wo"），用于校验结果是否仍匹配当前输入
+    pub code: String,
+    /// 发起请求时选中的候选索引
+    pub selected_index: usize,
+    /// 完整补全文本（不含选中词本身）
+    pub text: String,
+}
+
+impl CompletionHint {
+    /// 校验该补全是否仍适用于当前输入状态
+    pub fn matches(&self, code: &str, selected_index: usize) -> bool {
+        self.code == code && self.selected_index == selected_index
+    }
+}
+
 /// 输入上下文（如当前应用、光标位置等）
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct InputContext {
     pub caret_x: i32,
     pub caret_y: i32,
     pub caret_h: i32,
+    /// 光标前的文本（当前输入位置之前的已上屏内容），用于整句补全的上下文。
+    /// 平台层尽力读取，读取失败或不可用时为 None。
+    #[serde(default)]
+    pub preceding_text: Option<String>,
+    /// 光标后的文本（当前输入位置之后的内容），可选项，多数场景为 None。
+    #[serde(default)]
+    pub following_text: Option<String>,
+}
+
+impl InputContext {
+    /// 便捷构造：仅定位信息，无周围文本
+    pub fn caret(caret_x: i32, caret_y: i32, caret_h: i32) -> Self {
+        Self {
+            caret_x,
+            caret_y,
+            caret_h,
+            preceding_text: None,
+            following_text: None,
+        }
+    }
 }
 
 /// 输入方案标识
@@ -140,6 +178,9 @@ pub enum EngineCommand {
     SwitchScheme(SchemeId),
     /// 运行时热更新按键绑定（设置面板实时生效）
     UpdateKeyBindings(KeyBindings),
+    /// LLM 整句补全结果回传引擎（daemon worker 线程 → 引擎线程），
+    /// 供 Tab 提交时校验后拼入上屏文本
+    UpdateCompletion(Option<CompletionHint>),
     Reset,
     /// daemon → 引擎线程：退出信号（唤醒阻塞的 recv，使引擎线程及时结束）
     Shutdown,
@@ -160,6 +201,14 @@ pub enum UiCommand {
     },
     HideCandidates,
     CommitText(String),
+    /// LLM 整句补全结果 → 候选窗：`code` 用于与当前编码串比对、
+    /// `selected_index` 用于与当前选中项比对，避免异步结果错位显示；
+    /// `None` 表示无补全（失败/超时/未启用）
+    Completion {
+        code: String,
+        selected_index: usize,
+        text: Option<String>,
+    },
     UpdateStatus(String),
     ShowSettings,
     SetAutoStart(bool),
@@ -170,11 +219,14 @@ pub enum UiCommand {
     SetInputMode(bool),
     /// daemon → 候选窗线程：热更新候选窗参数（字号、最大候选数等）
     SetCandidateWindowSettings(CandidateWindowSettings),
+    /// daemon → 候选窗线程：同步"整句上屏"实际绑定的按键名，
+    /// 用于首行 Tab 提示显示真实绑定而非硬编码
+    SetCommitSentenceKey(String),
     Exit,
 }
 
 /// 应用设置
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     pub theme: Theme,
     pub default_scheme: SchemeId,
@@ -187,6 +239,9 @@ pub struct Settings {
     /// 由 daemon 全局持有并持久化，各进程 TSF 实例启动/获得焦点时同步。
     #[serde(default)]
     pub english_mode: bool,
+    /// LLM 整句补全设置（默认关闭，需用户显式开启）
+    #[serde(default)]
+    pub llm_completion: LlmCompletionSettings,
 }
 
 impl Default for Settings {
@@ -198,6 +253,68 @@ impl Default for Settings {
             key_bindings: KeyBindings::default(),
             auto_start: false,
             english_mode: false,
+            llm_completion: LlmCompletionSettings::default(),
+        }
+    }
+}
+
+/// LLM 整句补全设置
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LlmCompletionSettings {
+    /// 是否启用整句补全（默认关闭；内容会发送到 endpoint，需用户知情）
+    #[serde(default)]
+    pub enabled: bool,
+    /// OpenAI 兼容补全端点，如 http://127.0.0.1:11434/v1/chat/completions
+    #[serde(default = "default_llm_endpoint")]
+    pub endpoint: String,
+    /// 模型名，如 qwen2.5:1.5b
+    #[serde(default = "default_llm_model")]
+    pub model: String,
+    /// API Key（本地模型可为空，云端服务必填）
+    #[serde(default)]
+    pub api_key: String,
+    /// 单次补全最大 token 数。推理模型（如 deepseek-reasoner / v4-flash）
+    /// 会先消耗 token 做推理，32 常被推理耗尽导致 content 为空，默认放宽
+    #[serde(default = "default_llm_max_tokens")]
+    pub max_tokens: u32,
+    /// 采样温度
+    #[serde(default = "default_llm_temperature")]
+    pub temperature: f32,
+    /// 请求超时（毫秒）。云端 LLM（如 DeepSeek）推理耗时可能数秒，默认放宽到 15s
+    #[serde(default = "default_llm_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_llm_endpoint() -> String {
+    "http://127.0.0.1:11434/v1/chat/completions".to_string()
+}
+
+fn default_llm_model() -> String {
+    "qwen2.5:1.5b".to_string()
+}
+
+fn default_llm_max_tokens() -> u32 {
+    256
+}
+
+fn default_llm_temperature() -> f32 {
+    0.7
+}
+
+fn default_llm_timeout_ms() -> u64 {
+    15000
+}
+
+impl Default for LlmCompletionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_llm_endpoint(),
+            model: default_llm_model(),
+            api_key: String::new(),
+            max_tokens: default_llm_max_tokens(),
+            temperature: default_llm_temperature(),
+            timeout_ms: default_llm_timeout_ms(),
         }
     }
 }
@@ -235,6 +352,13 @@ pub struct KeyBindings {
     pub commit: String,
     pub cancel: String,
     pub switch_scheme: String,
+    /// 整句上屏（LLM 补全时 Tab 提交选中词+补全；无补全时回退为仅提交选中词）
+    #[serde(default = "default_commit_sentence")]
+    pub commit_sentence: String,
+}
+
+fn default_commit_sentence() -> String {
+    "Tab".to_string()
 }
 
 impl Default for KeyBindings {
@@ -245,6 +369,7 @@ impl Default for KeyBindings {
             commit: "Space".to_string(),
             cancel: "Escape".to_string(),
             switch_scheme: "Ctrl+Shift+F12".to_string(),
+            commit_sentence: default_commit_sentence(),
         }
     }
 }

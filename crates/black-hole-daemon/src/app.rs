@@ -1,4 +1,5 @@
 use crate::args::DaemonArgs;
+use crate::completion::{self, CompletionRequest};
 use black_hole_engine::{Engine, EngineBuilder};
 use black_hole_platform::PlatformIme;
 use black_hole_platform::auto_start::set_auto_start;
@@ -13,7 +14,8 @@ use black_hole_platform::{LinuxIbusIme, PlatformError as LinuxPlatformError};
 #[cfg(target_os = "windows")]
 use black_hole_platform::{PlatformError as WindowsPlatformError, WindowsTsfIme};
 use black_hole_shared::{
-    EngineCommand, InputContext, SchemeId, SchemeResult, Settings, Theme, UiCommand,
+    EngineCommand, InputContext, LlmCompletionSettings, SchemeId, SchemeResult, Settings, Theme,
+    UiCommand,
 };
 use black_hole_ui::{SettingsManager, run_candidate_window, run_settings_panel};
 use clap::Parser;
@@ -25,7 +27,7 @@ use std::io;
 use std::mem::discriminant;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -104,6 +106,16 @@ impl App {
         let (engine_tx, engine_rx) = mpsc::channel::<EngineCommand>();
         let (platform_tx, platform_rx) = mpsc::channel::<SchemeResult>();
 
+        // LLM 整句补全：引擎线程投递请求 → 独立 worker 异步调用 LLM，
+        // 结果经 EngineCommand::UpdateCompletion / UiCommand::Completion 双通道回传。
+        let (completion_tx, completion_rx) = mpsc::channel::<CompletionRequest>();
+        let completion_config: Arc<Mutex<LlmCompletionSettings>> =
+            Arc::new(Mutex::new(settings_mgr.settings().llm_completion.clone()));
+        // 补全请求代际号（daemon 与 worker 共享）：worker 发起请求时递增以作废
+        // 在途旧请求；引擎侧收到 Committed（选中/上屏）时也递增，终止所有
+        // 未返回的补全请求，避免选中后旧结果再覆盖。
+        let completion_generation = Arc::new(AtomicU64::new(0));
+
         Self::setup_signal_handler(ui_tx.clone());
 
         let default_theme = settings_mgr.settings().theme;
@@ -130,8 +142,35 @@ impl App {
         // 引擎线程（带 panic 恢复）
         let engine_clone = Arc::clone(&engine);
         let ui_tx_clone = ui_tx.clone();
+        let engine_generation = Arc::clone(&completion_generation);
         let engine_handle = thread::spawn(move || {
-            Self::run_engine_thread(engine_clone, engine_rx, platform_tx, ui_tx_clone);
+            Self::run_engine_thread(
+                engine_clone,
+                engine_rx,
+                platform_tx,
+                ui_tx_clone,
+                completion_tx,
+                engine_generation,
+            );
+        });
+
+        // LLM 补全 worker 线程：独立异步调用，绝不阻塞引擎按键管线
+        let completion_stop = Arc::new(AtomicBool::new(false));
+        let completion_engine_tx = engine_tx.clone();
+        let completion_ui_render_tx = ui_render_tx.clone();
+        let completion_config_worker = Arc::clone(&completion_config);
+        let completion_generation_worker = Arc::clone(&completion_generation);
+        let completion_stop_worker = Arc::clone(&completion_stop);
+        let completion_handle = thread::spawn(move || {
+            completion::run_completion_worker(
+                completion_rx,
+                completion_engine_tx,
+                completion_ui_render_tx,
+                completion_config_worker,
+                Arc::new(completion::HttpLlmClient),
+                completion_generation_worker,
+                completion_stop_worker,
+            );
         });
 
         // 为 UI 命令分发和平台线程预先 clone 通道 / 共享状态
@@ -157,6 +196,7 @@ impl App {
         let watch_ui_render_tx = ui_render_tx.clone();
         let watch_current = Arc::clone(&current_for_dispatch);
         let watch_last_applied = Arc::clone(&last_applied_settings);
+        let watch_completion_config = Arc::clone(&completion_config);
         // 停止信号：graceful_shutdown 置位后，watch 线程在 recv_timeout 超时醒来退出
         let watch_stop = Arc::new(AtomicBool::new(false));
         let watch_stop_flag = Arc::clone(&watch_stop);
@@ -200,6 +240,7 @@ impl App {
                                     &watch_engine_tx,
                                     &watch_ui_render_tx,
                                     &watch_current,
+                                    &watch_completion_config,
                                 );
                                 *watch_last_applied.lock().unwrap() = new_settings;
                             }
@@ -230,14 +271,16 @@ impl App {
             );
         }
 
-        Self::graceful_shutdown(
-            engine_tx_for_ui_dispatch,
-            ui_render_tx_for_shutdown,
+        Self::graceful_shutdown(ShutdownParts {
+            engine_tx: engine_tx_for_ui_dispatch,
+            ui_tx: ui_render_tx_for_shutdown,
             ui_handle,
             engine_handle,
             watch_handle,
             watch_stop,
-        );
+            completion_handle,
+            completion_stop,
+        });
 
         info!("Black-Hole IME daemon exited.");
         Ok(())
@@ -340,6 +383,8 @@ impl App {
         engine_rx: mpsc::Receiver<EngineCommand>,
         platform_tx: mpsc::Sender<SchemeResult>,
         ui_tx: mpsc::Sender<UiCommand>,
+        completion_tx: mpsc::Sender<CompletionRequest>,
+        completion_generation: Arc<AtomicU64>,
     ) {
         let result = catch_unwind(AssertUnwindSafe(|| {
             let mut ctx = InputContext::default();
@@ -351,7 +396,14 @@ impl App {
 
                 debug!("engine_thread start: cmd={:?}", discriminant(&cmd));
 
-                let result = Self::process_engine_command(&engine, &mut ctx, cmd, &ui_tx);
+                let result = Self::process_engine_command(
+                    &engine,
+                    &mut ctx,
+                    cmd,
+                    &ui_tx,
+                    &completion_tx,
+                    &completion_generation,
+                );
 
                 if let Some(r) = result
                     && platform_tx.send(r).is_err()
@@ -479,6 +531,7 @@ impl App {
         engine_tx: &mpsc::Sender<EngineCommand>,
         ui_render_tx: &mpsc::Sender<UiCommand>,
         current_settings: &Arc<Mutex<(SchemeId, Theme, bool)>>,
+        completion_config: &Arc<Mutex<LlmCompletionSettings>>,
     ) {
         if new.theme != old.theme {
             info!("Hot applying theme: {:?}", new.theme);
@@ -515,6 +568,10 @@ impl App {
         if new.key_bindings != old.key_bindings {
             info!("Hot applying key bindings");
             let _ = engine_tx.send(EngineCommand::UpdateKeyBindings(new.key_bindings.clone()));
+            // 同步"整句上屏"实际绑定给候选窗，首行提示显示真实按键
+            let _ = ui_render_tx.send(UiCommand::SetCommitSentenceKey(
+                new.key_bindings.commit_sentence.clone(),
+            ));
         }
 
         if new.english_mode != old.english_mode {
@@ -524,6 +581,11 @@ impl App {
                 cur.2 = new.english_mode;
             }
         }
+
+        if new.llm_completion != old.llm_completion {
+            info!("Hot applying LLM completion settings");
+            *completion_config.lock().unwrap() = new.llm_completion.clone();
+        }
     }
 
     /// 处理单个引擎命令，返回需要发送给平台层的结果
@@ -532,6 +594,8 @@ impl App {
         ctx: &mut InputContext,
         cmd: EngineCommand,
         ui_tx: &mpsc::Sender<UiCommand>,
+        completion_tx: &mpsc::Sender<CompletionRequest>,
+        completion_generation: &Arc<AtomicU64>,
     ) -> Option<SchemeResult> {
         match cmd {
             EngineCommand::SetContext(new_ctx) => {
@@ -543,7 +607,10 @@ impl App {
                 let result = engine.process(&EngineCommand::Key(key), ctx);
                 if let SchemeResult::Committed { ref text } = result {
                     let _ = ui_tx.send(UiCommand::CommitText(text.clone()));
+                    // 选中/上屏：递增代际号，终止所有在途补全请求
+                    completion_generation.fetch_add(1, Ordering::SeqCst);
                 }
+                maybe_request_completion(&result, ctx, completion_tx);
                 Some(result)
             }
             EngineCommand::Reset => {
@@ -557,6 +624,8 @@ impl App {
                 let result = engine.process(&EngineCommand::SelectCandidate(idx), ctx);
                 if let SchemeResult::Committed { ref text } = result {
                     let _ = ui_tx.send(UiCommand::CommitText(text.clone()));
+                    // 选中候选上屏：递增代际号，终止所有在途补全请求
+                    completion_generation.fetch_add(1, Ordering::SeqCst);
                 }
                 Some(result)
             }
@@ -573,6 +642,12 @@ impl App {
                 // 与 SwitchScheme 同理：由 daemon 主循环触发，无需响应。
                 None
             }
+            EngineCommand::UpdateCompletion(completion) => {
+                let mut engine = engine.lock().unwrap();
+                engine.process(&EngineCommand::UpdateCompletion(completion), ctx);
+                // 由补全 worker 线程触发，无需响应。
+                None
+            }
             EngineCommand::Shutdown => {
                 // 引擎线程循环已拦截 Shutdown 并退出，正常不会到达此处；
                 // 保留分支以穷尽匹配。
@@ -585,18 +660,24 @@ impl App {
     // 优雅退出
     // ------------------------------------------------------------------
 
-    fn graceful_shutdown(
-        engine_tx: mpsc::Sender<EngineCommand>,
-        ui_tx: mpsc::Sender<UiCommand>,
-        ui_handle: thread::JoinHandle<()>,
-        engine_handle: thread::JoinHandle<()>,
-        watch_handle: thread::JoinHandle<()>,
-        watch_stop: Arc<AtomicBool>,
-    ) {
+    fn graceful_shutdown(parts: ShutdownParts) {
         info!("Shutting down daemon...");
+        let ShutdownParts {
+            engine_tx,
+            ui_tx,
+            ui_handle,
+            engine_handle,
+            watch_handle,
+            watch_stop,
+            completion_handle,
+            completion_stop,
+        } = parts;
 
         // 停止设置热更新线程：置位停止信号，其 recv_timeout 循环会退出
         watch_stop.store(true, Ordering::Relaxed);
+
+        // 停止 LLM 补全 worker 线程：置位停止信号，其 recv_timeout 循环会退出
+        completion_stop.store(true, Ordering::Relaxed);
 
         // 通知引擎线程退出：发送 Shutdown 唤醒其阻塞的 recv，使其及时结束
         if engine_tx.send(EngineCommand::Shutdown).is_err() {
@@ -611,6 +692,15 @@ impl App {
         // 等待设置热更新线程结束（5 秒超时）
         if !Self::join_with_timeout(watch_handle, "SettingsWatcher", Duration::from_secs(5)) {
             warn!("Settings watcher thread did not exit within timeout");
+        }
+
+        // 等待 LLM 补全 worker 线程结束（5 秒超时）
+        if !Self::join_with_timeout(
+            completion_handle,
+            "CompletionWorker",
+            Duration::from_secs(5),
+        ) {
+            warn!("Completion worker thread did not exit within timeout");
         }
 
         // 等待引擎线程结束（5 秒超时）
@@ -647,6 +737,45 @@ impl App {
 // ------------------------------------------------------------------
 // 平台适配
 // ------------------------------------------------------------------
+
+/// 优雅退出所需的线程句柄与通知通道（聚合参数，避免过长函数签名）
+struct ShutdownParts {
+    engine_tx: mpsc::Sender<EngineCommand>,
+    ui_tx: mpsc::Sender<UiCommand>,
+    ui_handle: thread::JoinHandle<()>,
+    engine_handle: thread::JoinHandle<()>,
+    watch_handle: thread::JoinHandle<()>,
+    watch_stop: Arc<AtomicBool>,
+    completion_handle: thread::JoinHandle<()>,
+    completion_stop: Arc<AtomicBool>,
+}
+
+/// Composing 结果且存在选中候选时，向 LLM 补全 worker 投递请求。
+///
+/// 仅投递、绝不等待：LLM 结果经异步双通道回传，未就绪时 Tab 回退为
+/// 仅提交选中词，与无补全行为一致。含首选（index 0）。
+fn maybe_request_completion(
+    result: &SchemeResult,
+    ctx: &InputContext,
+    completion_tx: &mpsc::Sender<CompletionRequest>,
+) {
+    if let SchemeResult::Composing {
+        code,
+        candidates,
+        selected_index,
+        ..
+    } = result
+        && let Some(selected) = candidates.get(*selected_index)
+    {
+        let _ = completion_tx.send(CompletionRequest {
+            code: code.clone(),
+            selected_index: *selected_index,
+            selected_text: selected.text.clone(),
+            preceding_text: ctx.preceding_text.clone(),
+            following_text: ctx.following_text.clone(),
+        });
+    }
+}
 
 #[cfg(target_os = "windows")]
 fn run_platform(
