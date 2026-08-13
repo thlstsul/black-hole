@@ -64,7 +64,7 @@ impl LlmClient for HttpLlmClient {
                 "temperature": settings.temperature,
                 "thinking": {"type": "disabled"},
                 "messages": [
-                    {"role": "system", "content": "你是中文输入法的整句补全助手。"},
+                    {"role": "system", "content": "你是中文输入法的整句补全助手。\n请续写光标处【】内词语之后的内容，输出一句自然通顺的中文，只输出续写部分，不超过 20 字，可含句末标点。"},
                     {"role": "user", "content": build_prompt(&req)},
                 ],
             });
@@ -130,10 +130,7 @@ fn build_prompt(req: &CompletionRequest) -> String {
         (None, Some(post)) => format!("【{}】{}", req.selected_text, post),
         (None, None) => format!("【{}】", req.selected_text),
     };
-    format!(
-        "光标处文本是：{}\n请续写光标处【】内词语之后的内容，输出一句自然通顺的中文，只输出续写部分，不超过 20 字，可含句末标点。",
-        context
-    )
+    format!("光标处文本是：{}", context)
 }
 
 /// 清理 LLM 返回：去首尾空白与前导标点；若结果以选中词开头（模型重复了种子）
