@@ -135,6 +135,12 @@ unsafe extern "system" fn keyboard_hook_proc(
         let msg = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
         let vk = msg.vkCode;
         let event = wparam.0 as u32;
+        // 诊断日志：确认钩子回调是否被系统投递到本进程
+        // （若设置面板内按 Ctrl 时这里没有任何输出，说明回调未被投递）。
+        debug!(
+            "hook: proc ncode={} vk=0x{:04X} event=0x{:08X}",
+            ncode, vk, event
+        );
 
         if is_ctrl_vk(vk) && (event == WM_KEYDOWN || event == WM_KEYUP) {
             let down = event == WM_KEYDOWN;
@@ -228,15 +234,20 @@ fn foreground_service() -> Option<Arc<Mutex<ServiceInner>>> {
 
 fn on_ctrl_pressed() {
     let Some(inner) = foreground_service() else {
+        debug!("hook: on_ctrl_pressed 未找到前台服务");
         return;
     };
     if let Ok(mut guard) = inner.lock() {
+        // 新一轮 Ctrl 按下：重置抑制标志，避免上次残留（如钩子切换后
+        // TSF 从未收到 keyup）抑制本次 TSF 路径的合法切换。
+        guard.hook_toggled = false;
         guard.mode_switch.ctrl_pressed();
     }
 }
 
 fn on_other_key_pressed() {
     let Some(inner) = foreground_service() else {
+        debug!("hook: on_other_key_pressed 未找到前台服务");
         return;
     };
     if let Ok(mut guard) = inner.lock() {
@@ -246,14 +257,21 @@ fn on_other_key_pressed() {
 
 fn on_ctrl_released() {
     let Some(inner) = foreground_service() else {
+        debug!("hook: on_ctrl_released 未找到前台服务");
         return;
     };
+    // 在同一个临界区内消费候选并置位抑制标志，保证 TSF 路径 OnTestKeyUp
+    // 观察到的 hook_toggled 与状态机消费结果一致（避免 TOCTOU）。
     let toggled = {
         let mut guard = match inner.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
-        guard.mode_switch.ctrl_released()
+        let toggled = guard.mode_switch.ctrl_released();
+        if toggled.is_some() {
+            guard.hook_toggled = true;
+        }
+        toggled
     };
     if let Some(english) = toggled {
         debug!(

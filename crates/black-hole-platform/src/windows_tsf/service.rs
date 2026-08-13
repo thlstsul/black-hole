@@ -15,7 +15,9 @@ use tracing::{debug, error, info, warn};
 use windows::Win32::Foundation::{E_UNEXPECTED, LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_I4};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VIRTUAL_KEY, VK_CONTROL};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL, VK_RCONTROL,
+};
 use windows::Win32::UI::TextServices::{
     GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION, GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
     ITfCompartmentMgr, ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext,
@@ -272,6 +274,11 @@ fn variant_i32(v: i32) -> VARIANT {
     }
 }
 
+/// 判断虚拟键是否为 Ctrl（含左右键）。
+fn is_ctrl_key(vk: VIRTUAL_KEY) -> bool {
+    vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL
+}
+
 // ---------------------------------------------------------------------------
 // ITfTextInputProcessor
 // ---------------------------------------------------------------------------
@@ -428,6 +435,25 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
             unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0
         );
 
+        // Ctrl 键：标记切换候选（TSF 路径；与全局钩子共用状态机，
+        // 防双切由 OnTestKeyUp 中的 hook_toggled 标志协调）。
+        // 永远不拦截 Ctrl 本身，保证 Ctrl+C 等组合键正常工作。
+        if is_ctrl_key(vk) {
+            let mut inner = self.inner.lock().unwrap();
+            // 新一轮 Ctrl 按下：重置抑制标志，避免上次残留（如钩子切换后
+            // 本路径从未收到 keyup）抑制本次合法切换。
+            inner.hook_toggled = false;
+            inner.mode_switch.ctrl_pressed();
+            inner.last_key_event = None;
+            return Ok(BOOL(0));
+        }
+
+        // 按住 Ctrl 期间按下其他键（如 Ctrl+C、Ctrl+Shift），取消切换候选。
+        if unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0 {
+            let mut inner = self.inner.lock().unwrap();
+            inner.mode_switch.other_key_pressed(true);
+        }
+
         // 英文模式下不拦截任何按键。
         {
             let mut inner = self.inner.lock().unwrap();
@@ -476,13 +502,33 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         wparam: WPARAM,
         _lparam: LPARAM,
     ) -> Result<BOOL> {
-        // Ctrl 切换已由全局键盘钩子（hook.rs）统一处理，这里不再处理按键松开。
         let vk = VIRTUAL_KEY(wparam.0 as u16);
         debug!(
             "OnTestKeyUp: vk=0x{:04X} ctrl_held={}",
             vk.0,
             unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0
         );
+
+        // Ctrl 松开：若全局钩子已抢先完成切换（hook_toggled=true）则跳过，
+        // 避免与钩子路径重复切换；否则由 TSF 路径执行切换。
+        // - Chrome 等不把修饰键事件转发给 TSF 的应用收不到此回调，由钩子切换；
+        // - 设置面板等钩子回调不可靠（安装线程无消息循环）的应用走本路径。
+        if is_ctrl_key(vk) {
+            let toggled = {
+                let mut inner = self.inner.lock().unwrap();
+                if inner.hook_toggled {
+                    inner.hook_toggled = false;
+                    None
+                } else {
+                    inner.mode_switch.ctrl_released()
+                }
+            };
+            if let Some(english) = toggled {
+                self.on_input_mode_toggled(english);
+                // 上报 daemon 持久化并更新全局状态，供其它进程同步
+                self.send_ui_command(UiCommand::SetInputMode(english));
+            }
+        }
         Ok(BOOL(0))
     }
 

@@ -441,4 +441,114 @@ mod tests {
         assert_eq!(sw.set_english(false), Some(false));
         assert!(!sw.is_english());
     }
+
+    // ------------------------------------------------------------------
+    // 防双切协调逻辑：全局钩子（WH_KEYBOARD_LL）与 TSF 路径（OnTestKeyUp）
+    // 共用同一 InputModeSwitch，配合 hook_toggled 抑制标志保证
+    // "每次 Ctrl 松开恰好一次切换"。以下测试用局部变量模拟 hook_toggled
+    // 标志的消费顺序（对应 hook.rs 的 on_ctrl_released 与 service.rs 的
+    // OnTestKeyUp），钉住单切换不变量。
+    // ------------------------------------------------------------------
+
+    /// 模拟 hook.rs on_ctrl_released：消费候选，切换成功则置位抑制标志。
+    fn hook_release(sw: &mut InputModeSwitch, hook_toggled: &mut bool) -> Option<bool> {
+        let toggled = sw.ctrl_released();
+        if toggled.is_some() {
+            *hook_toggled = true;
+        }
+        toggled
+    }
+
+    /// 模拟 service.rs OnTestKeyUp：钩子已切换则跳过，否则由 TSF 路径切换。
+    fn tsf_keyup(sw: &mut InputModeSwitch, hook_toggled: &mut bool) -> Option<bool> {
+        if *hook_toggled {
+            *hook_toggled = false;
+            None
+        } else {
+            sw.ctrl_released()
+        }
+    }
+
+    #[test]
+    fn hook_consumes_then_tsf_skips_single_toggle() {
+        let mut sw = InputModeSwitch::default();
+        let mut hook_toggled = false;
+
+        // Ctrl 按下：两条路径都标记候选（幂等）
+        sw.ctrl_pressed();
+        sw.ctrl_pressed();
+
+        // Ctrl 松开：低层钩子先于 TSF 回调，钩子路径消费候选并置位标志
+        assert_eq!(hook_release(&mut sw, &mut hook_toggled), Some(true));
+        assert!(hook_toggled);
+
+        // TSF OnTestKeyUp 看到 hook_toggled，跳过，不再切换
+        assert_eq!(tsf_keyup(&mut sw, &mut hook_toggled), None);
+        assert!(!hook_toggled);
+        // 恰好一次切换（英文）
+        assert!(sw.is_english());
+
+        // 完整往返：再次 Ctrl 周期后应回到中文
+        sw.ctrl_pressed();
+        hook_toggled = false;
+        assert_eq!(hook_release(&mut sw, &mut hook_toggled), Some(false));
+        assert_eq!(tsf_keyup(&mut sw, &mut hook_toggled), None);
+        assert!(!sw.is_english());
+    }
+
+    #[test]
+    fn tsf_consumes_then_hook_sees_none_single_toggle() {
+        let mut sw = InputModeSwitch::default();
+        let mut hook_toggled = false;
+
+        // Ctrl 按下
+        sw.ctrl_pressed();
+
+        // Ctrl 松开：TSF 路径先执行（标志为 false），由 TSF 消费并切换
+        assert_eq!(tsf_keyup(&mut sw, &mut hook_toggled), Some(true));
+        assert!(!hook_toggled);
+
+        // 钩子随后执行：候选已被消费，返回 None，不置位标志、不重复切换
+        assert_eq!(hook_release(&mut sw, &mut hook_toggled), None);
+        assert!(!hook_toggled);
+        assert!(sw.is_english());
+    }
+
+    #[test]
+    fn hook_toggle_without_tsf_keyup_resets_on_next_press() {
+        let mut sw = InputModeSwitch::default();
+        let mut hook_toggled = false;
+
+        // Chrome 等场景：TSF 收不到修饰键松开，仅钩子路径收到事件
+        sw.ctrl_pressed();
+        assert_eq!(hook_release(&mut sw, &mut hook_toggled), Some(true));
+        // 无 TSF keyup 来消费标志，hook_toggled 残留为 true
+        assert!(hook_toggled);
+
+        // 新一轮 Ctrl 按下：OnTestKeyDown / on_ctrl_pressed 重置标志，
+        // 避免残留标志抑制本次合法切换
+        sw.ctrl_pressed();
+        hook_toggled = false;
+
+        // 新一轮 Ctrl 松开：TSF 路径正常切换回中文
+        assert_eq!(tsf_keyup(&mut sw, &mut hook_toggled), Some(false));
+        assert!(!sw.is_english());
+    }
+
+    #[test]
+    fn stale_flag_does_not_suppress_next_toggle() {
+        let mut sw = InputModeSwitch::default();
+        // 模拟残留的陈旧标志（钩子切换后 TSF 从未收到 keyup 消费标志）
+        let mut hook_toggled = true;
+
+        // 新一轮 Ctrl 按下必须重置标志（service.rs OnTestKeyDown 与
+        // hook.rs on_ctrl_pressed 都会执行此重置）
+        sw.ctrl_pressed();
+        assert!(hook_toggled); // 确认残留标志确实存在，随后被按下路径重置
+        hook_toggled = false;
+
+        // 松开时 TSF 路径应正常切换，而不是被陈旧标志吞掉
+        assert_eq!(tsf_keyup(&mut sw, &mut hook_toggled), Some(true));
+        assert!(sw.is_english());
+    }
 }

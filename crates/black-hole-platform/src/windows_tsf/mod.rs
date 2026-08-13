@@ -153,6 +153,9 @@ pub(crate) struct ServiceInner {
     pub(crate) current_theme: Theme,
     /// 中英文模式切换状态机（Ctrl 键触发，按线程独立维护）。
     pub(crate) mode_switch: InputModeSwitch,
+    /// 最近一次 Ctrl 松开是否已由全局键盘钩子完成切换。
+    /// TSF 路径（OnTestKeyUp）看到该标志时跳过，避免与钩子重复切换。
+    pub(crate) hook_toggled: bool,
 }
 
 impl ServiceInner {
@@ -175,6 +178,7 @@ impl ServiceInner {
             current_scheme: SchemeId::Pinyin,
             current_theme: Theme::Light,
             mode_switch: InputModeSwitch::default(),
+            hook_toggled: false,
         }
     }
 }
