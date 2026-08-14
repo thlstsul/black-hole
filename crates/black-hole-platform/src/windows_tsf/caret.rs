@@ -61,6 +61,27 @@ pub(crate) fn read_surrounding_text(
         return (None, None);
     }
 
+    // 合成串 range：合成中合成串是文档流的一部分，取上下文时必须排除"正在输入的字母"
+    let comp_range = composition.and_then(|c| unsafe { c.GetRange() }.ok());
+
+    // 光标相对合成串的位置：-1 在合成串之前 / 0 在合成串内（含两端）/ 1 在合成串之后
+    let caret_side = match comp_range.as_ref() {
+        Some(comp) => {
+            let before_start = unsafe { caret.CompareStart(ec, comp, TF_ANCHOR_START) };
+            if before_start.is_err() || before_start.unwrap_or(0) < 0 {
+                -1
+            } else {
+                let after_end = unsafe { caret.CompareEnd(ec, comp, TF_ANCHOR_END) };
+                if after_end.is_err() || after_end.unwrap_or(0) > 0 {
+                    1
+                } else {
+                    0
+                }
+            }
+        }
+        None => -1,
+    };
+
     // 前文：起点向前扩展 MAX_PRECEDING_CHARS 字符
     let preceding = {
         let mut text = String::new();
@@ -71,6 +92,13 @@ pub(crate) fn read_surrounding_text(
                     .is_ok()
                     && shifted != 0;
             if ok {
+                // 光标落在合成串内/末尾时，前文会混入正在输入的字母，
+                // 把终点收回到合成串起点，只取真实前文。
+                if caret_side >= 0
+                    && let Some(comp) = comp_range.as_ref()
+                {
+                    let _ = unsafe { r.ShiftEndToRange(ec, comp, TF_ANCHOR_START) };
+                }
                 text = read_range_text(ec, &r);
             }
         }
@@ -86,6 +114,13 @@ pub(crate) fn read_surrounding_text(
                 .is_ok()
                 && shifted != 0;
             if ok {
+                // 光标落在合成串内/起点时，后文会混入正在输入的字母，
+                // 把起点移到合成串末尾，只取真实后文。
+                if caret_side == 0
+                    && let Some(comp) = comp_range.as_ref()
+                {
+                    let _ = unsafe { r.ShiftStartToRange(ec, comp, TF_ANCHOR_END) };
+                }
                 text = read_range_text(ec, &r);
             }
         }
@@ -107,6 +142,137 @@ fn read_range_text(ec: u32, range: &ITfRange) -> String {
     } else {
         String::new()
     }
+}
+
+/// UIA 回退：TSF 文本存储不可用的应用（如 Zed 等纯 IMM32 应用，不实现
+/// ITfTextStore/ITfContextOwner，`ITfContext::GetSelection/GetText` 取不到文本）
+/// 无法走 TSF 读取周围文本；此类应用通常通过 UIA（accesskit_windows 等）实现
+/// `TextPattern`，这里改从 UIA 读取光标周围文本。
+///
+/// 取文本范围的两条路径，任一失败则回退到另一条：
+/// 1. `GetSelection`：拿到光标/选区 range；
+/// 2. `RangeFromPoint`：用已知的光标屏幕坐标定位 range（部分应用不暴露选区）。
+///
+/// TextPattern 可能挂在焦点元素的祖先节点上（如编辑器容器），
+/// 因此沿祖先链逐级查找，最多回溯 [`MAX_UIA_ANCESTORS`] 层。
+///
+/// 读取失败或无可读内容时对应项为 None。
+pub(crate) fn read_surrounding_text_via_uia(
+    caret_x: i32,
+    caret_y: i32,
+) -> (Option<String>, Option<String>) {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, IUIAutomationTextPattern, TextPatternRangeEndpoint_End,
+        TextPatternRangeEndpoint_Start, TextUnit_Character, UIA_TextPatternId,
+    };
+
+    const MAX_UIA_ANCESTORS: usize = 8;
+
+    let automation =
+        unsafe { CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER) };
+    let Ok(automation) = automation else {
+        return (None, None);
+    };
+    let focused = unsafe { automation.GetFocusedElement() };
+    let Ok(focused) = focused else {
+        return (None, None);
+    };
+
+    // 沿祖先链（含自身）查找支持 TextPattern 的元素
+    let Ok(raw_cond) = (unsafe { automation.RawViewCondition() }) else {
+        return (None, None);
+    };
+    let Ok(tree_walker) = (unsafe { automation.CreateTreeWalker(&raw_cond) }) else {
+        return (None, None);
+    };
+    let mut element = focused;
+    let mut pattern = None;
+    for _ in 0..=MAX_UIA_ANCESTORS {
+        if let Ok(p) =
+            unsafe { element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId) }
+        {
+            pattern = Some(p);
+            break;
+        }
+        let Ok(parent) = (unsafe { tree_walker.GetParentElement(&element) }) else {
+            break;
+        };
+        element = parent;
+    }
+    let Some(pattern) = pattern else {
+        return (None, None);
+    };
+
+    // 路径 1：光标选区 range；路径 2：光标坐标定位 range
+    let caret_range = {
+        let mut range = None;
+        if let Ok(selection) = unsafe { pattern.GetSelection() }
+            && let Ok(len) = unsafe { selection.Length() }
+            && len > 0
+            && let Ok(r) = unsafe { selection.GetElement(0) }
+        {
+            range = Some(r);
+        }
+        if range.is_none() {
+            range = unsafe {
+                pattern.RangeFromPoint(POINT {
+                    x: caret_x,
+                    y: caret_y,
+                })
+            }
+            .ok();
+        }
+        range
+    };
+    let Some(caret) = caret_range else {
+        return (None, None);
+    };
+
+    // 前文：把选区起点向前扩展 MAX_PRECEDING_CHARS 字符后读取
+    let preceding = {
+        let mut text = String::new();
+        if let Ok(r) = unsafe { caret.Clone() } {
+            let moved = unsafe {
+                r.MoveEndpointByUnit(
+                    TextPatternRangeEndpoint_Start,
+                    TextUnit_Character,
+                    -MAX_PRECEDING_CHARS,
+                )
+            };
+            if moved.is_ok()
+                && moved.unwrap_or(0) != 0
+                && let Ok(bstr) = unsafe { r.GetText(-1) }
+            {
+                text = String::from_utf16_lossy(&bstr);
+            }
+        }
+        (!text.is_empty()).then_some(text)
+    };
+
+    // 后文：把选区终点向后扩展 MAX_FOLLOWING_CHARS 字符后读取
+    let following = {
+        let mut text = String::new();
+        if let Ok(r) = unsafe { caret.Clone() } {
+            let moved = unsafe {
+                r.MoveEndpointByUnit(
+                    TextPatternRangeEndpoint_End,
+                    TextUnit_Character,
+                    MAX_FOLLOWING_CHARS,
+                )
+            };
+            if moved.is_ok()
+                && moved.unwrap_or(0) != 0
+                && let Ok(bstr) = unsafe { r.GetText(-1) }
+            {
+                text = String::from_utf16_lossy(&bstr);
+            }
+        }
+        (!text.is_empty()).then_some(text)
+    };
+
+    (preceding, following)
 }
 
 /// Get the screen coordinates of the current caret position.

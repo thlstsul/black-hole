@@ -1,4 +1,4 @@
-use super::caret::read_surrounding_text;
+use super::caret::{read_surrounding_text, read_surrounding_text_via_uia};
 use super::commit::apply_result;
 use super::{ServiceInner, try_reconnect_ipc};
 use crate::ipc::{IpcRequest, read_response, send_request};
@@ -179,8 +179,13 @@ fn handle_key_event_internal(
         // SetContext 为单向请求（daemon 不写响应），随后 KeyEvent 正常请求-响应。
         // 读取失败时静默跳过，不影响按键管线。
         if let Some((caret_x, caret_y, caret_h)) = last_caret_pos {
-            let (preceding_text, following_text) =
+            let (mut preceding_text, mut following_text) =
                 read_surrounding_text(ec, &ctx, composition.as_ref());
+            // TSF 取不到上下文（Zed 等纯 IMM32 应用不实现 TSF 文本存储）时，
+            // 回退到 UIA TextPattern 读取光标周围文本。
+            if preceding_text.is_none() && following_text.is_none() {
+                (preceding_text, following_text) = read_surrounding_text_via_uia(caret_x, caret_y);
+            }
             let set_ctx = IpcRequest::SetContext(InputContext {
                 caret_x,
                 caret_y,
