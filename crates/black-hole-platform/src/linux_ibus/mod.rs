@@ -11,7 +11,7 @@ use std::future::pending;
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender};
 use tracing::info;
-use zbus::zvariant::{Array, Dict, StructureBuilder, Type, Value};
+use zbus::zvariant::{Array, Dict, OwnedValue, Structure, StructureBuilder, Type, Value};
 use zbus::{Connection, Error, interface};
 
 use super::{PlatformError, PlatformIme};
@@ -249,6 +249,63 @@ impl IbusEngine {
         let _ = engine_tx.send(EngineCommand::SetContext(ctx));
     }
 
+    /// 应用推送的光标周围文本（IBus SetSurroundingText，IBus 1.5+）。
+    ///
+    /// `text` 为 variant 包裹的 IBusText（序列化结构
+    /// `(s "IBusText", a{sv} attachments, s text, v attrs)`，纯文本在第 3 个字段），
+    /// `cursor_pos` 为光标在文本中的字符索引。按光标位置切出前文/后文，
+    /// 合并光标坐标后通过 SetContext 同步给 daemon（供整句补全提供上下文）。
+    /// 解析失败或文本为空时静默跳过，不影响输入管线。
+    async fn set_surrounding_text(&self, text: OwnedValue, cursor_pos: u32, _anchor_pos: u32) {
+        const MAX_PRECEDING_CHARS: usize = 32;
+        const MAX_FOLLOWING_CHARS: usize = 16;
+
+        // IBusText 序列化为 (s "IBusText", a{sv} attachments, s text, v attrs)，
+        // 纯文本位于 index 2。
+        let Ok(structure) = text.downcast_ref::<&Structure>() else {
+            return;
+        };
+        let fields = structure.fields();
+        let Some(Value::Str(text_str)) = fields.get(2) else {
+            return;
+        };
+        if text_str.is_empty() {
+            return;
+        }
+
+        // cursor_pos 是字符索引，换算成字节偏移后切分前文/后文
+        let cursor_byte = text_str
+            .char_indices()
+            .nth(cursor_pos as usize)
+            .map(|(i, _)| i)
+            .unwrap_or(text_str.len());
+        let (pre, post) = text_str.split_at(cursor_byte);
+        // 前文取光标前最后 MAX_PRECEDING_CHARS 个字符，后文取光标后前 MAX_FOLLOWING_CHARS 个字符
+        let preceding: String = pre
+            .chars()
+            .rev()
+            .take(MAX_PRECEDING_CHARS)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let following: String = post.chars().take(MAX_FOLLOWING_CHARS).collect();
+
+        // 保留 set_cursor_location 写入的光标坐标，仅更新文本字段
+        let mut ctx = self.context.lock().unwrap().clone();
+        ctx.preceding_text = (!preceding.is_empty()).then_some(preceding);
+        ctx.following_text = (!following.is_empty()).then_some(following);
+        let engine_tx = self.engine_tx.lock().unwrap();
+        let _ = engine_tx.send(EngineCommand::SetContext(ctx));
+    }
+
+    /// 声明引擎需要周围文本（IBus 1.5.27+ 读取此属性，焦点变化时自动推送
+    /// SetSurroundingText）。
+    #[zbus(property, name = "active-surrounding-text")]
+    async fn active_surrounding_text(&self) -> bool {
+        true
+    }
+
     async fn focus_in(&self) {}
     async fn focus_out(&self) {}
 
@@ -267,6 +324,19 @@ impl IbusEngine {
     }
 
     async fn enable(&self) {
+        // 声明需要周围文本：IBus 1.5.27+ 的 daemon 读取 active-surrounding-text
+        // 属性后，会在每次焦点切换时自动推送 SetSurroundingText。
+        // 旧版 IBus 无此属性，改用 RequireSurroundingText 信号通知 daemon。
+        let _ = self
+            .conn
+            .emit_signal(
+                None::<&str>,
+                "/org/freedesktop/IBus/Engine/Black-Hole",
+                "org.freedesktop.IBus.Engine",
+                "RequireSurroundingText",
+                &(),
+            )
+            .await;
         // 注册 InputMode 属性，使面板/桌面 shell 能显示并跟踪中英文状态。
         let english = self.mode_switch.lock().unwrap().is_english();
         let _ = self
