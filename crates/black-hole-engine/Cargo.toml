@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 black-hole-shared = { workspace = true }
 dirs = "6.0"
+lru = "0.12"
 pinyin = "0.11"
 rime-dict = { git = "https://gitee.com/thelostsoul/rime-dict.git" }
 rustc-hash = "2"

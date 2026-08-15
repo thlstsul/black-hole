@@ -10,6 +10,7 @@
 
 use crate::{Dictionary, LanguageModel};
 use black_hole_shared::Candidate;
+use lru::LruCache;
 use pinyin::ToPinyin;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Reverse;
@@ -20,6 +21,7 @@ use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -68,8 +70,32 @@ type PrefixEntries = Vec<(String, i64)>;
 /// 首音节前缀缓存中每个音节的词条上限
 const PREFIX1_CACHE_LIMIT: usize = 100;
 
-/// 精确查询缓存上限，超出后整体清空（防御性，防编码前缀组合无限增长）
+/// 精确查询缓存默认容量（LRU 自动淘汰最久未使用条目）
 const LOOKUP_CACHE_LIMIT: usize = 1024;
+
+/// 前缀查询缓存默认容量（LRU 自动淘汰最久未使用条目）
+const PREFIX_CACHE_LIMIT: usize = 1024;
+
+/// RimeDict 缓存配置
+///
+/// 容量上限集中管理，缓存满载时由 LRU 策略逐条淘汰最久未使用条目，
+/// 避免全量清空导致的缓存命中率骤降与查询性能抖动。
+#[derive(Debug, Clone)]
+pub struct RimeDictConfig {
+    /// 前缀查询缓存容量（按音节 id 序列计条目）
+    pub prefix_cache_capacity: usize,
+    /// 精确查询缓存容量（按编码字符串计条目）
+    pub lookup_cache_capacity: usize,
+}
+
+impl Default for RimeDictConfig {
+    fn default() -> Self {
+        Self {
+            prefix_cache_capacity: PREFIX_CACHE_LIMIT,
+            lookup_cache_capacity: LOOKUP_CACHE_LIMIT,
+        }
+    }
+}
 
 /// `prefix_lookup` 性能统计（用于定位卡顿：枚举路径数 vs 实际表查询次数）
 #[derive(Default)]
@@ -107,10 +133,11 @@ pub struct RimeDict {
     syllable_to_id: FxHashMap<String, SyllableId>,
     /// 前缀查询缓存（音节 id 序列 → `(text, score)` 列表），惰性填充。
     /// 单音节前缀缓存 top N；多音节前缀结果天然较小，全量缓存。
-    prefix_cache: RwLock<FxHashMap<Vec<SyllableId>, PrefixEntries>>,
+    /// 满载时 LRU 逐条淘汰最久未使用条目，热点前缀长期保留。
+    prefix_cache: RwLock<LruCache<Vec<SyllableId>, PrefixEntries>>,
     /// 精确查询缓存（编码字符串 → 候选）。词典加载后只读，结果恒定；
-    /// 输入逐键增长时相邻按键共享前缀编码，命中率高。
-    lookup_cache: RwLock<FxHashMap<String, Vec<Candidate>>>,
+    /// 输入逐键增长时相邻按键共享前缀编码，命中率高。满载时 LRU 逐条淘汰。
+    lookup_cache: RwLock<LruCache<String, Vec<Candidate>>>,
     /// 语言模型（惰性构建，共享实例只建一次）
     lm: OnceLock<LanguageModel>,
 }
@@ -118,15 +145,27 @@ pub struct RimeDict {
 impl RimeDict {
     /// 从词条列表直接构建（内存编译，用于内置词典与测试）
     pub fn from_entries(entries: Vec<RawEntry>) -> Result<Self, RimeDictError> {
+        Self::from_entries_with_config(entries, RimeDictConfig::default())
+    }
+
+    /// 从词条列表构建，并指定缓存配置
+    pub fn from_entries_with_config(
+        entries: Vec<RawEntry>,
+        config: RimeDictConfig,
+    ) -> Result<Self, RimeDictError> {
         let syllabary = collect_syllabary(&entries);
         let algebra = SpellingAlgebra::new(vec![]);
         let prism_bin = PrismBuilder::build(&syllabary, &algebra, ALPHABET, 0, 0).into_bytes();
         let table_bin = TableBuilder::build(&entries, 0)?.into_bytes();
-        Self::from_bins(prism_bin, table_bin)
+        Self::from_bins(prism_bin, table_bin, config)
     }
 
     /// 从已编译的二进制映像加载
-    fn from_bins(prism_bin: Vec<u8>, table_bin: Vec<u8>) -> Result<Self, RimeDictError> {
+    fn from_bins(
+        prism_bin: Vec<u8>,
+        table_bin: Vec<u8>,
+        config: RimeDictConfig,
+    ) -> Result<Self, RimeDictError> {
         // 加载校验并读取音节表（table 与 prism 的音节 id 一致：均为排序去重列表）
         let table = Table::load(&table_bin)?;
         let syllabary = table.syllabary_entries()?;
@@ -143,13 +182,17 @@ impl RimeDict {
         let prism_cell = PrismCell::try_new(prism_bin, |bytes| Prism::load(bytes))?;
         let table_cell = TableCell::try_new(table_bin, |bytes| Table::load(bytes))?;
 
+        // LRU 容量下限为 1，避免配置为 0 时 NonZeroUsize  panic
+        let prefix_cap = NonZeroUsize::new(config.prefix_cache_capacity.max(1)).unwrap();
+        let lookup_cap = NonZeroUsize::new(config.lookup_cache_capacity.max(1)).unwrap();
+
         Ok(Self {
             prism_cell,
             table_cell,
             syllabary,
             syllable_to_id,
-            prefix_cache: RwLock::new(FxHashMap::default()),
-            lookup_cache: RwLock::new(FxHashMap::default()),
+            prefix_cache: RwLock::new(LruCache::new(prefix_cap)),
+            lookup_cache: RwLock::new(LruCache::new(lookup_cap)),
             lm: OnceLock::new(),
         })
     }
@@ -181,7 +224,7 @@ impl RimeDict {
             info!("Using cached rime dictionary: {}", table_path.display());
             let prism_bin = fs::read(&prism_path)?;
             let table_bin = fs::read(&table_path)?;
-            return Self::from_bins(prism_bin, table_bin);
+            return Self::from_bins(prism_bin, table_bin, RimeDictConfig::default());
         }
 
         info!("Compiling rime dictionary from: {}", src_path.display());
@@ -227,7 +270,7 @@ impl RimeDict {
         let prism_bin =
             PrismBuilder::build(&syllabary, &algebra, ALPHABET, checksum, 0).into_bytes();
         let table_bin = TableBuilder::build(entries, checksum)?.into_bytes();
-        Self::from_bins(prism_bin, table_bin)
+        Self::from_bins(prism_bin, table_bin, RimeDictConfig::default())
     }
 
     /// 构建内置小词典（无外部词库时的回退）
@@ -448,6 +491,7 @@ impl RimeDict {
     /// 前缀查询：收集以 `ids` 为编码前缀的全部词条（含精确命中）。
     ///
     /// 结果按 `ids` 缓存（单音节缓存 top N，多音节全量），重复输入零查表。
+    /// 缓存满载时 LRU 逐条淘汰最久未使用条目，热点前缀不受影响。
     fn collect_prefix(
         &self,
         ids: &[SyllableId],
@@ -457,13 +501,13 @@ impl RimeDict {
         if ids.is_empty() {
             return;
         }
-        {
-            let cache = self.prefix_cache.read().unwrap();
-            if let Some(cached) = cache.get(ids) {
-                stats.cache_hits += 1;
-                out.extend(cached.iter().cloned());
-                return;
-            }
+        // LRU 命中需更新热度（&mut），直接取写锁；内存哈希操作耗时纳秒级，
+        // 引擎线程串行查询，无争用风险
+        let mut cache = self.prefix_cache.write().unwrap();
+        if let Some(cached) = cache.get(ids) {
+            stats.cache_hits += 1;
+            out.extend(cached.iter().cloned());
+            return;
         }
         let t = Instant::now();
         let mut entries = self.query_prefix_resolved(ids);
@@ -473,12 +517,7 @@ impl RimeDict {
         if ids.len() == 1 {
             entries.truncate(PREFIX1_CACHE_LIMIT);
         }
-        let mut cache = self.prefix_cache.write().unwrap();
-        // 防御性清理：防止缓存无限增长（不同音节前缀组合随输入累积）
-        if cache.len() > 1024 {
-            cache.clear();
-        }
-        cache.insert(ids.to_vec(), entries.clone());
+        cache.put(ids.to_vec(), entries.clone());
         out.extend(entries);
     }
 
@@ -540,22 +579,16 @@ impl Dictionary for RimeDict {
     fn lookup(&self, code: &str) -> Vec<Candidate> {
         // 精确查询结果只取决于编码与只读词典，按编码字符串缓存；
         // 输入逐键增长时共享前缀命中率高，避免重复查表。
-        {
-            let cache = self.lookup_cache.read().unwrap();
-            if let Some(cached) = cache.get(code) {
-                return cached.clone();
-            }
+        // 缓存满载时 LRU 逐条淘汰最久未使用条目，热点编码不受影响。
+        let mut cache = self.lookup_cache.write().unwrap();
+        if let Some(cached) = cache.get(code) {
+            return cached.clone();
         }
         let candidates = match self.code_to_ids(code) {
             Some(ids) if !ids.is_empty() => self.lookup_uncached(&ids),
             _ => Vec::new(),
         };
-        let mut cache = self.lookup_cache.write().unwrap();
-        // 防御性清理：防止不同编码前缀组合随输入累积无限增长
-        if cache.len() > LOOKUP_CACHE_LIMIT {
-            cache.clear();
-        }
-        cache.insert(code.to_string(), candidates.clone());
+        cache.put(code.to_string(), candidates.clone());
         candidates
     }
 
@@ -893,6 +926,78 @@ mod tests {
         let candidates = dict.lookup("zhong wen");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].text, "中文");
+    }
+
+    /// 缓存满载时 LRU 逐条淘汰最久未使用条目，热点编码保留
+    #[test]
+    fn test_lookup_cache_lru_eviction() {
+        let dict = RimeDict::from_entries_with_config(
+            vec![
+                entry("a", "啊", 1),
+                entry("ai", "爱", 2),
+                entry("zhong wen", "中文", 3),
+            ],
+            RimeDictConfig {
+                lookup_cache_capacity: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // 填满容量：a, ai（a 为较旧）
+        dict.lookup("a");
+        dict.lookup("ai");
+        // 刷新 a 的热度，使 ai 成为最久未使用
+        dict.lookup("a");
+        // 插入第三个编码，应淘汰 ai 而非全量清空
+        dict.lookup("zhong wen");
+
+        let cache = dict.lookup_cache.read().unwrap();
+        assert_eq!(cache.len(), 2);
+        assert!(cache.peek("a").is_some(), "热点编码 a 应保留");
+        assert!(cache.peek("zhong wen").is_some(), "新编码应入缓存");
+        assert!(cache.peek("ai").is_none(), "最久未使用的 ai 应被淘汰");
+    }
+
+    /// 前缀查询缓存同样按 LRU 逐条淘汰
+    #[test]
+    fn test_prefix_cache_lru_eviction() {
+        let dict = RimeDict::from_entries_with_config(
+            vec![
+                entry("a", "啊", 1),
+                entry("ai", "爱", 2),
+                entry("ao", "奥", 3),
+            ],
+            RimeDictConfig {
+                prefix_cache_capacity: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // 直接调用 collect_prefix，精确控制缓存键（prefix_lookup 会做末音节
+        // 前缀扩展，一次调用级联缓存多个 id 序列，不利于构造确定场景）
+        let id_a = dict.code_to_ids("a").unwrap();
+        let id_ai = dict.code_to_ids("ai").unwrap();
+        let id_ao = dict.code_to_ids("ao").unwrap();
+        let mut out = Vec::new();
+        let mut stats = PrefixLookupStats::default();
+
+        // 填满容量：a, ai，随后刷新 a 的热度
+        dict.collect_prefix(&id_a, &mut out, &mut stats);
+        dict.collect_prefix(&id_ai, &mut out, &mut stats);
+        dict.collect_prefix(&id_a, &mut out, &mut stats);
+        // 插入第三个前缀，应淘汰 ai
+        dict.collect_prefix(&id_ao, &mut out, &mut stats);
+
+        let cache = dict.prefix_cache.read().unwrap();
+        assert_eq!(cache.len(), 2);
+        assert!(cache.peek(id_a.as_slice()).is_some(), "热点前缀 a 应保留");
+        assert!(cache.peek(id_ao.as_slice()).is_some(), "新前缀应入缓存");
+        assert!(
+            cache.peek(id_ai.as_slice()).is_none(),
+            "最久未使用的 ai 应被淘汰"
+        );
     }
 
     #[test]

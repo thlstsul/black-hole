@@ -27,7 +27,7 @@ pub use pinyin_preprocessor::PinyinPreprocessor;
 pub use pinyin_scheme::PinyinScheme;
 pub use punctuation::convert_punctuation;
 pub use ranker::{SimpleRanker, UserAwareRanker};
-pub use rime_dict::{RawEntry, RimeDict, RimeDictError};
+pub use rime_dict::{RawEntry, RimeDict, RimeDictConfig, RimeDictError};
 pub use scheme_registry::SchemeRegistry;
 pub use shuangpin::ShuangpinCodec;
 pub use shuangpin_scheme::ShuangpinScheme;
