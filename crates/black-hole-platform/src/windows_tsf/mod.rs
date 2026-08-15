@@ -30,10 +30,12 @@ use windows_core::{GUID, PCWSTR, w};
 
 use super::{PlatformError, PlatformIme};
 use black_hole_shared::{
-    EngineCommand, InputModeSwitch, KeyEvent, SchemeId, SchemeResult, Theme, UiCommand,
+    AutoModeSwitch, EngineCommand, InputModeSwitch, KeyEvent, SchemeId, SchemeResult, Theme,
+    UiCommand,
 };
 
 pub mod auto_register;
+pub(crate) mod auto_switch;
 pub(crate) mod caret;
 pub(crate) mod commit;
 pub(crate) mod dll;
@@ -156,6 +158,14 @@ pub(crate) struct ServiceInner {
     /// 最近一次 Ctrl 松开是否已由全局键盘钩子完成切换。
     /// TSF 路径（OnTestKeyUp）看到该标志时跳过，避免与钩子重复切换。
     pub(crate) hook_toggled: bool,
+    /// "根据光标周围文本自动切换中英模式"开关（由 daemon 的 GetSettings 同步，支持热更新）。
+    pub(crate) auto_switch: bool,
+    /// 自动切换状态机：评估语境建议、维护手动切换锁定的语境基线。
+    pub(crate) auto_mode: AutoModeSwitch,
+    /// 英文模式自动切换评估去重：最近一次在 OnTestKeyDown 评估过的按键及时间。
+    /// 部分应用（如 WebView2）对同一按键既调 OnTestKeyDown 又调 OnKeyDown，
+    /// OnKeyDown 据此在时间窗内跳过重复评估。
+    pub(crate) last_eng_eval_key: Option<(usize, Instant)>,
 }
 
 impl ServiceInner {
@@ -179,6 +189,9 @@ impl ServiceInner {
             current_theme: Theme::Light,
             mode_switch: InputModeSwitch::default(),
             hook_toggled: false,
+            auto_switch: false,
+            auto_mode: AutoModeSwitch::default(),
+            last_eng_eval_key: None,
         }
     }
 }
@@ -253,6 +266,10 @@ pub(crate) fn try_reconnect_ipc(inner_arc: &Arc<Mutex<ServiceInner>>) -> bool {
                 "try_reconnect_ipc: connected to daemon at {}",
                 IPC_SERVER_ADDR
             );
+            // 释放锁后重新同步设置：daemon 可能已重启且方案/主题/中英模式/
+            // 自动切换开关发生变化，避免本进程残留旧状态。
+            drop(inner);
+            service::sync_settings_from_daemon_inner(inner_arc);
             true
         }
         Err(e) => {
@@ -288,24 +305,24 @@ pub(crate) fn send_ui_command_inner(inner_arc: &Arc<Mutex<ServiceInner>>, cmd: U
 // ---------------------------------------------------------------------------
 
 pub struct WindowsTsfIme {
-    /// 运行时方案/主题/中英模式状态，daemon 每次切换时同步更新
-    current: Arc<Mutex<(SchemeId, Theme, bool)>>,
+    /// 运行时方案/主题/中英模式/自动切换开关状态，daemon 每次切换时同步更新
+    current: Arc<Mutex<(SchemeId, Theme, bool, bool)>>,
 }
 
 impl WindowsTsfIme {
     /// 使用共享状态创建。`current` 会被 daemon 在每次方案/主题/中英模式切换时自动更新。
-    pub fn new(current: Arc<Mutex<(SchemeId, Theme, bool)>>) -> Self {
+    pub fn new(current: Arc<Mutex<(SchemeId, Theme, bool, bool)>>) -> Self {
         Self { current }
     }
 
     /// 创建时指定初始值（内部创建共享状态）。
     pub fn new_with_values(default_scheme: SchemeId, default_theme: Theme) -> Self {
         Self {
-            current: Arc::new(Mutex::new((default_scheme, default_theme, false))),
+            current: Arc::new(Mutex::new((default_scheme, default_theme, false, false))),
         }
     }
 
-    pub fn current(&self) -> &Arc<Mutex<(SchemeId, Theme, bool)>> {
+    pub fn current(&self) -> &Arc<Mutex<(SchemeId, Theme, bool, bool)>> {
         &self.current
     }
 }
@@ -356,7 +373,7 @@ fn handle_ipc_client(
     engine_tx: Sender<EngineCommand>,
     platform_rx: Arc<Mutex<Receiver<SchemeResult>>>,
     ui_tx: Sender<UiCommand>,
-    current: Arc<Mutex<(SchemeId, Theme, bool)>>,
+    current: Arc<Mutex<(SchemeId, Theme, bool, bool)>>,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
@@ -404,11 +421,12 @@ fn handle_ipc_client(
                 let _ = ui_tx.send(ui_cmd);
             }
             IpcRequest::GetSettings => {
-                let (scheme_id, theme, english) = *current.lock().unwrap();
+                let (scheme_id, theme, english, auto_switch) = *current.lock().unwrap();
                 let response = IpcResponse::Settings {
                     scheme_id,
                     theme,
                     english,
+                    auto_switch,
                 };
                 let json = to_string(&response)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;

@@ -58,6 +58,7 @@ const MENU_ID_DARK: u32 = 5;
 const MENU_ID_SYSTEM: u32 = 6;
 const MENU_ID_EXIT: u32 = 7;
 const MENU_ID_AUTO_START: u32 = 9;
+const MENU_ID_AUTO_SWITCH: u32 = 10;
 
 // ---------------------------------------------------------------------------
 // 菜单暗色主题支持
@@ -200,6 +201,22 @@ impl BlackHoleLangBarItem {
         inner.mode_switch.is_english()
     }
 
+    fn is_auto_switch(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.auto_switch
+    }
+
+    /// 切换"根据光标周围文本自动切换中英"开关：本进程立即生效，
+    /// 持久化与其它进程同步由 daemon 统一处理（焦点同步时拉取）。
+    fn toggle_auto_switch(&self) {
+        let next = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.auto_switch = !inner.auto_switch;
+            inner.auto_switch
+        };
+        self.send_ui_command(UiCommand::SetAutoSwitch(next));
+    }
+
     /// 切换中英文模式（不依赖 Ctrl 键事件，Chrome 等应用不把单独修饰键
     /// 转发给 TSF，因此通过点击语言栏提供显式入口）。
     fn toggle_input_mode(&self) {
@@ -336,6 +353,19 @@ impl BlackHoleLangBarItem {
 
             let _ = AppendMenuW(root, MF_SEPARATOR, 0, PCWSTR::null());
 
+            // 根据光标周围文本自动切换中英：勾选状态反映本进程同步到的设置
+            let _ = AppendMenuW(
+                root,
+                MF_STRING
+                    | if self.is_auto_switch() {
+                        MF_CHECKED
+                    } else {
+                        MF_UNCHECKED
+                    },
+                MENU_ID_AUTO_SWITCH as usize,
+                w!("自动切换中英"),
+            );
+
             // 开机自启动：勾选状态反映系统当前配置（读注册表，无副作用）
             let _ = AppendMenuW(
                 root,
@@ -437,6 +467,7 @@ impl BlackHoleLangBarItem {
                     let next = !is_auto_start();
                     self.send_ui_command(UiCommand::SetAutoStart(next));
                 }
+                MENU_ID_AUTO_SWITCH => self.toggle_auto_switch(),
                 MENU_ID_EXIT => self.send_ui_command(UiCommand::Exit),
                 _ => {}
             }
@@ -558,6 +589,18 @@ impl ITfLangBarItemButton_Impl for BlackHoleLangBarItem_Impl {
 
         add_menu_separator(&menu)?;
 
+        // 根据光标周围文本自动切换中英：勾选状态反映本进程同步到的设置
+        add_menu_item(
+            &menu,
+            MENU_ID_AUTO_SWITCH,
+            if self.is_auto_switch() {
+                TF_LBMENUF_CHECKED
+            } else {
+                0
+            },
+            "自动切换中英",
+        )?;
+
         // 开机自启动：勾选状态反映系统当前配置（读注册表，无副作用）
         add_menu_item(
             &menu,
@@ -605,6 +648,7 @@ impl ITfLangBarItemButton_Impl for BlackHoleLangBarItem_Impl {
                 let next = !is_auto_start();
                 self.send_ui_command(UiCommand::SetAutoStart(next));
             }
+            MENU_ID_AUTO_SWITCH => self.toggle_auto_switch(),
             MENU_ID_EXIT => self.send_ui_command(UiCommand::Exit),
             _ => {}
         }

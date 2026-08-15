@@ -26,9 +26,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::ServiceInner;
+use super::caret::{get_caret_position_via_gui_thread_info, read_surrounding_text_via_uia};
 use super::send_ui_command_inner;
 use super::service::apply_input_mode_toggle;
-use black_hole_shared::UiCommand;
+use black_hole_shared::{UiCommand, suggest_input_mode};
 use tracing::{debug, warn};
 
 /// 当前进程内所有已激活的文本服务实例（线程 id → 弱引用）。
@@ -274,6 +275,16 @@ fn on_ctrl_released() {
         toggled
     };
     if let Some(english) = toggled {
+        // 用户手动切换：即时采样当前语境建议作为锁定基线（钩子回调中无法请求
+        // TSF 编辑会话，走 UIA TextPattern 读取；失败/无信号则为 None 基线），
+        // 同语境的自动建议不再撤销本次选择
+        let caret_pos = get_caret_position_via_gui_thread_info().ok();
+        let (preceding, following) =
+            read_surrounding_text_via_uia(caret_pos.map(|(x, y, _)| (x, y)));
+        let suggestion = suggest_input_mode(preceding.as_deref(), following.as_deref());
+        if let Ok(mut guard) = inner.lock() {
+            guard.auto_mode.lock_manual(suggestion);
+        }
         debug!(
             "Ctrl toggled via keyboard hook: {}",
             if english { "英文" } else { "中文" }

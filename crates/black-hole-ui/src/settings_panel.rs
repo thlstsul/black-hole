@@ -234,6 +234,21 @@ impl App for SettingsPanelApp {
                     ui.add_space(8.0);
 
                     ui.group(|ui| {
+                        ui.label("中英文自动切换");
+                        ui.horizontal(|ui| {
+                            changed |= ui
+                                .checkbox(
+                                    &mut settings.auto_switch_mode,
+                                    "根据光标周围文本自动切换中英文",
+                                )
+                                .changed();
+                        });
+                        ui.label("移动光标后按语境自动切换中/英文模式。");
+                    });
+
+                    ui.add_space(8.0);
+
+                    ui.group(|ui| {
                         ui.label("整句补全（LLM）");
                         ui.horizontal(|ui| {
                             changed |= ui

@@ -169,6 +169,91 @@ impl InputModeSwitch {
     }
 }
 
+/// 根据光标周围文本推断目标输入模式。true=英文，false=中文，None=无信号保持现状。
+///
+/// 前文从末尾向前逐字符扫描，跳过 Unicode 空白与 ASCII 标点，命中的第一个
+/// 强信号字符决定结果：ASCII 字母或数字 → 英文；CJK 字符或中文标点 → 中文；
+/// 其它字符（如 emoji、其它文字）视为中性继续向前。前文无强信号时，再对
+/// 后文从头向后做同样扫描；均无强信号则返回 None。
+pub fn suggest_input_mode(preceding: Option<&str>, following: Option<&str>) -> Option<bool> {
+    if let Some(text) = preceding
+        && let Some(mode) = scan_mode_signal(text.chars().rev())
+    {
+        return Some(mode);
+    }
+    if let Some(text) = following
+        && let Some(mode) = scan_mode_signal(text.chars())
+    {
+        return Some(mode);
+    }
+    None
+}
+
+/// 逐字符扫描强信号：ASCII 字母/数字 → 英文；CJK 字符/中文标点 → 中文；
+/// 空白、ASCII 标点与其它中性字符（emoji、其它文字等）跳过。
+fn scan_mode_signal(chars: impl Iterator<Item = char>) -> Option<bool> {
+    for ch in chars {
+        if ch.is_whitespace() || ch.is_ascii_punctuation() {
+            continue;
+        }
+        if ch.is_ascii_alphanumeric() {
+            return Some(true);
+        }
+        if is_cjk_or_zh_punct(ch) {
+            return Some(false);
+        }
+        // 中性字符：继续扫描
+    }
+    None
+}
+
+/// 是否 CJK 字符或中文标点（全角字符）
+fn is_cjk_or_zh_punct(ch: char) -> bool {
+    matches!(ch,
+        '\u{4E00}'..='\u{9FFF}'      // CJK 统一表意文字
+        | '\u{3400}'..='\u{4DBF}'    // CJK 统一表意文字扩展 A
+        | '\u{F900}'..='\u{FAFF}'    // CJK 兼容表意文字
+        | '\u{3000}'..='\u{303F}'    // CJK 符号和标点
+        | '\u{FF00}'..='\u{FFEF}') // 全角字符
+}
+
+/// 根据光标周围文本自动切换中英模式的状态机。
+///
+/// 配合 [`suggest_input_mode`] 使用：平台层在语境变化时调用 `evaluate`，
+/// 返回 Some(target) 表示应自动切换；用户手动切换后调用 `lock_manual`
+/// 并传入手动切换时刻评估的当前语境建议作为锁定基线，锁定期间同语境的
+/// 建议不再撤销用户选择，语境变化后自动解锁、恢复自动切换。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AutoModeSwitch {
+    /// None=未锁定；Some(b)=已锁定，b 为锁定时语境基线
+    locked_baseline: Option<Option<bool>>,
+}
+
+impl AutoModeSwitch {
+    /// 评估一次建议；返回 Some(target) 表示应自动切换到 target（true=英文）。
+    pub fn evaluate(&mut self, suggestion: Option<bool>, current_english: bool) -> Option<bool> {
+        // 已锁定：语境未变（建议等于基线）则保持锁定不动作；
+        // 语境已变则解除锁定，继续向下正常评估。
+        if let Some(baseline) = self.locked_baseline {
+            if suggestion == baseline {
+                return None;
+            }
+            self.locked_baseline = None;
+        }
+        match suggestion {
+            Some(target) if target != current_english => Some(target),
+            _ => None,
+        }
+    }
+
+    /// 用户手动切换后调用：以手动切换时刻评估的当前语境建议作为锁定基线。
+    /// 必须即时采样传入（而非复用旧评估结果），否则用户移动到其它语境后
+    /// 手动切换会以陈旧基线锁定，下个按键即被自动切换撤销。
+    pub fn lock_manual(&mut self, current_suggestion: Option<bool>) {
+        self.locked_baseline = Some(current_suggestion);
+    }
+}
+
 /// 平台适配层 → 引擎的命令
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EngineCommand {
@@ -217,6 +302,12 @@ pub enum UiCommand {
     /// 中英文输入模式切换：TSF 实例切换后上报 daemon，
     /// daemon 持久化并更新共享状态，供其它进程同步。
     SetInputMode(bool),
+    /// 自动切换中英模式上报：由"根据光标周围文本自动切换"逻辑触发，
+    /// daemon 只更新共享状态不持久化（区别于用户手动切换的 SetInputMode）。
+    SetInputModeTransient(bool),
+    /// 开关"根据光标周围文本自动切换中英模式"：daemon 持久化并更新共享状态，
+    /// 各进程 TSF 实例获得焦点时同步（与设置面板复选框等价）。
+    SetAutoSwitch(bool),
     /// daemon → 候选窗线程：热更新候选窗参数（字号、最大候选数等）
     SetCandidateWindowSettings(CandidateWindowSettings),
     /// daemon → 候选窗线程：同步"整句上屏"实际绑定的按键名，
@@ -239,6 +330,9 @@ pub struct Settings {
     /// 由 daemon 全局持有并持久化，各进程 TSF 实例启动/获得焦点时同步。
     #[serde(default)]
     pub english_mode: bool,
+    /// 是否根据光标周围文本自动切换中英模式（默认关闭，需用户显式开启）
+    #[serde(default)]
+    pub auto_switch_mode: bool,
     /// LLM 整句补全设置（默认关闭，需用户显式开启）
     #[serde(default)]
     pub llm_completion: LlmCompletionSettings,
@@ -253,6 +347,7 @@ impl Default for Settings {
             key_bindings: KeyBindings::default(),
             auto_start: false,
             english_mode: false,
+            auto_switch_mode: false,
             llm_completion: LlmCompletionSettings::default(),
         }
     }
@@ -550,5 +645,109 @@ mod tests {
         // 松开时 TSF 路径应正常切换，而不是被陈旧标志吞掉
         assert_eq!(tsf_keyup(&mut sw, &mut hook_toggled), Some(true));
         assert!(sw.is_english());
+    }
+
+    // ------------------------------------------------------------------
+    // 根据光标周围文本推断输入模式（suggest_input_mode）
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn suggest_preceding_chinese_returns_chinese() {
+        assert_eq!(suggest_input_mode(Some("你好"), None), Some(false));
+    }
+
+    #[test]
+    fn suggest_preceding_english_trailing_space_returns_english() {
+        // 末尾空格跳过，命中 'd' → 英文
+        assert_eq!(suggest_input_mode(Some("hello world "), None), Some(true));
+    }
+
+    #[test]
+    fn suggest_preceding_chinese_punct_returns_chinese() {
+        // 中文标点（全角逗号）是中文信号
+        assert_eq!(suggest_input_mode(Some("你好，"), None), Some(false));
+    }
+
+    #[test]
+    fn suggest_blank_preceding_falls_back_to_following() {
+        // 前文仅空白无信号，扫描后文命中英文
+        assert_eq!(suggest_input_mode(Some("   "), Some("abc")), Some(true));
+    }
+
+    #[test]
+    fn suggest_no_signal_returns_none() {
+        assert_eq!(suggest_input_mode(None, None), None);
+        assert_eq!(suggest_input_mode(Some("  \t "), None), None);
+        assert_eq!(suggest_input_mode(Some(" "), Some("  ")), None);
+    }
+
+    #[test]
+    fn suggest_preceding_alnum_returns_english() {
+        assert_eq!(suggest_input_mode(Some("abc123"), None), Some(true));
+    }
+
+    #[test]
+    fn suggest_preceding_mixed_chinese_returns_chinese() {
+        // 从末尾向前扫：空格跳过，命中 '章'（CJK）→ 中文
+        assert_eq!(suggest_input_mode(Some("第 3 章 "), None), Some(false));
+    }
+
+    #[test]
+    fn suggest_neutral_chars_are_skipped() {
+        // 末尾空格跳过、emoji 中性跳过，命中 'o' → 英文
+        assert_eq!(suggest_input_mode(Some("hello 🎉 "), None), Some(true));
+    }
+
+    // ------------------------------------------------------------------
+    // 自动切换状态机（AutoModeSwitch）
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn auto_unlocked_switches_on_different_suggestion() {
+        let mut sw = AutoModeSwitch::default();
+        // 建议与当前不同 → 自动切换
+        assert_eq!(sw.evaluate(Some(true), false), Some(true));
+        assert_eq!(sw.evaluate(Some(false), true), Some(false));
+        // 建议与当前相同 → 不动作
+        assert_eq!(sw.evaluate(Some(true), true), None);
+        // 无建议 → 不动作
+        assert_eq!(sw.evaluate(None, false), None);
+    }
+
+    #[test]
+    fn auto_manual_lock_blocks_same_context_and_unlocks_on_change() {
+        let mut sw = AutoModeSwitch::default();
+
+        // 用户在英文语境（建议=英文，当前已是英文）下手动切换
+        assert_eq!(sw.evaluate(Some(true), true), None);
+        sw.lock_manual(Some(true));
+
+        // 锁定生效：同语境建议不再撤销用户选择（当前中文也不自动切回英文）
+        assert_eq!(sw.evaluate(Some(true), false), None);
+
+        // 语境变化（建议变为中文）→ 解锁；建议与当前相同，不动作
+        assert_eq!(sw.evaluate(Some(false), false), None);
+
+        // 已解锁：恢复自动切换
+        assert_eq!(sw.evaluate(Some(true), false), Some(true));
+    }
+
+    #[test]
+    fn auto_manual_lock_uses_fresh_baseline_not_stale_suggestion() {
+        let mut sw = AutoModeSwitch::default();
+
+        // 此前在英文语境评估过（建议=英文），随后用户移动到中文语境
+        assert_eq!(sw.evaluate(Some(true), true), None);
+        // 手动切换为英文：以手动切换时刻采样的当前语境（中文建议）为锁定基线
+        sw.lock_manual(Some(false));
+
+        // 同语境（中文建议）不再撤销用户选择：保持英文不自动切回中文
+        assert_eq!(sw.evaluate(Some(false), true), None);
+
+        // 语境变化（建议变为英文）→ 解锁；建议与当前相同，不动作
+        assert_eq!(sw.evaluate(Some(true), true), None);
+
+        // 已解锁：恢复自动切换
+        assert_eq!(sw.evaluate(Some(false), true), Some(false));
     }
 }

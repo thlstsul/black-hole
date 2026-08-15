@@ -4,12 +4,12 @@
 //! channel 与引擎线程通信处理按键，并通过 `black_hole_ui` 显示候选窗口。
 
 use black_hole_shared::{
-    EngineCommand, InputContext, InputModeSwitch, KeyEvent, KeyState, Modifiers, SchemeResult,
-    UiCommand,
+    AutoModeSwitch, EngineCommand, InputContext, InputModeSwitch, KeyEvent, KeyState, Modifiers,
+    SchemeId, SchemeResult, Theme, UiCommand, suggest_input_mode,
 };
 use std::future::pending;
-use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use tracing::info;
 use zbus::zvariant::{Array, Dict, OwnedValue, Structure, StructureBuilder, Type, Value};
 use zbus::{Connection, Error, interface};
@@ -19,11 +19,15 @@ use super::{PlatformError, PlatformIme};
 pub mod auto_register;
 
 /// Linux IBus 输入法平台实现
-pub struct LinuxIbusIme;
+pub struct LinuxIbusIme {
+    /// daemon 共享的运行时设置（方案/主题/中英模式/自动切换开关），
+    /// 元组第四元为"根据光标周围文本自动切换中英模式"开关，支持热更新
+    current_settings: Arc<Mutex<(SchemeId, Theme, bool, bool)>>,
+}
 
 impl LinuxIbusIme {
-    pub fn new() -> Self {
-        Self
+    pub fn new(current_settings: Arc<Mutex<(SchemeId, Theme, bool, bool)>>) -> Self {
+        Self { current_settings }
     }
 }
 
@@ -57,7 +61,9 @@ impl LinuxIbusIme {
             ui_tx: Mutex::new(ui_tx),
             context: Mutex::new(InputContext::default()),
             mode_switch: Mutex::new(InputModeSwitch::default()),
+            auto_mode: Mutex::new(AutoModeSwitch::default()),
             last_code: Mutex::new(None),
+            current_settings: Arc::clone(&self.current_settings),
             conn: conn.clone(),
         };
 
@@ -81,8 +87,13 @@ struct IbusEngine {
     context: Mutex<InputContext>,
     /// 中英文模式切换状态机（Ctrl 键触发）
     mode_switch: Mutex<InputModeSwitch>,
+    /// 根据光标周围文本自动切换中英模式的状态机
+    /// （用户手动切换后锁定语境基线，语境变化后自动解锁）
+    auto_mode: Mutex<AutoModeSwitch>,
     /// 最近一次 composition 的编码（切英文模式时上屏保留）
     last_code: Mutex<Option<String>>,
+    /// daemon 共享的运行时设置：元组第四元为自动切换开关，每次评估时读取
+    current_settings: Arc<Mutex<(SchemeId, Theme, bool, bool)>>,
     conn: Connection,
 }
 
@@ -132,6 +143,52 @@ impl IbusEngine {
             )
             .await;
     }
+
+    /// 根据光标周围文本自动评估并切换中英模式。
+    ///
+    /// 仅在自动切换开关开启（daemon 共享状态元组第四元，支持热更新）且
+    /// 当前非合成态（无未上屏编码）时评估；命中建议时直接设置模式并复用
+    /// `apply_mode_change` 完成上屏保留/重置引擎/更新属性收尾。
+    async fn maybe_auto_switch_mode(&self) {
+        if !self.current_settings.lock().unwrap().3 {
+            return;
+        }
+        // 合成中（输入框尚有编码）不评估，避免打断正在进行的输入
+        let composing = self
+            .last_code
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|c| !c.is_empty());
+        if composing {
+            return;
+        }
+        let (preceding, following) = {
+            let ctx = self.context.lock().unwrap();
+            (ctx.preceding_text.clone(), ctx.following_text.clone())
+        };
+        let suggestion = suggest_input_mode(preceding.as_deref(), following.as_deref());
+        let target = {
+            let current = self.mode_switch.lock().unwrap().is_english();
+            self.auto_mode.lock().unwrap().evaluate(suggestion, current)
+        };
+        if let Some(english) = target {
+            // evaluate 已确认目标与当前不同，set_english 必然产生切换
+            self.mode_switch.lock().unwrap().set_english(english);
+            info!(
+                "Input mode auto switched: {}",
+                if english { "英文" } else { "中文" }
+            );
+            self.apply_mode_change(english).await;
+        }
+    }
+
+    /// 以缓存的光标周围文本评估当前语境建议（手动切换时作为锁定基线，
+    /// 必须即时采样：陈旧基线会导致下个按键即被自动切换撤销）
+    fn current_context_suggestion(&self) -> Option<bool> {
+        let ctx = self.context.lock().unwrap();
+        suggest_input_mode(ctx.preceding_text.as_deref(), ctx.following_text.as_deref())
+    }
 }
 
 #[interface(name = "org.freedesktop.IBus.Engine")]
@@ -161,6 +218,10 @@ impl IbusEngine {
                     "Input mode toggled: {}",
                     if english { "英文" } else { "中文" }
                 );
+                // 用户手动切换：以即时采样的当前语境建议为锁定基线，
+                // 同语境的自动建议不再撤销本次选择
+                let suggestion = self.current_context_suggestion();
+                self.auto_mode.lock().unwrap().lock_manual(suggestion);
                 self.apply_mode_change(english).await;
             }
             return false;
@@ -170,6 +231,9 @@ impl IbusEngine {
         if state & CONTROL_MASK != 0 {
             self.mode_switch.lock().unwrap().other_key_pressed(true);
         }
+
+        // 根据光标周围文本自动切换中英模式（开关开启且非合成态时评估一次）
+        self.maybe_auto_switch_mode().await;
 
         // 英文模式下不消费任何按键。
         if self.mode_switch.lock().unwrap().is_english() {
@@ -243,9 +307,14 @@ impl IbusEngine {
 
     /// 更新光标位置
     async fn set_cursor_location(&self, x: i32, y: i32, _w: i32, h: i32) {
-        let engine_tx = self.engine_tx.lock().unwrap();
-        let ctx = InputContext::caret(x, y, h);
+        // 合并更新：保留 set_surrounding_text 缓存的周围文本，仅刷新光标坐标；
+        // 整体覆盖会清掉文本缓存，使自动切换中英模式评估失去依据
+        let mut ctx = self.context.lock().unwrap().clone();
+        ctx.caret_x = x;
+        ctx.caret_y = y;
+        ctx.caret_h = h;
         *self.context.lock().unwrap() = ctx.clone();
+        let engine_tx = self.engine_tx.lock().unwrap();
         let _ = engine_tx.send(EngineCommand::SetContext(ctx));
     }
 
@@ -291,10 +360,12 @@ impl IbusEngine {
             .collect();
         let following: String = post.chars().take(MAX_FOLLOWING_CHARS).collect();
 
-        // 保留 set_cursor_location 写入的光标坐标，仅更新文本字段
+        // 保留 set_cursor_location 写入的光标坐标，仅更新文本字段；
+        // 同时缓存到 self.context，供自动切换中英模式评估时读取周围文本
         let mut ctx = self.context.lock().unwrap().clone();
         ctx.preceding_text = (!preceding.is_empty()).then_some(preceding);
         ctx.following_text = (!following.is_empty()).then_some(following);
+        *self.context.lock().unwrap() = ctx.clone();
         let engine_tx = self.engine_tx.lock().unwrap();
         let _ = engine_tx.send(EngineCommand::SetContext(ctx));
     }
@@ -379,6 +450,10 @@ impl IbusEngine {
                 "Input mode toggled via property: {}",
                 if english { "英文" } else { "中文" }
             );
+            // 用户手动切换：以即时采样的当前语境建议为锁定基线，
+            // 同语境的自动建议不再撤销本次选择
+            let suggestion = self.current_context_suggestion();
+            self.auto_mode.lock().unwrap().lock_manual(suggestion);
             self.apply_mode_change(english).await;
         }
     }

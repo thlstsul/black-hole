@@ -120,11 +120,12 @@ impl App {
 
         let default_theme = settings_mgr.settings().theme;
 
-        // 运行时方案/主题/中英模式状态，平台线程通过 IPC GetSettings 读取，dispatch 时同步更新
-        let current_settings: Arc<Mutex<(SchemeId, Theme, bool)>> = Arc::new(Mutex::new((
+        // 运行时方案/主题/中英模式/自动切换开关状态，平台线程通过 IPC GetSettings 读取，dispatch 时同步更新
+        let current_settings: Arc<Mutex<(SchemeId, Theme, bool, bool)>> = Arc::new(Mutex::new((
             default_scheme,
             default_theme,
             settings_mgr.settings().english_mode,
+            settings_mgr.settings().auto_switch_mode,
         )));
 
         // 最后已生效设置：dispatch 持久化时同步更新，watcher 据此跳过 daemon 自身写入，
@@ -435,7 +436,7 @@ impl App {
         cmd: UiCommand,
         engine_tx: &mpsc::Sender<EngineCommand>,
         ui_render_tx: &mpsc::Sender<UiCommand>,
-        current_settings: &Arc<Mutex<(SchemeId, Theme, bool)>>,
+        current_settings: &Arc<Mutex<(SchemeId, Theme, bool, bool)>>,
         last_applied: &Arc<Mutex<Settings>>,
     ) {
         match cmd {
@@ -504,6 +505,25 @@ impl App {
                     cur.2 = english;
                 }
             }
+            UiCommand::SetInputModeTransient(english) => {
+                // 自动切换上报：只更新共享状态供其它进程同步，不持久化
+                debug!("UI dispatch: transient input mode english={}", english);
+                let mut cur = current_settings.lock().unwrap();
+                cur.2 = english;
+            }
+            UiCommand::SetAutoSwitch(enabled) => {
+                info!("UI dispatch: set auto switch mode to {}", enabled);
+                // 持久化到设置，使重启后保持本次选择
+                let mut settings_mgr = SettingsManager::new();
+                settings_mgr.settings_mut().auto_switch_mode = enabled;
+                *last_applied.lock().unwrap() = settings_mgr.settings().clone();
+                settings_mgr.save();
+                // 同步共享状态，使平台线程（IPC GetSettings）返回最新值
+                {
+                    let mut cur = current_settings.lock().unwrap();
+                    cur.3 = enabled;
+                }
+            }
             UiCommand::Exit => {
                 // 主循环在分发前已拦截 Exit 并结束事件循环，正常不会到达此处；
                 // 保留分支以穷尽匹配，并防止误转发到候选窗线程。
@@ -525,12 +545,13 @@ impl App {
     /// - 候选窗参数：通知候选窗线程热更新字号/最大候选数
     /// - 按键绑定：通知引擎线程热更新按键映射
     /// - 中英模式：同步共享状态，供各进程 TSF 实例获得焦点时同步
+    /// - 自动切换中英模式开关：同步共享状态，供平台层每次评估时读取
     fn apply_settings_hot(
         new: &Settings,
         old: &Settings,
         engine_tx: &mpsc::Sender<EngineCommand>,
         ui_render_tx: &mpsc::Sender<UiCommand>,
-        current_settings: &Arc<Mutex<(SchemeId, Theme, bool)>>,
+        current_settings: &Arc<Mutex<(SchemeId, Theme, bool, bool)>>,
         completion_config: &Arc<Mutex<LlmCompletionSettings>>,
     ) {
         if new.theme != old.theme {
@@ -579,6 +600,14 @@ impl App {
             {
                 let mut cur = current_settings.lock().unwrap();
                 cur.2 = new.english_mode;
+            }
+        }
+
+        if new.auto_switch_mode != old.auto_switch_mode {
+            info!("Hot applying auto switch mode: {}", new.auto_switch_mode);
+            {
+                let mut cur = current_settings.lock().unwrap();
+                cur.3 = new.auto_switch_mode;
             }
         }
 
@@ -782,7 +811,7 @@ fn run_platform(
     engine_tx: mpsc::Sender<EngineCommand>,
     platform_rx: mpsc::Receiver<SchemeResult>,
     ui_tx: mpsc::Sender<UiCommand>,
-    current_settings: Arc<Mutex<(SchemeId, Theme, bool)>>,
+    current_settings: Arc<Mutex<(SchemeId, Theme, bool, bool)>>,
 ) -> Result<(), WindowsPlatformError> {
     let mut platform = WindowsTsfIme::new(current_settings);
     platform.run(engine_tx, platform_rx, ui_tx)?;
@@ -794,9 +823,9 @@ fn run_platform(
     engine_tx: mpsc::Sender<EngineCommand>,
     platform_rx: mpsc::Receiver<SchemeResult>,
     ui_tx: mpsc::Sender<UiCommand>,
-    _current_settings: Arc<Mutex<(SchemeId, Theme, bool)>>,
+    current_settings: Arc<Mutex<(SchemeId, Theme, bool, bool)>>,
 ) -> Result<(), LinuxPlatformError> {
-    let mut platform = LinuxIbusIme::new();
+    let mut platform = LinuxIbusIme::new(current_settings);
     platform.run(engine_tx, platform_rx, ui_tx)?;
     Ok(())
 }

@@ -1,11 +1,16 @@
-use super::caret::{read_surrounding_text, read_surrounding_text_via_uia};
+use super::auto_switch::apply_auto_mode_toggle;
+use super::caret::{
+    get_caret_position_via_gui_thread_info, read_surrounding_text, read_surrounding_text_via_uia,
+    truncate_for_log,
+};
 use super::commit::apply_result;
 use super::{ServiceInner, try_reconnect_ipc};
 use crate::ipc::{IpcRequest, read_response, send_request};
-use black_hole_shared::{InputContext, KeyEvent, KeyState, Modifiers};
+use black_hole_shared::{InputContext, KeyEvent, KeyState, Modifiers, suggest_input_mode};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 use windows::Win32::Foundation::{E_UNEXPECTED, LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN,
@@ -115,14 +120,18 @@ pub(crate) fn virtual_key_to_key_event(
 pub(crate) struct KeyHandlerEditSession {
     pub(crate) service: Arc<Mutex<ServiceInner>>,
     pub(crate) key_event: KeyEvent,
+    /// 中文→英文自动切换标志：会话内发生切换时置位，OnKeyDown 据此放行
+    /// 本次按键给应用（英文模式不消费按键，与 Linux 侧语义一致）。
+    pub(crate) auto_switched: Arc<AtomicBool>,
 }
 
 impl ITfEditSession_Impl for KeyHandlerEditSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
         let service = self.service.clone();
         let key_event = self.key_event.clone();
+        let auto_switched = self.auto_switched.clone();
 
-        match handle_key_event_with_reconnect(&service, ec, key_event) {
+        match handle_key_event_with_reconnect(&service, ec, key_event, &auto_switched) {
             Ok(()) => Ok(()),
             Err(e) => {
                 error!("DoEditSession: failed with error: {:?}", e);
@@ -142,8 +151,9 @@ pub(crate) fn handle_key_event_with_reconnect(
     service: &Arc<Mutex<ServiceInner>>,
     ec: u32,
     key_event: KeyEvent,
+    auto_switched: &AtomicBool,
 ) -> Result<()> {
-    let result = handle_key_event_internal(service, ec, &key_event);
+    let result = handle_key_event_internal(service, ec, &key_event, auto_switched);
     if result.is_ok() {
         return result;
     }
@@ -159,7 +169,7 @@ pub(crate) fn handle_key_event_with_reconnect(
         return result;
     }
 
-    handle_key_event_internal(service, ec, &key_event)
+    handle_key_event_internal(service, ec, &key_event, auto_switched)
 }
 
 /// Internal key event handling logic (assumes connection exists).
@@ -167,25 +177,75 @@ fn handle_key_event_internal(
     service: &Arc<Mutex<ServiceInner>>,
     ec: u32,
     key_event: &KeyEvent,
+    auto_switched: &AtomicBool,
 ) -> Result<()> {
     let result = catch_unwind(AssertUnwindSafe(|| {
         let mut inner = service.lock().unwrap();
         let ctx = inner.context.clone().ok_or(E_UNEXPECTED)?;
         let composition = inner.composition.clone();
         let last_caret_pos = inner.last_caret_pos;
+
+        // 读取光标周围文本（整句补全上下文与自动切换评估共用）。
+        // TSF 读取不依赖光标坐标，始终尝试；取不到上下文（Zed 等纯 IMM32 应用
+        // 不实现 TSF 文本存储）时回退 UIA TextPattern。UIA 优先走 GetSelection，
+        // 无需 Win32 光标坐标（自绘光标应用拿不到）；坐标仅作 RangeFromPoint 兜底，
+        // 优先用布局事件缓存，缺失时从 GUI 线程信息获取。读取失败时静默跳过，
+        // 不影响按键管线。
+        let caret_pos = last_caret_pos.or_else(|| get_caret_position_via_gui_thread_info().ok());
+        let (mut preceding_text, mut following_text) =
+            read_surrounding_text(ec, &ctx, composition.as_ref());
+        // UIA 回退仅服务自动切换评估（纯 IMM32 应用 TSF 取不到文本）：
+        // 未开启自动切换时跳过，避免中文模式下每键一次的 UIA 跨进程读取开销
+        if inner.auto_switch && preceding_text.is_none() && following_text.is_none() {
+            let (uia_preceding, uia_following) =
+                read_surrounding_text_via_uia(caret_pos.map(|(x, y, _)| (x, y)));
+            preceding_text = uia_preceding;
+            following_text = uia_following;
+        }
+        let surrounding = if preceding_text.is_some() || following_text.is_some() {
+            Some((preceding_text, following_text))
+        } else {
+            None
+        };
+
+        // 根据光标周围文本自动切换中英模式（中文→英文方向）。
+        // 仅当开关开启且无进行中的合成（GetRange 失败视为无合成）时评估；
+        // 命中建议则切换并复用手动切换收尾，本次按键不再送入引擎，
+        // 由 OnKeyDown 依据 auto_switched 标志放行给应用（英文直输）。
+        if inner.auto_switch {
+            let no_composition = match &composition {
+                None => true,
+                Some(c) => unsafe { c.GetRange().is_err() },
+            };
+            if no_composition && let Some((preceding_text, following_text)) = &surrounding {
+                let suggestion =
+                    suggest_input_mode(preceding_text.as_deref(), following_text.as_deref());
+                debug!(
+                    "auto-switch eval (中→英): preceding={:?} following={:?} suggestion={:?}",
+                    preceding_text.as_deref().map(truncate_for_log),
+                    following_text.as_deref().map(truncate_for_log),
+                    suggestion
+                );
+                let current = inner.mode_switch.is_english();
+                if let Some(target) = inner.auto_mode.evaluate(suggestion, current) {
+                    // evaluate 已确认目标与当前不同，set_english 必然产生切换
+                    inner.mode_switch.set_english(target);
+                    auto_switched.store(true, Ordering::SeqCst);
+                    // 收尾函数会重新获取 inner 锁，先释放再调用（同 service.rs 既有模式）
+                    drop(inner);
+                    apply_auto_mode_toggle(service, target);
+                    return Ok(());
+                }
+            }
+        }
+
         let conn = inner.ipc_conn.as_mut().ok_or(E_UNEXPECTED)?;
 
         // 读取光标周围文本并同步给 daemon（供整句补全提供上下文）。
         // SetContext 为单向请求（daemon 不写响应），随后 KeyEvent 正常请求-响应。
-        // 读取失败时静默跳过，不影响按键管线。
-        if let Some((caret_x, caret_y, caret_h)) = last_caret_pos {
-            let (mut preceding_text, mut following_text) =
-                read_surrounding_text(ec, &ctx, composition.as_ref());
-            // TSF 取不到上下文（Zed 等纯 IMM32 应用不实现 TSF 文本存储）时，
-            // 回退到 UIA TextPattern 读取光标周围文本。
-            if preceding_text.is_none() && following_text.is_none() {
-                (preceding_text, following_text) = read_surrounding_text_via_uia(caret_x, caret_y);
-            }
+        if let (Some((caret_x, caret_y, caret_h)), Some((preceding_text, following_text))) =
+            (caret_pos, surrounding)
+        {
             let set_ctx = IpcRequest::SetContext(InputContext {
                 caret_x,
                 caret_y,

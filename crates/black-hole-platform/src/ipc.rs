@@ -42,6 +42,9 @@ pub enum IpcResponse {
         theme: Theme,
         /// 全局中英文输入模式：true=英文，false=中文
         english: bool,
+        /// 是否启用"根据光标周围文本自动切换中英模式"
+        #[serde(default)]
+        auto_switch: bool,
     },
 }
 

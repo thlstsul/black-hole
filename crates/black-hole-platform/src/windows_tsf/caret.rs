@@ -144,6 +144,19 @@ fn read_range_text(ec: u32, range: &ITfRange) -> String {
     }
 }
 
+/// 诊断日志用：截断过长文本（保留末尾，自动切换评估关注光标附近字符）
+pub(crate) fn truncate_for_log(text: &str) -> &str {
+    const MAX_LOG_CHARS: usize = 16;
+    let mut start = text.len();
+    for (count, (i, _)) in text.char_indices().rev().enumerate() {
+        if count == MAX_LOG_CHARS {
+            break;
+        }
+        start = i;
+    }
+    &text[start..]
+}
+
 /// UIA 回退：TSF 文本存储不可用的应用（如 Zed 等纯 IMM32 应用，不实现
 /// ITfTextStore/ITfContextOwner，`ITfContext::GetSelection/GetText` 取不到文本）
 /// 无法走 TSF 读取周围文本；此类应用通常通过 UIA（accesskit_windows 等）实现
@@ -152,14 +165,14 @@ fn read_range_text(ec: u32, range: &ITfRange) -> String {
 /// 取文本范围的两条路径，任一失败则回退到另一条：
 /// 1. `GetSelection`：拿到光标/选区 range；
 /// 2. `RangeFromPoint`：用已知的光标屏幕坐标定位 range（部分应用不暴露选区）。
+///    仅在调用方拿到 Win32 光标坐标时可用；自绘光标的应用（如 Zed）传 None。
 ///
 /// TextPattern 可能挂在焦点元素的祖先节点上（如编辑器容器），
 /// 因此沿祖先链逐级查找，最多回溯 [`MAX_UIA_ANCESTORS`] 层。
 ///
 /// 读取失败或无可读内容时对应项为 None。
 pub(crate) fn read_surrounding_text_via_uia(
-    caret_x: i32,
-    caret_y: i32,
+    caret_pos: Option<(i32, i32)>,
 ) -> (Option<String>, Option<String>) {
     use windows::Win32::Foundation::POINT;
     use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
@@ -205,7 +218,7 @@ pub(crate) fn read_surrounding_text_via_uia(
         return (None, None);
     };
 
-    // 路径 1：光标选区 range；路径 2：光标坐标定位 range
+    // 路径 1：光标选区 range；路径 2：光标坐标定位 range（有坐标时可用）
     let caret_range = {
         let mut range = None;
         if let Ok(selection) = unsafe { pattern.GetSelection() }
@@ -215,7 +228,9 @@ pub(crate) fn read_surrounding_text_via_uia(
         {
             range = Some(r);
         }
-        if range.is_none() {
+        if range.is_none()
+            && let Some((caret_x, caret_y)) = caret_pos
+        {
             range = unsafe {
                 pattern.RangeFromPoint(POINT {
                     x: caret_x,
