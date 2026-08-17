@@ -242,6 +242,11 @@ impl AutoModeSwitch {
         }
         match suggestion {
             Some(target) if target != current_english => Some(target),
+            // 无信号（空白文档、新文件、文本读取失败等中立语境）：当前为英文时
+            // 默认回到中文，避免自动切换产生的英文状态在中立语境"粘住"
+            // （表现为新开文档/切换进程后默认英文）。手动 Ctrl 切到英文
+            // 由 lock_manual 锁定保护，不受此规则影响。
+            None if current_english => Some(false),
             _ => None,
         }
     }
@@ -730,6 +735,26 @@ mod tests {
 
         // 已解锁：恢复自动切换
         assert_eq!(sw.evaluate(Some(true), false), Some(true));
+    }
+
+    #[test]
+    fn auto_no_signal_defaults_back_to_chinese_when_english() {
+        let mut sw = AutoModeSwitch::default();
+        // 中立语境（无信号）且当前为英文 → 默认回到中文
+        assert_eq!(sw.evaluate(None, true), Some(false));
+        // 中立语境且当前为中文 → 保持中文不动作
+        assert_eq!(sw.evaluate(None, false), None);
+    }
+
+    #[test]
+    fn auto_manual_english_lock_survives_no_signal() {
+        let mut sw = AutoModeSwitch::default();
+        // 用户在中立语境手动切到英文并锁定（基线 None）
+        sw.lock_manual(None);
+        // 同语境（无信号）不再撤销手动选择
+        assert_eq!(sw.evaluate(None, true), None);
+        // 语境变化（出现中文信号）→ 解锁并切回中文
+        assert_eq!(sw.evaluate(Some(false), true), Some(false));
     }
 
     #[test]
