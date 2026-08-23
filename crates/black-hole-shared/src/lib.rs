@@ -304,11 +304,13 @@ pub enum UiCommand {
     SetAutoStart(bool),
     SetTheme(Theme),
     SwitchScheme(SchemeId),
-    /// 中英文输入模式切换：TSF 实例切换后上报 daemon，
-    /// daemon 持久化并更新共享状态，供其它进程同步。
+    /// 中英文输入模式切换：TSF 实例切换后上报 daemon。
+    /// daemon 只更新共享状态供其它进程同步，不持久化 settings.json
+    /// （中英模式是运行时状态，重启后回到中文）。连接时各平台实例
+    /// 直接应用 daemon 当前模式，无"连接默认中文"门控。
     SetInputMode(bool),
     /// 自动切换中英模式上报：由"根据光标周围文本自动切换"逻辑触发，
-    /// daemon 只更新共享状态不持久化（区别于用户手动切换的 SetInputMode）。
+    /// daemon 处理与 SetInputMode 一致（仅更新共享状态，不持久化）。
     SetInputModeTransient(bool),
     /// 开关"根据光标周围文本自动切换中英模式"：daemon 持久化并更新共享状态，
     /// 各进程 TSF 实例获得焦点时同步（与设置面板复选框等价）。
@@ -331,10 +333,6 @@ pub struct Settings {
     /// 是否开机自启动（登录时自动运行守护进程）
     #[serde(default)]
     pub auto_start: bool,
-    /// 中英文输入模式：true=英文，false=中文。
-    /// 由 daemon 全局持有并持久化，各进程 TSF 实例启动/获得焦点时同步。
-    #[serde(default)]
-    pub english_mode: bool,
     /// 是否根据光标周围文本自动切换中英模式（默认关闭，需用户显式开启）
     #[serde(default)]
     pub auto_switch_mode: bool,
@@ -351,7 +349,6 @@ impl Default for Settings {
             candidate_window: CandidateWindowSettings::default(),
             key_bindings: KeyBindings::default(),
             auto_start: false,
-            english_mode: false,
             auto_switch_mode: false,
             llm_completion: LlmCompletionSettings::default(),
         }
@@ -424,6 +421,35 @@ pub enum Theme {
     Light,
     Dark,
     System,
+}
+
+/// daemon 运行时共享状态（非持久化设置项）：
+/// 方案 / 主题 / 中英模式 / 自动切换开关。
+/// 由 daemon 持有并在 dispatch / 热更新时同步更新，平台线程通过
+/// IPC GetSettings 读取；中英模式启动播种为中文（重启后回到中文），
+/// 会话内由 SetInputMode/SetInputModeTransient 更新、供跨进程同步。
+/// 连接时平台实例直接应用 daemon 当前模式（含会话内英文），
+/// 无"连接默认中文"门控。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeSettings {
+    pub scheme_id: SchemeId,
+    pub theme: Theme,
+    /// true=英文，false=中文
+    pub english: bool,
+    /// "根据光标周围文本自动切换中英模式"开关
+    pub auto_switch: bool,
+}
+
+impl RuntimeSettings {
+    /// 以指定方案/主题构造，中英模式播种为中文（运行时状态，重启回中文）。
+    pub fn new(scheme_id: SchemeId, theme: Theme) -> Self {
+        Self {
+            scheme_id,
+            theme,
+            english: false,
+            auto_switch: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

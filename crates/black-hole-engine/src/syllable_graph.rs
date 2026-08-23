@@ -1,5 +1,4 @@
 use rustc_hash::FxHashSet;
-use std::collections::HashSet;
 
 /// 音节切分有向无环图（DAG）
 ///
@@ -106,7 +105,7 @@ impl SyllableGraph {
 
     /// 获取所有可达的终点位置（从起点出发）
     pub fn reachable_ends(&self) -> Vec<usize> {
-        let mut reachable = HashSet::new();
+        let mut reachable = FxHashSet::default();
         reachable.insert(0usize);
         let mut changed = true;
         while changed {

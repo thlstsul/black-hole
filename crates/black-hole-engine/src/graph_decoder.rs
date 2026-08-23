@@ -1,5 +1,6 @@
 use crate::{Dictionary, LanguageModel, SyllableGraph};
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 use tracing::debug;
 
 /// 解码结果
@@ -19,7 +20,7 @@ pub struct DecodeResult {
 #[derive(Debug, Clone)]
 struct WordEdge {
     end_pos: usize,
-    text: String,
+    text: Arc<str>,
     base_score: f64,
     syllable_count: usize,
 }
@@ -34,7 +35,7 @@ struct ViterbiState {
     /// 父状态位置 (音节位置, 该位置的状态索引)；起点（<s>）为 None
     prev: Option<(usize, usize)>,
     /// 到达本状态所用的词（即词边文本），回溯重建整句时使用
-    last_word: String,
+    last_word: Arc<str>,
 }
 
 /// 评分配置参数
@@ -193,7 +194,7 @@ impl<'a> GraphDecoder<'a> {
         dp[0].push(ViterbiState {
             score: 0.0,
             prev: None,
-            last_word: "<s>".to_string(),
+            last_word: Arc::from("<s>"),
         });
 
         for i in 0..=n {
@@ -215,7 +216,7 @@ impl<'a> GraphDecoder<'a> {
                     after[edge.end_pos - i - 1].push(ViterbiState {
                         score: new_score,
                         prev: Some((i, state_idx)),
-                        last_word: edge.text.clone(),
+                        last_word: Arc::clone(&edge.text),
                     });
                 }
             }
@@ -266,7 +267,7 @@ impl<'a> GraphDecoder<'a> {
         let (mut pos, mut idx) = (pos, idx);
         loop {
             let st = &dp[pos][idx];
-            words_rev.push(st.last_word.clone());
+            words_rev.push(st.last_word.to_string());
             match st.prev {
                 Some((p, k)) => {
                     pos = p;
@@ -276,8 +277,9 @@ impl<'a> GraphDecoder<'a> {
             }
         }
         words_rev.reverse();
-        let text = words_rev[1..].concat();
-        let words = words_rev[1..].to_vec();
+        // split_off(1) 一次切片移除 <s> 哨兵，避免 [1..] 两次独立切片分配
+        let words = words_rev.split_off(1);
+        let text = words.concat();
         (text, words)
     }
 
@@ -419,7 +421,7 @@ impl<'a> GraphDecoder<'a> {
                 for cand in &candidates {
                     edges.push(WordEdge {
                         end_pos: pos,
-                        text: cand.text.clone(),
+                        text: Arc::from(cand.text.as_str()),
                         base_score: cand.score as f64,
                         syllable_count,
                     });

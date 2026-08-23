@@ -41,9 +41,52 @@ const ENG_EVAL_DEDUP_WINDOW: Duration = Duration::from_millis(200);
 /// 按键事件是否为可输入字符（ASCII 字母/数字/标点）。
 /// OnTestKeyDown/OnKeyDown 的按键拦截判定与英文模式自动切换评估门控共用。
 fn is_input_char_event(evt: &KeyEvent) -> bool {
-    evt.key.len() == 1 && {
-        let ch = evt.key.chars().next().unwrap();
-        ch.is_ascii_alphanumeric() || ch.is_ascii_punctuation()
+    if evt.key.len() != 1 {
+        return false;
+    }
+    let Some(ch) = evt.key.chars().next() else {
+        return false;
+    };
+    ch.is_ascii_alphanumeric() || ch.is_ascii_punctuation()
+}
+
+/// 英文模式自动切换的按键级决策结果（由 [`decide_english_auto_switch`] 产生）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EnglishEvalDecision {
+    /// 是否应用新 pic 刷新 context（pic 非空时无条件刷新，
+    /// 防焦点切换后的陈旧 ITfContext；空 pic 保留既有有效上下文）。
+    pub(crate) refresh_context: bool,
+    /// 是否应执行英→中自动切换评估。
+    pub(crate) evaluate: bool,
+}
+
+/// 英文模式按键是否应执行英→中自动切换评估（可测纯函数）。
+///
+/// 门控与 OnTestKeyDown/OnKeyDown 两个英文分支共用：
+/// - 开关开启（auto_switch）
+/// - 无进行中的合成（has_composition=false）
+/// - 评估时 context 可用：pic 非空（将刷新）或既有 context 非空（空 pic 保留）
+/// - 是字符输入键（is_input_key；Shift/方向键等非输入键直接放行）
+/// - 本次按键未在 OnTestKeyDown 已评估过（already_evaluated，去重窗口）
+///
+/// 将决策从 COM 回调中提取为纯函数，便于单测覆盖刷新/空 pic 保留/去重
+/// 三个关键场景；回调仅负责执行动作（刷新 context、请求评估会话）。
+pub(crate) fn decide_english_auto_switch(
+    auto_switch: bool,
+    has_composition: bool,
+    context_was_some: bool,
+    pic_present: bool,
+    is_input_key: bool,
+    already_evaluated: bool,
+) -> EnglishEvalDecision {
+    let context_after = pic_present || context_was_some;
+    EnglishEvalDecision {
+        refresh_context: pic_present,
+        evaluate: auto_switch
+            && !has_composition
+            && context_after
+            && is_input_key
+            && !already_evaluated,
     }
 }
 
@@ -112,6 +155,8 @@ impl BlackHoleTextService {
     /// 向 daemon 查询当前的 scheme、theme、全局中英模式和自动切换开关，
     /// 并更新 ServiceInner，使托盘菜单能勾选正确的选项、跨进程（管理员/普通）
     /// 保持中英模式一致、自动切换开关设置热生效。
+    /// 始终应用 daemon 当前中英模式（含英文）：英文模式下自动切换已由
+    /// OnTestKeyDown 补设 context 后正常触发，无需再以"连接默认中文"兜底。
     fn sync_settings_from_daemon(&self) {
         sync_settings_from_daemon_inner(&self.inner);
     }
@@ -300,7 +345,7 @@ impl BlackHoleTextService {
 }
 
 /// sync_settings_from_daemon 的自由函数版本：供 IPC 重连成功等无 service
-/// 实例上下文的路径复用（语义与该方法一致）。
+/// 实例上下文的路径复用（语义与该方法一致）。始终应用 daemon 当前中英模式。
 pub(crate) fn sync_settings_from_daemon_inner(inner_arc: &Arc<Mutex<ServiceInner>>) {
     let english = {
         let mut inner = inner_arc.lock().unwrap();
@@ -430,11 +475,11 @@ impl ITfTextInputProcessor_Impl for BlackHoleTextService_Impl {
         // TSF，需通过 WH_KEYBOARD_LL 直接监听物理按键。
         register_service(unsafe { GetCurrentThreadId() }, self.inner.clone());
 
-        // 连接成功后，向 daemon 查询当前设置，确保托盘菜单勾选正确。
+        // 连接时同步 daemon 当前设置（含中英模式），并同步系统 compartment，
+        // 使托盘菜单勾选正确、跨进程（管理员/普通）模式保持一致。
+        // 不再以"连接默认中文"兜底：英文模式下自动切换已由 OnTestKeyDown
+        // 补设 context 后正常触发，连接时即使处于英文模式也能自动切回中文。
         self.sync_settings_from_daemon();
-
-        // 同步初始中英文模式到系统键盘 compartment（默认中文），
-        // 使其它应用在 IME 激活后即可感知输入法状态。
         let english = self.inner.lock().unwrap().mode_switch.is_english();
         self.sync_input_mode_compartments(english);
 
@@ -504,7 +549,9 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         if fforeground.as_bool() {
             set_foreground_thread(unsafe { GetCurrentThreadId() });
             // 获得焦点时从 daemon 同步全局中英模式：管理员/普通进程
-            // 各自持有本地状态，切换进程时以此保持一致。
+            // 各自持有本地状态，切换进程时以此保持一致。始终应用 daemon
+            // 当前模式（含英文）：英文模式下自动切换已由 OnTestKeyDown
+            // 补设 context 后正常触发，无需以"连接默认中文"跳过。
             self.sync_settings_from_daemon();
         } else {
             clear_foreground_thread();
@@ -517,7 +564,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
 
     fn OnTestKeyDown(
         &self,
-        _pic: Ref<'_, ITfContext>,
+        pic: Ref<'_, ITfContext>,
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Result<BOOL> {
@@ -554,17 +601,25 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
             let mut inner = self.inner.lock().unwrap();
             if inner.mode_switch.is_english() {
                 inner.last_key_event = None;
-                let try_auto =
-                    inner.auto_switch && inner.composition.is_none() && inner.context.is_some();
-                drop(inner);
-                if !try_auto {
-                    return Ok(BOOL(0));
-                }
-                // 仅字符输入键触发评估：Shift/方向键等非输入键直接放行，
-                // 避免修饰键操作引发误切换与无谓的文本读取开销
+                // 决策提取为纯函数（见 decide_english_auto_switch）：无条件
+                // 刷新 context 防陈旧 ITfContext、空 pic 保留既有有效上下文、
+                // 仅字符输入键触发评估。
+                let pic_present = pic.to_owned().is_some();
                 let is_input_key = virtual_key_to_key_event(vk, wparam, lparam, KeyState::Press)
                     .is_some_and(|evt| is_input_char_event(&evt));
-                if !is_input_key {
+                let decision = decide_english_auto_switch(
+                    inner.auto_switch,
+                    inner.composition.is_some(),
+                    inner.context.is_some(),
+                    pic_present,
+                    is_input_key,
+                    false, // OnTestKeyDown 是去重记录的源头，本路径不查去重
+                );
+                if decision.refresh_context {
+                    inner.context = pic.to_owned();
+                }
+                drop(inner);
+                if !decision.evaluate {
                     return Ok(BOOL(0));
                 }
                 // 记录本次评估的按键与时间，供 OnKeyDown 去重：
@@ -653,21 +708,12 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         // 评估必须在此补做，否则该类应用中英→中永远不触发；命中切回中文后
         // 继续走下方中文模式流程，消费本次按键（与 OnTestKeyDown 路径语义一致）。
         {
-            let inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap();
             if inner.mode_switch.is_english() {
-                let try_auto =
-                    inner.auto_switch && inner.composition.is_none() && inner.context.is_some();
-                // 同一按键已在 OnTestKeyDown 评估过（时间窗内同键视为同一次按下），
-                // 直接放行：部分应用对同一按键两个回调都会调用，避免双重评估
-                let already_evaluated = match &inner.last_eng_eval_key {
-                    Some((w, t)) => *w == wparam.0 && t.elapsed() < ENG_EVAL_DEDUP_WINDOW,
-                    None => false,
-                };
-                drop(inner);
-                if !try_auto || already_evaluated {
-                    return Ok(BOOL(0));
-                }
-                // 与 OnTestKeyDown 一致：仅字符输入键触发评估
+                // 决策提取为纯函数（见 decide_english_auto_switch）：无条件
+                // 刷新 context 防陈旧 ITfContext、空 pic 保留既有有效上下文、
+                // 仅字符输入键触发评估、去重窗口防双重评估。
+                let pic_present = pic.to_owned().is_some();
                 let is_input_key = virtual_key_to_key_event(
                     VIRTUAL_KEY(wparam.0 as u16),
                     wparam,
@@ -675,7 +721,25 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
                     KeyState::Press,
                 )
                 .is_some_and(|evt| is_input_char_event(&evt));
-                if !is_input_key || !self.try_auto_switch_to_chinese() {
+                // 同一按键已在 OnTestKeyDown 评估过（时间窗内同键视为同一次按下），
+                // 直接放行：部分应用对同一按键两个回调都会调用，避免双重评估
+                let already_evaluated = match &inner.last_eng_eval_key {
+                    Some((w, t)) => *w == wparam.0 && t.elapsed() < ENG_EVAL_DEDUP_WINDOW,
+                    None => false,
+                };
+                let decision = decide_english_auto_switch(
+                    inner.auto_switch,
+                    inner.composition.is_some(),
+                    inner.context.is_some(),
+                    pic_present,
+                    is_input_key,
+                    already_evaluated,
+                );
+                if decision.refresh_context {
+                    inner.context = pic.to_owned();
+                }
+                drop(inner);
+                if !decision.evaluate || !self.try_auto_switch_to_chinese() {
                     return Ok(BOOL(0));
                 }
             }
@@ -850,5 +914,180 @@ impl ITfThreadMgrEventSink_Impl for BlackHoleTextService_Impl {
 
     fn OnPopContext(&self, _pic: Ref<'_, ITfContext>) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::IpcConnection;
+    use super::*;
+    use black_hole_shared::{SchemeId, Theme};
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+
+    /// 启动一个 mock daemon：接受连接后循环响应请求。
+    /// GetSettings 固定返回 english=true 的 Settings，其余请求返回 Ignored。
+    fn spawn_mock_daemon() -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let resp = match serde_json::from_str::<IpcRequest>(line.trim()) {
+                        Ok(IpcRequest::GetSettings) => IpcResponse::Settings {
+                            scheme_id: SchemeId::Pinyin,
+                            theme: Theme::Light,
+                            english: true,
+                            auto_switch: false,
+                        },
+                        _ => IpcResponse::Ignored,
+                    };
+                    let json = serde_json::to_string(&resp).unwrap();
+                    writeln!(stream, "{}", json).unwrap();
+                    stream.flush().unwrap();
+                }
+            }
+        });
+        addr
+    }
+
+    /// 构造连接到 mock daemon 的 ServiceInner（模拟"连接已建立"状态）。
+    fn connect_to_mock(addr: std::net::SocketAddr) -> Arc<Mutex<ServiceInner>> {
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut inner = ServiceInner::new();
+        inner.ipc_conn = Some(IpcConnection {
+            writer: stream.try_clone().unwrap(),
+            reader: BufReader::new(stream),
+        });
+        Arc::new(Mutex::new(inner))
+    }
+
+    /// 模拟 try_reconnect_ipc 建立连接：仅写入 ipc_conn。
+    /// 连接/重连后由调用方执行 sync_settings_from_daemon_inner——
+    /// 该函数始终应用 daemon 当前中英模式，无门控。
+    fn establish_connection(inner_arc: &Arc<Mutex<ServiceInner>>, addr: std::net::SocketAddr) {
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut inner = inner_arc.lock().unwrap();
+        inner.ipc_conn = Some(IpcConnection {
+            writer: stream.try_clone().unwrap(),
+            reader: BufReader::new(stream),
+        });
+    }
+
+    #[test]
+    fn sync_settings_applies_daemon_english() {
+        // 同步始终应用 daemon 当前模式：mock 返回 english=true → 本地英文
+        let addr = spawn_mock_daemon();
+        let inner_arc = connect_to_mock(addr);
+        sync_settings_from_daemon_inner(&inner_arc);
+        assert!(inner_arc.lock().unwrap().mode_switch.is_english());
+    }
+
+    #[test]
+    fn connect_always_applies_daemon_mode() {
+        // 全新连接也始终应用 daemon 当前模式（含英文），不再以"连接默认
+        // 中文"兜底：英文模式下自动切换已由 OnTestKeyDown 补设 context
+        // 后正常触发，连接时处于英文模式也能自动切回中文。
+        let addr = spawn_mock_daemon();
+        let inner_arc = Arc::new(Mutex::new(ServiceInner::new()));
+        establish_connection(&inner_arc, addr);
+        sync_settings_from_daemon_inner(&inner_arc);
+        assert!(inner_arc.lock().unwrap().mode_switch.is_english());
+    }
+
+    #[test]
+    fn reconnect_applies_daemon_current_mode() {
+        // 会话中重连同样应用 daemon 当前模式（含英文），跨进程保持一致
+        let addr = spawn_mock_daemon();
+        let inner_arc = connect_to_mock(addr);
+        sync_settings_from_daemon_inner(&inner_arc);
+        assert!(inner_arc.lock().unwrap().mode_switch.is_english());
+    }
+
+    #[test]
+    fn first_activate_failure_then_reconnect_applies_daemon_mode() {
+        // 首次 Activate 连接失败（daemon 未就绪）不建立连接；之后按键路径
+        // 重连成功并同步——始终应用 daemon 当前模式（mock 返回 english=true），
+        // 无"门控被无连接同步提前消费"的问题（门控已随连接默认中文回退）。
+        let addr = spawn_mock_daemon();
+        let inner_arc = Arc::new(Mutex::new(ServiceInner::new()));
+
+        // 首次 Activate 失败：无连接、未同步
+        assert!(inner_arc.lock().unwrap().ipc_conn.is_none());
+
+        // 按键路径 try_reconnect_ipc 重连成功：建立连接
+        establish_connection(&inner_arc, addr);
+        sync_settings_from_daemon_inner(&inner_arc);
+        assert!(inner_arc.lock().unwrap().mode_switch.is_english());
+    }
+
+    #[test]
+    fn decide_english_auto_switch_refreshes_context_when_pic_present() {
+        // 场景一：pic 非空（有文档上下文的按键）→ 无条件刷新 context，
+        // 且开关开启、无合成、字符输入键时评估通过
+        let d = decide_english_auto_switch(
+            true,  // auto_switch
+            false, // has_composition
+            false, // context_was_some（新实例 context 为 None）
+            true,  // pic_present
+            true,  // is_input_key
+            false, // already_evaluated
+        );
+        assert!(d.refresh_context, "pic 非空应刷新 context");
+        assert!(d.evaluate, "全门控满足应触发评估");
+    }
+
+    #[test]
+    fn decide_english_auto_switch_keeps_context_when_pic_null() {
+        // 场景二：pic 为空（无文档上下文事件）→ 不刷新（保留既有有效
+        // 上下文），既有 context 非空时评估仍可通过——空指针不得覆盖
+        // 导致自动切换失联
+        let d = decide_english_auto_switch(
+            true, // auto_switch
+            false, // has_composition
+            true, // context_was_some（既有有效上下文）
+            false, // pic_present（空 pic）
+            true, // is_input_key
+            false, // already_evaluated
+        );
+        assert!(!d.refresh_context, "空 pic 应保留既有 context，不刷新");
+        assert!(d.evaluate, "空 pic 但既有 context 可用时仍应评估");
+
+        // 空 pic 且无既有 context：无法评估
+        let d2 = decide_english_auto_switch(true, false, false, false, true, false);
+        assert!(!d2.evaluate, "空 pic 且无既有 context 时不得评估");
+    }
+
+    #[test]
+    fn decide_english_auto_switch_dedup_window_suppresses_reeval() {
+        // 场景三：同一按键已在 OnTestKeyDown 评估过（去重窗口内）→
+        // OnKeyDown 收到同键不得重复评估
+        let d = decide_english_auto_switch(true, false, true, true, true, true);
+        assert!(!d.evaluate, "去重窗口内已评估的按键不得重复评估");
+        // 仍应刷新 context（与 evaluate 解耦）
+        assert!(d.refresh_context, "去重只抑制评估，不影响 context 刷新");
+
+        // 去重窗口外（already_evaluated=false）恢复评估
+        let d2 = decide_english_auto_switch(true, false, true, true, true, false);
+        assert!(d2.evaluate, "去重窗口外应恢复评估");
+    }
+
+    #[test]
+    fn decide_english_auto_switch_gate_conditions() {
+        // 门控各条件单独不满足时均不评估：
+        // 开关关闭 / 合成中 / 非字符输入键
+        assert!(!decide_english_auto_switch(false, false, true, true, true, false).evaluate,
+            "开关关闭不评估");
+        assert!(!decide_english_auto_switch(true, true, true, true, true, false).evaluate,
+            "合成中不评估");
+        assert!(!decide_english_auto_switch(true, false, true, true, false, false).evaluate,
+            "非字符输入键不评估");
     }
 }

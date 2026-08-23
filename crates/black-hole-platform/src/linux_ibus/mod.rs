@@ -5,7 +5,7 @@
 
 use black_hole_shared::{
     AutoModeSwitch, EngineCommand, InputContext, InputModeSwitch, KeyEvent, KeyState, Modifiers,
-    SchemeId, SchemeResult, Theme, UiCommand, suggest_input_mode,
+    RuntimeSettings, SchemeResult, UiCommand, suggest_input_mode,
 };
 use std::future::pending;
 use std::sync::mpsc::{Receiver, Sender};
@@ -21,12 +21,12 @@ pub mod auto_register;
 /// Linux IBus 输入法平台实现
 pub struct LinuxIbusIme {
     /// daemon 共享的运行时设置（方案/主题/中英模式/自动切换开关），
-    /// 元组第四元为"根据光标周围文本自动切换中英模式"开关，支持热更新
-    current_settings: Arc<Mutex<(SchemeId, Theme, bool, bool)>>,
+    /// auto_switch 字段为"根据光标周围文本自动切换中英模式"开关，支持热更新
+    current_settings: Arc<Mutex<RuntimeSettings>>,
 }
 
 impl LinuxIbusIme {
-    pub fn new(current_settings: Arc<Mutex<(SchemeId, Theme, bool, bool)>>) -> Self {
+    pub fn new(current_settings: Arc<Mutex<RuntimeSettings>>) -> Self {
         Self { current_settings }
     }
 }
@@ -92,8 +92,9 @@ struct IbusEngine {
     auto_mode: Mutex<AutoModeSwitch>,
     /// 最近一次 composition 的编码（切英文模式时上屏保留）
     last_code: Mutex<Option<String>>,
-    /// daemon 共享的运行时设置：元组第四元为自动切换开关，每次评估时读取
-    current_settings: Arc<Mutex<(SchemeId, Theme, bool, bool)>>,
+    /// daemon 共享的运行时设置（方案/主题/中英模式/自动切换开关），
+    /// auto_switch 字段为自动切换开关，每次评估时读取
+    current_settings: Arc<Mutex<RuntimeSettings>>,
     conn: Connection,
 }
 
@@ -150,7 +151,7 @@ impl IbusEngine {
     /// 当前非合成态（无未上屏编码）时评估；命中建议时直接设置模式并复用
     /// `apply_mode_change` 完成上屏保留/重置引擎/更新属性收尾。
     async fn maybe_auto_switch_mode(&self) {
-        if !self.current_settings.lock().unwrap().3 {
+        if !self.current_settings.lock().unwrap().auto_switch {
             return;
         }
         // 合成中（输入框尚有编码）不评估，避免打断正在进行的输入

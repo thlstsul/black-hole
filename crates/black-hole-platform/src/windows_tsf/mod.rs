@@ -30,8 +30,8 @@ use windows_core::{GUID, PCWSTR, w};
 
 use super::{PlatformError, PlatformIme};
 use black_hole_shared::{
-    AutoModeSwitch, EngineCommand, InputModeSwitch, KeyEvent, SchemeId, SchemeResult, Theme,
-    UiCommand,
+    AutoModeSwitch, EngineCommand, InputModeSwitch, KeyEvent, RuntimeSettings, SchemeId,
+    SchemeResult, Theme, UiCommand,
 };
 
 pub mod auto_register;
@@ -267,7 +267,10 @@ pub(crate) fn try_reconnect_ipc(inner_arc: &Arc<Mutex<ServiceInner>>) -> bool {
                 IPC_SERVER_ADDR
             );
             // 释放锁后重新同步设置：daemon 可能已重启且方案/主题/中英模式/
-            // 自动切换开关发生变化，避免本进程残留旧状态。
+            // 自动切换开关发生变化，避免本进程残留旧状态。连接/重连始终
+            // 应用 daemon 当前中英模式（含英文）：英文模式下按键路径
+            // （OnTestKeyDown 补设 context）已能正常触发自动切换，无需
+            // 再以"连接默认中文"兜底，跨进程模式保持一致。
             drop(inner);
             service::sync_settings_from_daemon_inner(inner_arc);
             true
@@ -306,23 +309,26 @@ pub(crate) fn send_ui_command_inner(inner_arc: &Arc<Mutex<ServiceInner>>, cmd: U
 
 pub struct WindowsTsfIme {
     /// 运行时方案/主题/中英模式/自动切换开关状态，daemon 每次切换时同步更新
-    current: Arc<Mutex<(SchemeId, Theme, bool, bool)>>,
+    current: Arc<Mutex<RuntimeSettings>>,
 }
 
 impl WindowsTsfIme {
     /// 使用共享状态创建。`current` 会被 daemon 在每次方案/主题/中英模式切换时自动更新。
-    pub fn new(current: Arc<Mutex<(SchemeId, Theme, bool, bool)>>) -> Self {
+    pub fn new(current: Arc<Mutex<RuntimeSettings>>) -> Self {
         Self { current }
     }
 
     /// 创建时指定初始值（内部创建共享状态）。
     pub fn new_with_values(default_scheme: SchemeId, default_theme: Theme) -> Self {
         Self {
-            current: Arc::new(Mutex::new((default_scheme, default_theme, false, false))),
+            current: Arc::new(Mutex::new(RuntimeSettings::new(
+                default_scheme,
+                default_theme,
+            ))),
         }
     }
 
-    pub fn current(&self) -> &Arc<Mutex<(SchemeId, Theme, bool, bool)>> {
+    pub fn current(&self) -> &Arc<Mutex<RuntimeSettings>> {
         &self.current
     }
 }
@@ -373,7 +379,7 @@ fn handle_ipc_client(
     engine_tx: Sender<EngineCommand>,
     platform_rx: Arc<Mutex<Receiver<SchemeResult>>>,
     ui_tx: Sender<UiCommand>,
-    current: Arc<Mutex<(SchemeId, Theme, bool, bool)>>,
+    current: Arc<Mutex<RuntimeSettings>>,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
@@ -421,12 +427,12 @@ fn handle_ipc_client(
                 let _ = ui_tx.send(ui_cmd);
             }
             IpcRequest::GetSettings => {
-                let (scheme_id, theme, english, auto_switch) = *current.lock().unwrap();
+                let settings = *current.lock().unwrap();
                 let response = IpcResponse::Settings {
-                    scheme_id,
-                    theme,
-                    english,
-                    auto_switch,
+                    scheme_id: settings.scheme_id,
+                    theme: settings.theme,
+                    english: settings.english,
+                    auto_switch: settings.auto_switch,
                 };
                 let json = to_string(&response)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;

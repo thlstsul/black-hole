@@ -83,35 +83,35 @@ impl PinyinPreprocessor {
     fn generate_fuzzy_variants(&self, input: &str) -> Vec<String> {
         let mut variants = Vec::new();
 
-        // 对输入中的每个字符应用模糊映射
-        if input.is_empty() {
-            return variants;
-        }
-
         // 对整个音节应用模糊规则（例如 an <-> ang）
-        // 这里简单处理：只处理首字符
-        let first_char = input.chars().next().unwrap();
+        // 这里简单处理：只处理首字符；非 ASCII 输入直接跳过（模糊映射只覆盖 ASCII 字母）
+        // 空输入由下方 let-else 提前返回（chars().next() 返回 None）
+        let Some(first_char) = input.chars().next() else {
+            return variants;
+        };
         if let Some(replacements) = self.fuzzy_map.get(&first_char) {
+            let tail = &input[first_char.len_utf8()..];
             for &replacement in replacements {
                 if replacement != first_char {
-                    let mut variant = String::new();
+                    let mut variant = String::with_capacity(input.len());
                     variant.push(replacement);
-                    variant.push_str(&input[1..]);
+                    variant.push_str(tail);
                     variants.push(variant);
                 }
             }
         }
 
-        // 处理音节级别的模糊（如 an/ang）
+        // 处理音节级别的模糊（如 an/ang）；仅对 "ng" 结尾生成前鼻音变体
+        // （"ang"→"an"、"eng"→"en"），其它以裸 'g' 结尾的输入不受影响；
+        // strip_suffix 按字符匹配，多字节结尾不会命中
         if input.ends_with('n') && !input.ends_with("ng") {
             // 添加后鼻音版本
             let mut variant = input.to_string();
             variant.push('g');
             variants.push(variant);
-        } else if input.ends_with("ng") {
-            // 添加前鼻音版本
-            let variant = input[..input.len() - 1].to_string();
-            variants.push(variant);
+        } else if let Some(prefix) = input.strip_suffix("ng") {
+            // 添加前鼻音版本（"ng" → "n"）
+            variants.push(format!("{}n", prefix));
         }
 
         variants
@@ -183,5 +183,46 @@ mod tests {
         // 确保没有重复
         let unique_count = variants.iter().collect::<HashSet<_>>().len();
         assert_eq!(variants.len(), unique_count);
+    }
+
+    #[test]
+    fn test_non_ascii_input_does_not_panic() {
+        // 模糊音/纠错路径假定 ASCII 拼音输入；多字节输入不应 panic
+        // （此前按字节切片 input[1..] / input[..len-1] 会越界）
+        let preprocessor = PinyinPreprocessor::new();
+
+        for input in ["中文", "测试", "中", "a中", "中n", "n中"] {
+            let variants = preprocessor.preprocess(input);
+            // 原始输入始终在结果中，且不产生崩溃
+            assert!(variants.contains(&input.to_string()), "input={input}");
+        }
+    }
+
+    #[test]
+    fn test_ng_suffix_only_generates_front_nasal_variant() {
+        // 前鼻音变体只对 "ng" 结尾生成（"ang"→"an"、"eng"→"en"），
+        // 其它以裸 'g' 结尾的输入（g/ag/hg）不得产生丢字母变体
+        let preprocessor = PinyinPreprocessor::new();
+
+        // "ng" 结尾：生成前鼻音变体
+        let variants = preprocessor.preprocess("ang");
+        assert!(variants.contains(&"an".to_string()));
+        let variants = preprocessor.preprocess("eng");
+        assert!(variants.contains(&"en".to_string()));
+
+        // 裸 'g' 结尾：不生成去掉 'g' 的变体（如 "g"→"" 或 "ag"→"a"）
+        for input in ["g", "ag", "hg", "中g"] {
+            let variants = preprocessor.preprocess(input);
+            assert!(
+                !variants.contains(&String::new()),
+                "input={input}: unexpected empty variant"
+            );
+            assert!(
+                !variants.contains(&input[..input.len().saturating_sub(1)].to_string()),
+                "input={input}: trailing 'g' should not be dropped"
+            );
+            // 原始输入始终保留
+            assert!(variants.contains(&input.to_string()), "input={input}");
+        }
     }
 }

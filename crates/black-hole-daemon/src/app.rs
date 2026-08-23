@@ -14,8 +14,8 @@ use black_hole_platform::{LinuxIbusIme, PlatformError as LinuxPlatformError};
 #[cfg(target_os = "windows")]
 use black_hole_platform::{PlatformError as WindowsPlatformError, WindowsTsfIme};
 use black_hole_shared::{
-    EngineCommand, InputContext, LlmCompletionSettings, SchemeId, SchemeResult, Settings, Theme,
-    UiCommand,
+    EngineCommand, InputContext, LlmCompletionSettings, RuntimeSettings, SchemeId, SchemeResult,
+    Settings, Theme, UiCommand,
 };
 use black_hole_ui::{SettingsManager, run_candidate_window, run_settings_panel};
 use clap::Parser;
@@ -121,12 +121,17 @@ impl App {
         let default_theme = settings_mgr.settings().theme;
 
         // 运行时方案/主题/中英模式/自动切换开关状态，平台线程通过 IPC GetSettings 读取，dispatch 时同步更新
-        let current_settings: Arc<Mutex<(SchemeId, Theme, bool, bool)>> = Arc::new(Mutex::new((
-            default_scheme,
-            default_theme,
-            settings_mgr.settings().english_mode,
-            settings_mgr.settings().auto_switch_mode,
-        )));
+        // 中英模式是运行时状态而非设置项：daemon 启动播种为中文（false），
+        // 会话内由 SetInputMode/SetInputModeTransient 更新共享状态供跨进程
+        // 同步，不持久化 settings.json，重启后回到中文。连接时各平台实例
+        // 直接应用 daemon 当前模式（含会话内已切换的英文）：英文模式下
+        // 自动切换已由 OnTestKeyDown 补设 context 正常触发，无需再以
+        // "连接默认中文"兜底。
+        // auto_switch 是持久化设置项，须在启动时从 settings 恢复，否则用户开启的
+        // 自动切换在 daemon 重启后静默失效（直到下次手动切换或热更新才恢复）。
+        let current_settings: Arc<Mutex<RuntimeSettings>> = Arc::new(Mutex::new(
+            Self::seed_runtime_settings(settings_mgr.settings(), default_scheme, default_theme),
+        ));
 
         // 最后已生效设置：dispatch 持久化时同步更新，watcher 据此跳过 daemon 自身写入，
         // 避免设置面板/托盘改一项设置触发两次热应用
@@ -431,12 +436,58 @@ impl App {
         }
     }
 
+    /// 依据持久化设置初始化运行时共享状态。
+    ///
+    /// `auto_switch` 是持久化设置项（settings.json 的 auto_switch_mode），
+    /// 启动时必须恢复，否则用户开启的自动切换在 daemon 重启后静默失效；
+    /// `english` 是运行时状态而非设置项，启动播种为中文（false），
+    /// 会话内由 SetInputMode/SetInputModeTransient 更新。
+    fn seed_runtime_settings(
+        settings: &Settings,
+        default_scheme: SchemeId,
+        default_theme: Theme,
+    ) -> RuntimeSettings {
+        let mut runtime = RuntimeSettings::new(default_scheme, default_theme);
+        runtime.auto_switch = settings.auto_switch_mode;
+        runtime
+    }
+
+    /// 创建一个以"磁盘最新可用值"为基线的 SettingsManager。
+    ///
+    /// `SettingsManager::new()` 在读取/解析失败（如设置面板正在写入的
+    /// 半写文件）时会回退到默认值；直接以默认值为基线再保存会把面板的
+    /// 真实设置覆盖掉。因此仅当磁盘加载确实失败（`load_ok() == false`）
+    /// 时才改用 `last_applied` 内存基线，保证 dispatch 的读-改-写只修改
+    /// 目标字段、不丢失其它字段；合法默认值文件与解析失败不再混淆。
+    fn settings_manager_with_latest(last_applied: &Settings) -> SettingsManager {
+        Self::apply_last_applied_fallback(SettingsManager::new(), last_applied)
+    }
+
+    /// 加载失败时以 `last_applied` 覆盖默认值基线（核心决策，独立可测）。
+    ///
+    /// `load_ok() == false`（读取/解析失败，如半写文件）时，把默认值回退
+    /// 替换为 daemon 内存中最后一次生效的 `last_applied`，防止 dispatch
+    /// 以默认值为基线再保存而静默覆盖用户真实设置；`load_ok() == true`
+    /// （含文件不存在按默认值处理）时保持磁盘内容不变。
+    /// 独立成纯函数：配合 `SettingsManager::from_config_path` 注入临时路径，
+    /// 可直接验证损坏/有效文件的回退决策。
+    fn apply_last_applied_fallback(
+        mut mgr: SettingsManager,
+        last_applied: &Settings,
+    ) -> SettingsManager {
+        if !mgr.load_ok() {
+            warn!("settings.json unreadable, using last applied settings as baseline");
+            *mgr.settings_mut() = last_applied.clone();
+        }
+        mgr
+    }
+
     /// 分发来自平台层/UI 层的命令到对应处理者
     fn dispatch_ui_command(
         cmd: UiCommand,
         engine_tx: &mpsc::Sender<EngineCommand>,
         ui_render_tx: &mpsc::Sender<UiCommand>,
-        current_settings: &Arc<Mutex<(SchemeId, Theme, bool, bool)>>,
+        current_settings: &Arc<Mutex<RuntimeSettings>>,
         last_applied: &Arc<Mutex<Settings>>,
     ) {
         match cmd {
@@ -456,7 +507,11 @@ impl App {
                 info!("UI dispatch: switch to {:?}", scheme_id);
                 let _ = engine_tx.send(EngineCommand::SwitchScheme(scheme_id));
                 // 持久化到设置，使重启后保持本次选择
-                let mut settings_mgr = SettingsManager::new();
+                // 先克隆基线再读盘：settings_manager_with_latest 内部会加载
+                // settings.json，避免持 last_applied 锁跨磁盘 I/O（watcher
+                // 线程每次文件变更也要获取该锁，缩短锁竞争窗口）。
+                let last = last_applied.lock().unwrap().clone();
+                let mut settings_mgr = Self::settings_manager_with_latest(&last);
                 settings_mgr.settings_mut().default_scheme = scheme_id;
                 // 先同步"最后已生效设置"基线，再落盘，watcher 可识别本次为自身写入而跳过
                 *last_applied.lock().unwrap() = settings_mgr.settings().clone();
@@ -464,19 +519,20 @@ impl App {
                 // 同步共享状态，使平台线程（IPC GetSettings）返回最新值
                 {
                     let mut cur = current_settings.lock().unwrap();
-                    cur.0 = scheme_id;
+                    cur.scheme_id = scheme_id;
                 }
             }
             UiCommand::SetTheme(theme) => {
                 info!("UI dispatch: set theme to {:?}", theme);
-                let mut settings_mgr = SettingsManager::new();
+                let last = last_applied.lock().unwrap().clone();
+                let mut settings_mgr = Self::settings_manager_with_latest(&last);
                 settings_mgr.settings_mut().theme = theme;
                 *last_applied.lock().unwrap() = settings_mgr.settings().clone();
                 settings_mgr.save();
                 // 同步共享状态
                 {
                     let mut cur = current_settings.lock().unwrap();
-                    cur.1 = theme;
+                    cur.theme = theme;
                 }
                 let _ = ui_render_tx.send(UiCommand::SetTheme(theme));
             }
@@ -487,41 +543,33 @@ impl App {
                     warn!("Failed to set auto start ({}): {}", enabled, e);
                 }
                 // 持久化到设置，使重启后保持本次选择
-                let mut settings_mgr = SettingsManager::new();
+                let last = last_applied.lock().unwrap().clone();
+                let mut settings_mgr = Self::settings_manager_with_latest(&last);
                 settings_mgr.settings_mut().auto_start = enabled;
                 *last_applied.lock().unwrap() = settings_mgr.settings().clone();
                 settings_mgr.save();
             }
-            UiCommand::SetInputMode(english) => {
-                info!("UI dispatch: set input mode english={}", english);
-                // 持久化到设置，使重启后保持本次选择
-                let mut settings_mgr = SettingsManager::new();
-                settings_mgr.settings_mut().english_mode = english;
-                *last_applied.lock().unwrap() = settings_mgr.settings().clone();
-                settings_mgr.save();
-                // 同步共享状态，使平台线程（IPC GetSettings）返回最新值
-                {
-                    let mut cur = current_settings.lock().unwrap();
-                    cur.2 = english;
-                }
-            }
-            UiCommand::SetInputModeTransient(english) => {
-                // 自动切换上报：只更新共享状态供其它进程同步，不持久化
-                debug!("UI dispatch: transient input mode english={}", english);
+            UiCommand::SetInputMode(english) | UiCommand::SetInputModeTransient(english) => {
+                // 中英模式是运行时状态而非设置项：手动切换（SetInputMode）与自动切换
+                // 上报（SetInputModeTransient）处理一致——仅更新共享状态，供平台线程
+                // （IPC GetSettings）与其它进程 TSF 实例同步，不持久化 settings.json。
+                // 手动切换的详细日志已由平台层（Ctrl/语言栏路径）记录，此处用 debug。
+                debug!("UI dispatch: set input mode english={}", english);
                 let mut cur = current_settings.lock().unwrap();
-                cur.2 = english;
+                cur.english = english;
             }
             UiCommand::SetAutoSwitch(enabled) => {
                 info!("UI dispatch: set auto switch mode to {}", enabled);
                 // 持久化到设置，使重启后保持本次选择
-                let mut settings_mgr = SettingsManager::new();
+                let last = last_applied.lock().unwrap().clone();
+                let mut settings_mgr = Self::settings_manager_with_latest(&last);
                 settings_mgr.settings_mut().auto_switch_mode = enabled;
                 *last_applied.lock().unwrap() = settings_mgr.settings().clone();
                 settings_mgr.save();
                 // 同步共享状态，使平台线程（IPC GetSettings）返回最新值
                 {
                     let mut cur = current_settings.lock().unwrap();
-                    cur.3 = enabled;
+                    cur.auto_switch = enabled;
                 }
             }
             UiCommand::Exit => {
@@ -544,21 +592,21 @@ impl App {
     /// - 自启动：平台写入（注册表 Run 键 / XDG autostart 文件）
     /// - 候选窗参数：通知候选窗线程热更新字号/最大候选数
     /// - 按键绑定：通知引擎线程热更新按键映射
-    /// - 中英模式：同步共享状态，供各进程 TSF 实例获得焦点时同步
     /// - 自动切换中英模式开关：同步共享状态，供平台层每次评估时读取
+    /// - LLM 补全：更新补全 worker 的配置
     fn apply_settings_hot(
         new: &Settings,
         old: &Settings,
         engine_tx: &mpsc::Sender<EngineCommand>,
         ui_render_tx: &mpsc::Sender<UiCommand>,
-        current_settings: &Arc<Mutex<(SchemeId, Theme, bool, bool)>>,
+        current_settings: &Arc<Mutex<RuntimeSettings>>,
         completion_config: &Arc<Mutex<LlmCompletionSettings>>,
     ) {
         if new.theme != old.theme {
             info!("Hot applying theme: {:?}", new.theme);
             {
                 let mut cur = current_settings.lock().unwrap();
-                cur.1 = new.theme;
+                cur.theme = new.theme;
             }
             let _ = ui_render_tx.send(UiCommand::SetTheme(new.theme));
         }
@@ -568,7 +616,7 @@ impl App {
             let _ = engine_tx.send(EngineCommand::SwitchScheme(new.default_scheme));
             {
                 let mut cur = current_settings.lock().unwrap();
-                cur.0 = new.default_scheme;
+                cur.scheme_id = new.default_scheme;
             }
         }
 
@@ -595,19 +643,11 @@ impl App {
             ));
         }
 
-        if new.english_mode != old.english_mode {
-            info!("Hot applying input mode english={}", new.english_mode);
-            {
-                let mut cur = current_settings.lock().unwrap();
-                cur.2 = new.english_mode;
-            }
-        }
-
         if new.auto_switch_mode != old.auto_switch_mode {
             info!("Hot applying auto switch mode: {}", new.auto_switch_mode);
             {
                 let mut cur = current_settings.lock().unwrap();
-                cur.3 = new.auto_switch_mode;
+                cur.auto_switch = new.auto_switch_mode;
             }
         }
 
@@ -811,7 +851,7 @@ fn run_platform(
     engine_tx: mpsc::Sender<EngineCommand>,
     platform_rx: mpsc::Receiver<SchemeResult>,
     ui_tx: mpsc::Sender<UiCommand>,
-    current_settings: Arc<Mutex<(SchemeId, Theme, bool, bool)>>,
+    current_settings: Arc<Mutex<RuntimeSettings>>,
 ) -> Result<(), WindowsPlatformError> {
     let mut platform = WindowsTsfIme::new(current_settings);
     platform.run(engine_tx, platform_rx, ui_tx)?;
@@ -823,9 +863,125 @@ fn run_platform(
     engine_tx: mpsc::Sender<EngineCommand>,
     platform_rx: mpsc::Receiver<SchemeResult>,
     ui_tx: mpsc::Sender<UiCommand>,
-    current_settings: Arc<Mutex<(SchemeId, Theme, bool, bool)>>,
+    current_settings: Arc<Mutex<RuntimeSettings>>,
 ) -> Result<(), LinuxPlatformError> {
     let mut platform = LinuxIbusIme::new(current_settings);
     platform.run(engine_tx, platform_rx, ui_tx)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn seed_runtime_settings_restores_auto_switch() {
+        // auto_switch 是持久化设置项：daemon 重启后须从 settings 恢复，
+        // 否则用户开启的自动切换静默失效
+        let settings = Settings {
+            auto_switch_mode: true,
+            ..Settings::default()
+        };
+        let runtime = App::seed_runtime_settings(&settings, SchemeId::Pinyin, Theme::Dark);
+        assert!(runtime.auto_switch);
+        assert_eq!(runtime.scheme_id, SchemeId::Pinyin);
+        assert_eq!(runtime.theme, Theme::Dark);
+    }
+
+    #[test]
+    fn seed_runtime_settings_auto_switch_disabled_by_default() {
+        // 未开启自动切换时保持关闭
+        let settings = Settings::default();
+        let runtime = App::seed_runtime_settings(&settings, SchemeId::Pinyin, Theme::Dark);
+        assert!(!runtime.auto_switch);
+    }
+
+    #[test]
+    fn seed_runtime_settings_english_always_chinese() {
+        // english 是运行时状态而非设置项：启动播种恒为中文（false），
+        // 不随任何持久化值恢复
+        let settings = Settings::default();
+        let runtime = App::seed_runtime_settings(&settings, SchemeId::Shuangpin, Theme::Light);
+        assert!(!runtime.english);
+        assert_eq!(runtime.scheme_id, SchemeId::Shuangpin);
+    }
+
+    /// 每个测试使用独立的临时配置目录，避免并行测试互相干扰
+    fn temp_config_path(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "black-hole-daemon-test-{}-{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("settings.json")
+    }
+
+    #[test]
+    fn apply_last_applied_fallback_uses_baseline_on_corrupt_file() {
+        // 数据保护核心：settings.json 损坏（半写文件）时，dispatch 必须以
+        // last_applied 为基线而非默认值——否则托盘操作以默认值再保存会
+        // 静默覆盖用户真实设置
+        let path = temp_config_path("corrupt");
+        fs::write(&path, "{not valid json").unwrap();
+
+        let last_applied = Settings {
+            default_scheme: SchemeId::Shuangpin,
+            auto_switch_mode: true,
+            ..Settings::default()
+        };
+
+        let mgr = App::apply_last_applied_fallback(
+            SettingsManager::from_config_path(path),
+            &last_applied,
+        );
+        assert_eq!(
+            mgr.settings(),
+            &last_applied,
+            "损坏文件应以 last_applied 为基线"
+        );
+    }
+
+    #[test]
+    fn apply_last_applied_fallback_keeps_valid_disk_content() {
+        // 有效文件：保持磁盘内容不变，不得用 last_applied 覆盖
+        let path = temp_config_path("valid");
+        let disk = Settings {
+            default_scheme: SchemeId::Shuangpin,
+            auto_switch_mode: true,
+            ..Settings::default()
+        };
+        fs::write(&path, serde_json::to_string(&disk).unwrap()).unwrap();
+
+        // last_applied 故意与磁盘内容不同，验证有效文件路径不应用基线
+        let last_applied = Settings::default();
+        let mgr = App::apply_last_applied_fallback(
+            SettingsManager::from_config_path(path),
+            &last_applied,
+        );
+        assert_eq!(mgr.settings(), &disk, "有效文件应保留磁盘内容");
+    }
+
+    #[test]
+    fn apply_last_applied_fallback_keeps_disk_on_missing_file() {
+        // 文件不存在（首次运行）：默认值合法，视为加载成功（load_ok=true），
+        // 不得误判为失败而用 last_applied 覆盖
+        let path = temp_config_path("missing");
+        // 不创建文件
+        let last_applied = Settings {
+            default_scheme: SchemeId::Shuangpin,
+            ..Settings::default()
+        };
+        let mgr = App::apply_last_applied_fallback(
+            SettingsManager::from_config_path(path),
+            &last_applied,
+        );
+        assert_eq!(
+            mgr.settings(),
+            &Settings::default(),
+            "文件不存在应保留默认值（不应用 last_applied）"
+        );
+    }
 }

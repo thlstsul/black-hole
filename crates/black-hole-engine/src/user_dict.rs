@@ -190,7 +190,10 @@ impl UserDictionary {
             .and_then(|m| m.get(code))
             .cloned()
             .unwrap_or_default();
-        candidates.sort_by(|a, b| b.score.cmp(&a.score).then(a.text.cmp(&b.text)));
+        // 词频降序、同分按文本升序，保证确定顺序；单候选时跳过排序
+        if candidates.len() > 1 {
+            candidates.sort_by(|a, b| b.score.cmp(&a.score).then(a.text.cmp(&b.text)));
+        }
         candidates
     }
 }
