@@ -1050,11 +1050,11 @@ mod tests {
         // 上下文），既有 context 非空时评估仍可通过——空指针不得覆盖
         // 导致自动切换失联
         let d = decide_english_auto_switch(
-            true, // auto_switch
+            true,  // auto_switch
             false, // has_composition
-            true, // context_was_some（既有有效上下文）
+            true,  // context_was_some（既有有效上下文）
             false, // pic_present（空 pic）
-            true, // is_input_key
+            true,  // is_input_key
             false, // already_evaluated
         );
         assert!(!d.refresh_context, "空 pic 应保留既有 context，不刷新");
@@ -1083,11 +1083,17 @@ mod tests {
     fn decide_english_auto_switch_gate_conditions() {
         // 门控各条件单独不满足时均不评估：
         // 开关关闭 / 合成中 / 非字符输入键
-        assert!(!decide_english_auto_switch(false, false, true, true, true, false).evaluate,
-            "开关关闭不评估");
-        assert!(!decide_english_auto_switch(true, true, true, true, true, false).evaluate,
-            "合成中不评估");
-        assert!(!decide_english_auto_switch(true, false, true, true, false, false).evaluate,
-            "非字符输入键不评估");
+        assert!(
+            !decide_english_auto_switch(false, false, true, true, true, false).evaluate,
+            "开关关闭不评估"
+        );
+        assert!(
+            !decide_english_auto_switch(true, true, true, true, true, false).evaluate,
+            "合成中不评估"
+        );
+        assert!(
+            !decide_english_auto_switch(true, false, true, true, false, false).evaluate,
+            "非字符输入键不评估"
+        );
     }
 }
