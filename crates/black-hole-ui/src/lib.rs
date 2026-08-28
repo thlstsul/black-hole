@@ -2,7 +2,7 @@ use black_hole_shared::candidate_layout::{
     CANDIDATE_WINDOW_WIDTH, EXPANDED_AVAILABLE_WIDTH, ITEM_SPACING,
     layout_candidates_into_rows_excluding,
 };
-use black_hole_shared::{Candidate, CandidateWindowSettings, InputContext, Theme, UiCommand};
+use black_hole_shared::{Candidate, CandidateWindowSettings, Theme, UiCommand};
 pub use candidate_window::run_candidate_window;
 use eframe::egui::Frame as EguiFrame;
 use eframe::egui::{
@@ -134,33 +134,5 @@ fn wgpu_configuration() -> WgpuConfiguration {
             native_adapter_selector: None,
         }),
         ..Default::default()
-    }
-}
-
-/// 候选窗口接口
-pub trait CandidateWindow {
-    fn show(&mut self, code: &str, candidates: &[Candidate], selected: usize, ctx: &InputContext);
-    fn hide(&mut self);
-    fn update_selection(&mut self, selected: usize);
-}
-
-/// 设置面板接口
-pub trait SettingsPanel {
-    fn show(&mut self);
-    fn hide(&mut self);
-}
-
-/// 显示候选窗口原型（测试用）
-pub fn show_candidate_prototype(code: &str, candidates: &[Candidate], selected: usize) {
-    info!(code, "show candidate window");
-    for (i, c) in candidates.iter().enumerate() {
-        let marker = if i == selected { ">" } else { " " };
-        info!(
-            marker,
-            index = i + 1,
-            text = c.text,
-            comment = c.comment.as_deref().unwrap_or(""),
-            "candidate"
-        );
     }
 }
