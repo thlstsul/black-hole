@@ -25,12 +25,37 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP,
 };
 
-use super::ServiceInner;
-use super::caret::{get_caret_position_via_gui_thread_info, read_surrounding_text_via_uia};
 use super::send_ui_command_inner;
 use super::service::apply_input_mode_toggle;
-use black_hole_shared::{UiCommand, suggest_input_mode};
+use super::{ContextSample, ServiceInner};
+use black_hole_shared::UiCommand;
 use tracing::{debug, warn};
+
+/// 钩子路径手动切换的缓存基线门控：仅当采样快照（[`ContextSample`]）的焦点
+/// 线程、光标位置与语境版本均与当前状态一致时才信任缓存基线（UIA 回退已
+/// 移除，钩子回调无法即时采样语境建议）。判定规则：
+/// - 焦点线程：两者均需已知且相等（多进程应用 WebView2 等中
+///   GetForegroundWindow 不可靠，窗口身份以 TSF 焦点线程为准）；
+/// - 光标位置：两者均需已知且相等——光标移动不 bump 版本，需单独比对；
+///   自绘光标等从不跟踪位置的应用中 None==None 空真无法证明位置未变，
+///   保守拒绝；
+/// - 版本：缓存未被合成/焦点等语境变更作废（见 record_context_sample）。
+///
+/// 任一不匹配（焦点线程切换、光标移动、合成期间、从未采样）均拒绝，让自动
+/// 切换按新语境正常工作；钩子路径手动切换此时无法即时锁定，改为置位
+/// pending_manual_lock，由下个实时采样点在评估前以新鲜建议延迟锁定基线。
+fn cached_baseline_usable(
+    sample: &ContextSample,
+    focused_tid: Option<u32>,
+    current_pos: Option<(i32, i32, i32)>,
+    current_version: u64,
+) -> bool {
+    sample.focus_tid.is_some()
+        && sample.focus_tid == focused_tid
+        && sample.caret_pos.is_some()
+        && sample.caret_pos == current_pos
+        && sample.version == current_version
+}
 
 /// 当前进程内所有已激活的文本服务实例（线程 id → 弱引用）。
 /// 钩子回调据此定位前台窗口所属线程对应的服务。
@@ -58,6 +83,13 @@ pub(crate) fn clear_foreground_thread() {
     if let Ok(mut guard) = FOREGROUND_TID.lock() {
         *guard = None;
     }
+}
+
+/// 读取当前持有 TSF 输入焦点的线程 id（None=无 TSF 焦点）。
+/// 多进程应用（WebView2 等）中 GetForegroundWindow 不可靠，钩子门控与缓存
+/// 采样都以此身份标识为锚（见 cached_baseline_usable）。
+pub(crate) fn focused_thread_id() -> Option<u32> {
+    FOREGROUND_TID.lock().ok().and_then(|g| *g)
 }
 
 /// 注册一个已激活的服务实例（Activate 时调用），并确保钩子已安装。
@@ -275,15 +307,28 @@ fn on_ctrl_released() {
         toggled
     };
     if let Some(english) = toggled {
-        // 用户手动切换：即时采样当前语境建议作为锁定基线（钩子回调中无法请求
-        // TSF 编辑会话，走 UIA TextPattern 读取；失败/无信号则为 None 基线），
-        // 同语境的自动建议不再撤销本次选择
-        let caret_pos = get_caret_position_via_gui_thread_info().ok();
-        let (preceding, following) =
-            read_surrounding_text_via_uia(caret_pos.map(|(x, y, _)| (x, y)));
-        let suggestion = suggest_input_mode(preceding.as_deref(), following.as_deref());
+        // 用户手动切换：钩子回调中无法请求 TSF 编辑会话读取周围文本，
+        // 以最近一次 TSF 采样到的语境建议作为锁定基线——None 基线会在
+        // 下一个真实建议（Some）时触发"语境变化"解锁、撤销手动切换；
+        // 从未采样时为 None（无自动切换信号，锁定无副作用）
         if let Ok(mut guard) = inner.lock() {
-            guard.auto_mode.lock_manual(suggestion);
+            // 钩子路径无法即时采样语境建议（UIA 回退已移除）：仅当最近一次
+            // 采样快照仍与当前焦点线程/光标位置/语境版本一致时才以缓存作
+            // 锁定基线（门控规则见 cached_baseline_usable）；基线不可信时
+            // 置位"延迟手动锁定"，下个实时采样点（按键评估/编辑会话）以
+            // 新鲜建议锁定基线，保护本次手动切换不被自动切换立即撤销。
+            if cached_baseline_usable(
+                &guard.context_sample,
+                focused_thread_id(),
+                guard.last_caret_pos,
+                guard.context_version,
+            ) {
+                let baseline = guard.context_sample.suggestion;
+                guard.auto_mode.lock_manual(baseline);
+            } else {
+                debug!("hook: 缓存基线不可用，置位延迟手动锁定");
+                guard.pending_manual_lock = true;
+            }
         }
         debug!(
             "Ctrl toggled via keyboard hook: {}",
@@ -292,5 +337,74 @@ fn on_ctrl_released() {
         apply_input_mode_toggle(&inner, english);
         // 上报 daemon 持久化并更新全局状态，供其它进程（管理员/普通）同步
         send_ui_command_inner(&inner, UiCommand::SetInputMode(english));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ContextSample, cached_baseline_usable};
+
+    fn sample(focus_tid: Option<u32>, pos: Option<(i32, i32, i32)>, version: u64) -> ContextSample {
+        ContextSample {
+            suggestion: Some(true),
+            focus_tid,
+            caret_pos: pos,
+            version,
+        }
+    }
+
+    #[test]
+    fn baseline_usable_requires_focus_position_version_match() {
+        let pos = Some((10, 20, 30));
+        // 全部匹配（焦点线程/位置/版本）：可用
+        assert!(cached_baseline_usable(
+            &sample(Some(1), pos, 3),
+            Some(1),
+            pos,
+            3
+        ));
+        // 焦点线程不匹配（焦点切换）：不可用
+        assert!(!cached_baseline_usable(
+            &sample(Some(1), pos, 3),
+            Some(2),
+            pos,
+            3
+        ));
+        // 焦点线程未知（无 TSF 焦点）：空真拒绝
+        assert!(!cached_baseline_usable(
+            &sample(Some(1), pos, 3),
+            None,
+            pos,
+            3
+        ));
+        // 光标位置不匹配（采样后移动到不同语境）：不可用
+        assert!(!cached_baseline_usable(
+            &sample(Some(1), pos, 3),
+            Some(1),
+            Some((40, 50, 60)),
+            3
+        ));
+        // 版本不匹配（合成/焦点变更作废缓存）：不可用
+        assert!(!cached_baseline_usable(
+            &sample(Some(1), pos, 2),
+            Some(1),
+            pos,
+            3
+        ));
+        // 位置未知（自绘光标等应用从不跟踪 last_caret_pos）：None==None 空真
+        // 无法证明位置未变，保守拒绝
+        assert!(!cached_baseline_usable(
+            &sample(Some(1), None, 3),
+            Some(1),
+            None,
+            3
+        ));
+        // 从未采样（None 焦点线程/位置）：不可用
+        assert!(!cached_baseline_usable(
+            &sample(None, None, 3),
+            Some(1),
+            pos,
+            3
+        ));
     }
 }

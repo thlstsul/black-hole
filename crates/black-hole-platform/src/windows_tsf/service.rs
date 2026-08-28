@@ -166,6 +166,7 @@ impl BlackHoleTextService {
         let mut inner = self.inner.lock().unwrap();
         inner.ipc_conn = None;
         inner.composition = None;
+        inner.context_version += 1;
         inner.active = false;
     }
 
@@ -256,9 +257,9 @@ impl BlackHoleTextService {
     }
 
     /// 采样当前语境建议：手动 Ctrl 切换时作为自动切换状态机的锁定基线。
-    /// 通过同步只读编辑会话读取光标周围文本（TSF 取不到时回退 UIA），
-    /// 读取失败或无信号返回 None（None 基线下任一有效建议即视为语境变化，
-    /// 自动解锁恢复自动切换，不会困住手动选择）。
+    /// 通过同步只读编辑会话读取光标周围文本（TSF 文本存储取不到时按无信号
+    /// 处理，UIA 回退已移除），读取失败或无信号返回 None（None 基线下任一
+    /// 有效建议即视为语境变化，自动解锁恢复自动切换，不会困住手动选择）。
     fn sample_current_suggestion(&self) -> Option<bool> {
         let (ctx, client_id) = {
             let inner = self.inner.lock().unwrap();
@@ -543,6 +544,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         {
             let mut inner = self.inner.lock().unwrap();
             inner.last_caret_pos = None;
+            inner.context_version += 1;
         }
         // 记录 TSF 输入焦点：WebView2 等多进程应用的 IME 承载进程与宿主窗口
         // 进程不同，GetForegroundWindow 不可靠，钩子依赖此处的焦点状态判定前台。
@@ -774,6 +776,9 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
 
         {
             let mut inner = self.inner.lock().unwrap();
+            // 无条件保持 context 最新：TSF 不保证跨按键返回同一接口指针，
+            // 以指针比较门控刷新会在指针不稳定时保留过期 context（导致提交/
+            // 插入作用到错误上下文）。
             inner.context = pic.to_owned();
         }
 
@@ -825,6 +830,10 @@ impl ITfCompositionSink_Impl for BlackHoleTextService_Impl {
     ) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.composition = None;
+        // 应用主动终止合成（Esc/点击等绕过 Commit/Cancel 编辑会话）：
+        // 与 commit.rs 的合成结束路径保持一致，同步清空光标位置并作废缓存
+        inner.last_caret_pos = None;
+        inner.context_version += 1;
         if let Some(cookie) = inner.layout_sink_cookie.take()
             && let Some(ref ctx) = inner.context
             && let Ok(source) = ctx.cast::<ITfSource>()
@@ -903,6 +912,7 @@ impl ITfThreadMgrEventSink_Impl for BlackHoleTextService_Impl {
         {
             let mut inner = self.inner.lock().unwrap();
             inner.last_caret_pos = None;
+            inner.context_version += 1;
         }
         self.send_reset(false);
         Ok(())
@@ -1050,11 +1060,11 @@ mod tests {
         // 上下文），既有 context 非空时评估仍可通过——空指针不得覆盖
         // 导致自动切换失联
         let d = decide_english_auto_switch(
-            true, // auto_switch
+            true,  // auto_switch
             false, // has_composition
-            true, // context_was_some（既有有效上下文）
+            true,  // context_was_some（既有有效上下文）
             false, // pic_present（空 pic）
-            true, // is_input_key
+            true,  // is_input_key
             false, // already_evaluated
         );
         assert!(!d.refresh_context, "空 pic 应保留既有 context，不刷新");
@@ -1083,11 +1093,17 @@ mod tests {
     fn decide_english_auto_switch_gate_conditions() {
         // 门控各条件单独不满足时均不评估：
         // 开关关闭 / 合成中 / 非字符输入键
-        assert!(!decide_english_auto_switch(false, false, true, true, true, false).evaluate,
-            "开关关闭不评估");
-        assert!(!decide_english_auto_switch(true, true, true, true, true, false).evaluate,
-            "合成中不评估");
-        assert!(!decide_english_auto_switch(true, false, true, true, false, false).evaluate,
-            "非字符输入键不评估");
+        assert!(
+            !decide_english_auto_switch(false, false, true, true, true, false).evaluate,
+            "开关关闭不评估"
+        );
+        assert!(
+            !decide_english_auto_switch(true, true, true, true, true, false).evaluate,
+            "合成中不评估"
+        );
+        assert!(
+            !decide_english_auto_switch(true, false, true, true, false, false).evaluate,
+            "非字符输入键不评估"
+        );
     }
 }

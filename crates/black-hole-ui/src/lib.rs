@@ -102,6 +102,41 @@ fn load_system_font_data() -> Option<FontData> {
     None
 }
 
+/// 候选窗/设置面板共用的 wgpu 配置。
+///
+/// Windows 上排除 Vulkan 后端：Intel 核显（如 UHD 630）的 igvk64.dll 驱动在
+/// wgpu 初始化/渲染时存在访问冲突崩溃（0xc0000005，事件日志 faulting module
+/// 即 igvk64.dll），候选窗随 daemon 常驻、每次按键都可能触发渲染，必须绕开；
+/// DX12（含 WARP 兜底）在 Windows 上始终可用。非 Windows 保持原有后端集合。
+fn wgpu_configuration() -> WgpuConfiguration {
+    #[cfg(target_os = "windows")]
+    let backends = Backends::PRIMARY - Backends::VULKAN;
+    #[cfg(not(target_os = "windows"))]
+    let backends = Backends::PRIMARY;
+
+    WgpuConfiguration {
+        wgpu_setup: WgpuSetup::CreateNew(WgpuSetupCreateNew {
+            instance_descriptor: InstanceDescriptor {
+                flags: InstanceFlags::empty(),
+                backends,
+                memory_budget_thresholds: MemoryBudgetThresholds::default(),
+                backend_options: BackendOptions::default(),
+                display: None, // 关键：禁用所有 debug/validation
+            },
+            device_descriptor: Arc::new(|_adapter| DeviceDescriptor {
+                memory_hints: MemoryHints::Manual {
+                    suballocated_device_memory_block_size: 4 * 1024 * 1024..16 * 1024 * 1024,
+                },
+                ..Default::default()
+            }),
+            display_handle: None,
+            power_preference: PowerPreference::None,
+            native_adapter_selector: None,
+        }),
+        ..Default::default()
+    }
+}
+
 /// 候选窗口接口
 pub trait CandidateWindow {
     fn show(&mut self, code: &str, candidates: &[Candidate], selected: usize, ctx: &InputContext);

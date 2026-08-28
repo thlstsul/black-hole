@@ -58,6 +58,7 @@ impl LlmClient for HttpLlmClient {
         Box::pin(async move {
             // DeepSeek V4 系列默认开启思考模式：会先消耗 token 推理、content 常为空。
             // 整句补全无需推理，固定关闭思考（thinking.disabled），max_tokens 全部用于生成补全。
+            let prompt = build_prompt(&req);
             let body = serde_json::json!({
                 "model": settings.model,
                 "max_tokens": settings.max_tokens,
@@ -65,9 +66,19 @@ impl LlmClient for HttpLlmClient {
                 "thinking": {"type": "disabled"},
                 "messages": [
                     {"role": "system", "content": "你是中文输入法的整句补全助手。\n请续写光标处【】内词语之后的内容，输出一句自然通顺的中文，只输出续写部分，不超过 20 字，可含句末标点。"},
-                    {"role": "user", "content": build_prompt(&req)},
+                    {"role": "user", "content": prompt},
                 ],
             });
+
+            // 只记请求元数据，不记 prompt 正文：正文含用户输入的光标周围
+            // 文本/选区文本，属用户数据（与平台侧 truncate_for_log 约定一致）
+            debug!(
+                "completion request: model={} max_tokens={} temperature={} prompt_bytes={}",
+                settings.model,
+                settings.max_tokens,
+                settings.temperature,
+                prompt.len()
+            );
 
             // 分阶段超时：连接阶段短超时快速失败（DNS/建连），读取阶段用完整
             // 配置超时——云端 LLM（如 DeepSeek）推理耗时可能数秒。reqwest 的

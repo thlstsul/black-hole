@@ -120,6 +120,25 @@ pub(crate) struct IpcConnection {
     pub(crate) reader: BufReader<TcpStream>,
 }
 
+/// 最近一次语境建议采样快照。由三个 TSF 采样点（key_event.rs 的
+/// handle_key_event_internal、auto_switch.rs 的 AutoSwitchEditSession /
+/// SuggestionReadSession）经 [`ServiceInner::record_context_sample`] 统一写入，
+/// 供钩子路径手动切换（hook.rs）作锁定基线。
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ContextSample {
+    /// 语境建议（None=无信号或读取失败）。
+    pub(crate) suggestion: Option<bool>,
+    /// 采样时的 TSF 焦点线程 id（FOREGROUND_TID 快照）：多进程应用（WebView2
+    /// 等）中 GetForegroundWindow 不可靠，窗口身份以焦点线程为锚。
+    pub(crate) focus_tid: Option<u32>,
+    /// 采样时的光标位置（last_caret_pos 快照）：光标移动不 bump context_version，
+    /// 钩子路径额外要求缓存位置与当前光标一致。
+    pub(crate) caret_pos: Option<(i32, i32, i32)>,
+    /// 采样时（读取前快照）的 context_version：与当前版本比对判断缓存是否被
+    /// 后续语境变更作废。
+    pub(crate) version: u64,
+}
+
 pub(crate) struct ServiceInner {
     /// IPC connection to the daemon (out-of-process mode).
     pub(crate) ipc_conn: Option<IpcConnection>,
@@ -162,6 +181,18 @@ pub(crate) struct ServiceInner {
     pub(crate) auto_switch: bool,
     /// 自动切换状态机：评估语境建议、维护手动切换锁定的语境基线。
     pub(crate) auto_mode: AutoModeSwitch,
+    /// 语境变更版本：合成开始/结束、焦点切换、Deactivate 时 +1。与
+    /// [`ContextSample::version`] 比对判断采样缓存是否已被后续语境变更作废。
+    pub(crate) context_version: u64,
+    /// 最近一次语境建议采样快照。钩子路径手动切换无法请求 TSF 编辑会话，
+    /// 仅在焦点线程/光标位置/版本与当前状态一致时以缓存作锁定基线
+    /// （见 hook.rs 的 cached_baseline_usable）。
+    pub(crate) context_sample: ContextSample,
+    /// "延迟手动锁定"标志：钩子路径手动切换（hook.rs on_ctrl_released）因
+    /// 缓存门控失败无法即时 lock_manual 时置位，下个实时语境采样点
+    /// （key_event.rs 中→英评估 / auto_switch.rs 英→中评估）在 evaluate 前
+    /// 以新鲜建议消费该标志锁定基线，保护手动切换不被随后的自动切换撤销。
+    pub(crate) pending_manual_lock: bool,
     /// 英文模式自动切换评估去重：最近一次在 OnTestKeyDown 评估过的按键及时间。
     /// 部分应用（如 WebView2）对同一按键既调 OnTestKeyDown 又调 OnKeyDown，
     /// OnKeyDown 据此在时间窗内跳过重复评估。
@@ -191,8 +222,30 @@ impl ServiceInner {
             hook_toggled: false,
             auto_switch: false,
             auto_mode: AutoModeSwitch::default(),
+            context_version: 0,
+            context_sample: ContextSample::default(),
+            pending_manual_lock: false,
             last_eng_eval_key: None,
         }
+    }
+
+    /// 记录一次语境建议采样快照。`version`/`caret_pos` 必须传读取前的快照
+    /// （entry_version / last_caret_pos）：版本盖章必须与采样文本同源——若盖
+    /// 写入时的当前版本，读取窗口内的语境变更会留下"新文本+旧版本"或
+    /// "旧文本+新版本"的错位，钩子路径的版本门控会空真通过或误拒。
+    pub(crate) fn record_context_sample(
+        &mut self,
+        suggestion: Option<bool>,
+        focus_tid: Option<u32>,
+        caret_pos: Option<(i32, i32, i32)>,
+        version: u64,
+    ) {
+        self.context_sample = ContextSample {
+            suggestion,
+            focus_tid,
+            caret_pos,
+            version,
+        };
     }
 }
 

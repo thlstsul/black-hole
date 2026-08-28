@@ -11,10 +11,9 @@
 //! 手动 Ctrl 切换（TSF 路径与全局钩子路径）会调用 `AutoModeSwitch::lock_manual`
 //! 锁定当时的语境基线：锁定期间同语境的自动建议被抑制，语境变化后自动解锁。
 
-use super::caret::{
-    get_caret_position_via_gui_thread_info, read_surrounding_text, read_surrounding_text_via_uia,
-    truncate_for_log,
-};
+use super::caret::{read_surrounding_text, truncate_for_log};
+use super::hook::focused_thread_id;
+use super::key_event::context_changed;
 use super::service::apply_input_mode_toggle;
 use super::{ServiceInner, send_ui_command_inner};
 use black_hole_shared::{UiCommand, suggest_input_mode};
@@ -37,26 +36,17 @@ pub(crate) fn apply_auto_mode_toggle(inner: &Arc<Mutex<ServiceInner>>, target: b
     send_ui_command_inner(inner, UiCommand::SetInputModeTransient(target));
 }
 
-/// 编辑会话内共用：读取光标周围文本（TSF 文本存储优先，取不到时回退 UIA
-/// TextPattern——仅在纯 IMM32 应用上产生 UIA 开销）并给出语境建议。
+/// 编辑会话内共用：通过 TSF 文本存储读取光标周围文本并给出语境建议。
+/// 返回 (语境建议, TSF 文本存储是否可用)。存储可用性供英→中评估在
+/// 无文本存储的应用（纯 IMM32）上跳过"中立语境回中文"评估。
 /// 供自动切换评估（[`AutoSwitchEditSession`]）与手动切换的基线采样
 /// （[`SuggestionReadSession`]）复用。
 pub(crate) fn suggest_from_surrounding_text(
     ec: u32,
     ctx: &ITfContext,
     composition: Option<&ITfComposition>,
-) -> Option<bool> {
-    let (mut preceding, mut following) = read_surrounding_text(ec, ctx, composition);
-    // 纯 IMM32 应用（如 Zed）无 TSF 文本存储：回退 UIA TextPattern。
-    // UIA 优先走 GetSelection，无需 Win32 光标坐标（自绘光标应用拿不到）；
-    // 坐标仅作 RangeFromPoint 兜底。
-    if preceding.is_none() && following.is_none() {
-        let caret_pos = get_caret_position_via_gui_thread_info().ok();
-        let (uia_preceding, uia_following) =
-            read_surrounding_text_via_uia(caret_pos.map(|(x, y, _)| (x, y)));
-        preceding = uia_preceding;
-        following = uia_following;
-    }
+) -> (Option<bool>, bool) {
+    let (preceding, following, store_available) = read_surrounding_text(ec, ctx, composition);
     let suggestion = suggest_input_mode(preceding.as_deref(), following.as_deref());
     debug!(
         "surrounding-text suggestion: preceding={:?} following={:?} suggestion={:?}",
@@ -64,14 +54,13 @@ pub(crate) fn suggest_from_surrounding_text(
         following.as_deref().map(truncate_for_log),
         suggestion
     );
-    suggestion
+    (suggestion, store_available)
 }
 
 /// 英文→中文自动切换评估用的只读编辑会话（仿 caret.rs 的 LayoutChangeEditSession）。
 ///
-/// 会话内通过 TSF 文本存储读取光标周围文本并评估（TSF 取不到时回退 UIA
-/// TextPattern，仅在纯 IMM32 应用上产生每键一次的 UIA 开销），结果写入
-/// `result`，由调用方（OnTestKeyDown）在同步会话返回后读取并完成收尾。
+/// 会话内通过 TSF 文本存储读取光标周围文本并评估，结果写入 `result`，
+/// 由调用方（OnTestKeyDown）在同步会话返回后读取并完成收尾。
 #[implement(ITfEditSession)]
 pub(crate) struct AutoSwitchEditSession {
     pub(crate) inner_arc: Arc<Mutex<ServiceInner>>,
@@ -81,7 +70,7 @@ pub(crate) struct AutoSwitchEditSession {
 
 impl ITfEditSession_Impl for AutoSwitchEditSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
-        let (ctx, composition) = {
+        let (ctx, composition, entry_version, last_caret_pos) = {
             let inner = self.inner_arc.lock().unwrap();
             // 会话执行时再次确认门控（请求发出到会话执行之间状态可能已变化）：
             // 开关开启、当前英文模式、有上下文且无进行中的合成
@@ -101,15 +90,50 @@ impl ITfEditSession_Impl for AutoSwitchEditSession_Impl {
             if !no_composition {
                 return Ok(());
             }
-            (ctx, composition)
+            (
+                ctx,
+                composition,
+                inner.context_version,
+                inner.last_caret_pos,
+            )
         };
 
         // 读文本期间不持有 inner 锁，避免 TSF 回调重入死锁
         // （与 LayoutChangeEditSession 的加锁模式一致）。
-        let suggestion = suggest_from_surrounding_text(ec, &ctx, composition.as_ref());
+        let (suggestion, store_available) =
+            suggest_from_surrounding_text(ec, &ctx, composition.as_ref());
         debug!("auto-switch eval (英→中): suggestion={:?}", suggestion);
+        // TSF 文本存储不可用的应用（纯 IMM32 无 ITfTextStore）：每键评估都只会
+        // 得到无信号建议，evaluate 的"中立语境默认回中文"规则会强制切回英文
+        // 模式——存储不可用（GetSelection 失败且无 composition range 可回退，
+        // 含 GetRange 已失效的死合成）时跳过评估，保持当前模式。可用性直接
+        // 来自本次读取（read_surrounding_text），无需额外探测。
+        if !store_available {
+            return Ok(());
+        }
 
         let mut inner = self.inner_arc.lock().unwrap();
+        // 读取期间发生语境变更（合成/焦点等，context_version 已 bump）：
+        // 本次读取的文本已过期，跳过评估（评估会话不消费按键，直接返回
+        // 不会吞键，OnTestKeyDown 按未评估继续）。
+        if context_changed(entry_version, inner.context_version) {
+            return Ok(());
+        }
+        // 缓存本次采样（含焦点线程、光标位置与语境版本）：钩子路径手动切换
+        // 仅在焦点线程/位置一致且缓存未被后续合成/焦点变更作废时据此取锁定基线
+        inner.record_context_sample(
+            suggestion,
+            focused_thread_id(),
+            last_caret_pos,
+            entry_version,
+        );
+        // 消费"延迟手动锁定"：钩子路径手动切换（Ctrl）因缓存门控失败未能
+        // 即时 lock_manual 时，以本次实时采样到的语境建议作基线锁定，保护
+        // 手动切换不被随后的英→中自动切换立即撤销。
+        if inner.pending_manual_lock {
+            inner.auto_mode.lock_manual(suggestion);
+            inner.pending_manual_lock = false;
+        }
         let current = inner.mode_switch.is_english();
         if let Some(target) = inner.auto_mode.evaluate(suggestion, current) {
             // evaluate 已确认目标与当前不同，set_english 必然产生切换
@@ -132,16 +156,36 @@ pub(crate) struct SuggestionReadSession {
 
 impl ITfEditSession_Impl for SuggestionReadSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
-        let (ctx, composition) = {
+        let (ctx, composition, entry_version, last_caret_pos) = {
             let inner = self.inner_arc.lock().unwrap();
             let Some(ctx) = inner.context.clone() else {
                 return Ok(());
             };
-            (ctx, inner.composition.clone())
+            (
+                ctx,
+                inner.composition.clone(),
+                inner.context_version,
+                inner.last_caret_pos,
+            )
         };
         // 读文本期间不持有 inner 锁，避免 TSF 回调重入死锁
-        let suggestion = suggest_from_surrounding_text(ec, &ctx, composition.as_ref());
+        let (suggestion, _) = suggest_from_surrounding_text(ec, &ctx, composition.as_ref());
         *self.suggestion.lock().unwrap() = suggestion;
+        // 缓存本次采样（含焦点线程、光标位置与语境版本）：钩子路径手动切换
+        // 仅在焦点线程/位置一致且缓存未被后续合成/焦点变更作废时据此取锁定基线
+        {
+            let mut inner = self.inner_arc.lock().unwrap();
+            inner.record_context_sample(
+                suggestion,
+                focused_thread_id(),
+                last_caret_pos,
+                entry_version,
+            );
+            // 清空"延迟手动锁定"：TSF 路径（service.rs OnTestKeyUp）会以本次
+            // 采样建议即时 lock_manual，钩子路径遗留的 pending 无需再延迟消费
+            // 到后续评估点，避免重复锁定。
+            inner.pending_manual_lock = false;
+        }
         Ok(())
     }
 }

@@ -34,6 +34,7 @@ pub(crate) fn apply_result(
                         let valid = unsafe { c.GetRange().is_ok() };
                         if !valid {
                             inner.composition = None;
+                            inner.context_version += 1;
                         }
                         !valid
                     }
@@ -42,7 +43,9 @@ pub(crate) fn apply_result(
             if need_start {
                 {
                     let mut inner = inner_arc.lock().unwrap();
+                    // 合成开始：文本/光标状态不可靠，一并清空光标位置并作废缓存
                     inner.last_caret_pos = None;
+                    inner.context_version += 1;
                 }
 
                 let insert: ITfInsertAtSelection = ctx.cast()?;
@@ -55,6 +58,7 @@ pub(crate) fn apply_result(
                 {
                     let mut inner = inner_arc.lock().unwrap();
                     inner.composition = Some(comp);
+                    inner.context_version += 1;
                 }
 
                 {
@@ -84,6 +88,9 @@ pub(crate) fn apply_result(
             if code.is_empty() {
                 let composition = {
                     let mut inner = inner_arc.lock().unwrap();
+                    // 清空合成：文本已变化，一并清空光标位置并作废缓存
+                    inner.last_caret_pos = None;
+                    inner.context_version += 1;
                     inner.composition.take()
                 };
                 if let Some(composition) = composition {
@@ -156,6 +163,10 @@ pub(crate) fn apply_result(
                     unsafe { range.SetText(ec, 0, &utf16)? };
                     Ok(())
                 })();
+                // 直插文本（无合成）：文档已变化，一并清空光标位置并作废缓存
+                let mut inner = inner_arc.lock().unwrap();
+                inner.last_caret_pos = None;
+                inner.context_version += 1;
                 return Ok(());
             };
 
@@ -183,6 +194,7 @@ pub(crate) fn apply_result(
             {
                 let mut inner = inner_arc.lock().unwrap();
                 inner.last_caret_pos = None;
+                inner.context_version += 1;
                 if let Some(cookie) = inner.layout_sink_cookie.take()
                     && let Ok(source) = ctx.cast::<ITfSource>()
                 {
@@ -245,6 +257,7 @@ impl ITfEditSession_Impl for CommitCompositionEditSession_Impl {
             let mut inner = self.inner_arc.lock().unwrap();
             inner.composition = None;
             inner.last_caret_pos = None;
+            inner.context_version += 1;
             if let Some(cookie) = layout_cookie
                 && let Some(ref ctx) = ctx
                 && let Ok(source) = ctx.cast::<ITfSource>()
@@ -284,6 +297,7 @@ impl ITfEditSession_Impl for CancelCompositionEditSession_Impl {
             let mut inner = self.inner_arc.lock().unwrap();
             inner.composition = None;
             inner.last_caret_pos = None;
+            inner.context_version += 1;
             if let Some(cookie) = layout_cookie
                 && let Some(ref ctx) = ctx
                 && let Ok(source) = ctx.cast::<ITfSource>()

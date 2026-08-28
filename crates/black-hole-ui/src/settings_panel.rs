@@ -4,6 +4,7 @@ use black_hole_shared::{KeyBindings, SchemeId, Settings, Theme};
 use crate::configure_fonts;
 use crate::settings_manager::SettingsManager;
 use crate::theme_visuals;
+use crate::wgpu_configuration;
 use eframe::egui::{DragValue, Margin, ScrollArea, Ui, ViewportBuilder, ViewportCommand};
 use eframe::{App, EventLoopBuilder, EventLoopBuilderHook, Frame, NativeOptions, run_native};
 #[cfg(target_os = "windows")]
@@ -454,6 +455,7 @@ pub fn run_settings_panel(settings_mgr: SettingsManager) {
             .with_title("黑洞输入法设置")
             .with_active(true),
         event_loop_builder,
+        wgpu_options: wgpu_configuration(),
         ..Default::default()
     };
 
