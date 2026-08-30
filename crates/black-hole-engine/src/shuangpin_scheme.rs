@@ -1,6 +1,6 @@
 #[cfg(test)]
 use crate::RawEntry;
-use crate::punctuation::convert_punctuation;
+use crate::punctuation::{QuotePair, convert_punctuation};
 use crate::{
     CandidateRanker, Codec, CodecState, Dictionary, GraphDecoder, InputScheme, RimeDict,
     ShuangpinCodec, SimpleRanker, UserDictionary, global_user_dict, sort_candidates,
@@ -38,6 +38,8 @@ pub struct ShuangpinScheme {
     completion: Option<CompletionHint>,
     /// 临时英文输入缓冲（大写字母开头时进入）
     english_buffer: Option<String>,
+    /// 中文引号配对状态（' 与 " 交替输出左右引号）
+    quote_pair: QuotePair,
 }
 
 impl Default for ShuangpinScheme {
@@ -59,6 +61,7 @@ impl ShuangpinScheme {
             selected_index: 0,
             completion: None,
             english_buffer: None,
+            quote_pair: QuotePair::new(),
         }
     }
 
@@ -74,6 +77,7 @@ impl ShuangpinScheme {
             selected_index: 0,
             completion: None,
             english_buffer: None,
+            quote_pair: QuotePair::new(),
         }
     }
 
@@ -284,7 +288,7 @@ impl InputScheme for ShuangpinScheme {
         SchemeId::Shuangpin
     }
 
-    fn handle_key(&mut self, key: &KeyEvent, _ctx: &InputContext) -> SchemeResult {
+    fn handle_key(&mut self, key: &KeyEvent, ctx: &InputContext) -> SchemeResult {
         if key.state != KeyState::Press {
             return SchemeResult::Ignored;
         }
@@ -591,8 +595,14 @@ impl InputScheme for ShuangpinScheme {
                 }
             }
             CodecState::Rejected => {
-                let Some(cn) = convert_punctuation(ch) else {
-                    return SchemeResult::Ignored;
+                // 引号键启用配对（交替输出左右引号），其余标点直接转换
+                let cn = if ch == '\'' || ch == '"' {
+                    self.quote_pair.next(ch, ctx.preceding_text.as_deref())
+                } else {
+                    let Some(cn) = convert_punctuation(ch) else {
+                        return SchemeResult::Ignored;
+                    };
+                    cn
                 };
                 let committed = if self.codec.code().is_empty() {
                     String::new()
@@ -634,6 +644,7 @@ impl InputScheme for ShuangpinScheme {
         self.selected_index = 0;
         self.completion = None;
         self.english_buffer = None;
+        self.quote_pair.reset();
     }
 }
 
@@ -670,6 +681,52 @@ mod tests {
                 .collect(),
         )
         .unwrap()
+    }
+
+    /// 构造带光标前文的上下文
+    fn ctx_with_preceding(text: &str) -> InputContext {
+        InputContext {
+            preceding_text: Some(text.to_string()),
+            ..InputContext::caret(0, 0, 20)
+        }
+    }
+
+    #[test]
+    fn test_shuangpin_scheme_quote_pairing() {
+        let mut scheme = ShuangpinScheme::new();
+
+        // 前文为空 → 输出左引号
+        let r1 = scheme.handle_key(&key_event("\""), &InputContext::caret(0, 0, 20));
+        assert!(
+            matches!(r1, SchemeResult::Committed { ref text } if text == "“"),
+            "空前文应按引号输出左引号，实际: {:?}",
+            r1
+        );
+
+        // 前文包含未闭合的左引号 → 输出右引号（配对闭合）
+        let r2 = scheme.handle_key(&key_event("\""), &ctx_with_preceding("他说“你好"));
+        assert!(
+            matches!(r2, SchemeResult::Committed { ref text } if text == "”"),
+            "前文有未闭合左引号应输出右引号，实际: {:?}",
+            r2
+        );
+
+        // 前文已闭合 → 再次输出左引号
+        let r3 = scheme.handle_key(&key_event("\""), &ctx_with_preceding("他说“你好”"));
+        assert!(
+            matches!(r3, SchemeResult::Committed { ref text } if text == "“"),
+            "前文已闭合应输出左引号，实际: {:?}",
+            r3
+        );
+    }
+
+    #[test]
+    fn test_shuangpin_scheme_single_quote_pairing() {
+        let mut scheme = ShuangpinScheme::new();
+        let r1 = scheme.handle_key(&key_event("'"), &InputContext::caret(0, 0, 20));
+        assert!(matches!(r1, SchemeResult::Committed { ref text } if text == "‘"));
+        let r2 = scheme.handle_key(&key_event("'"), &ctx_with_preceding("他说‘你好"));
+        assert!(matches!(r2, SchemeResult::Committed { ref text } if text == "’"));
     }
 
     #[test]
