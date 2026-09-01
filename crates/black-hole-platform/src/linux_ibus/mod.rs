@@ -262,9 +262,21 @@ impl IbusEngine {
         };
 
         match result {
-            SchemeResult::Committed { text } => {
+            SchemeResult::Committed {
+                text,
+                temporary_english,
+            } => {
                 // 已上屏，清空记录的编码，避免切换模式时重复上屏
                 *self.last_code.lock().unwrap() = None;
+                // 临时英文结束上屏后，以英文为基线锁定自动切换，避免紧随其后的
+                // 中→英自动切换把用户拉入全英文模式（与 Windows 侧一致）。
+                // 临时英文上屏文本为纯 ASCII 字母，Space 结束路径可带一个尾部
+                // 空格（suggest_input_mode 的信号扫描会跳过空白），故上屏后语境
+                // 必为英文，直接以 Some(true) 作基线，无需回读（缓存语境可能是
+                // 上屏前文本）。
+                if temporary_english {
+                    self.auto_mode.lock().unwrap().lock_manual(Some(true));
+                }
                 // 发送 CommitText DBus 信号
                 let ibus_text = (text.as_str(), Vec::<(u32, u32, u32, u32)>::new());
                 let variant = Value::from(ibus_text);

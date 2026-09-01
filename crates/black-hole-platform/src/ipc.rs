@@ -34,6 +34,12 @@ pub enum IpcResponse {
     },
     Committed {
         text: String,
+        /// 本次上屏是否为"临时英文模式"结束上屏（见 SchemeResult::Committed）。
+        /// 加 #[serde(default)] 做跨版本兼容：旧版本 daemon 序列化的 Committed
+        /// JSON 不含此字段时默认 false（非临时英文），与同枚举 Settings.auto_switch
+        /// 的约定一致，避免版本错配时 read_response 反序列化失败丢键。
+        #[serde(default)]
+        temporary_english: bool,
     },
     Ignored,
     /// 响应 GetSettings 请求，返回 daemon 当前加载的设置。
@@ -62,7 +68,13 @@ impl From<SchemeResult> for IpcResponse {
                 selected_index,
                 expanded,
             },
-            SchemeResult::Committed { text } => IpcResponse::Committed { text },
+            SchemeResult::Committed {
+                text,
+                temporary_english,
+            } => IpcResponse::Committed {
+                text,
+                temporary_english,
+            },
             SchemeResult::Ignored => IpcResponse::Ignored,
         }
     }
@@ -82,7 +94,13 @@ impl From<IpcResponse> for SchemeResult {
                 selected_index,
                 expanded,
             },
-            IpcResponse::Committed { text } => SchemeResult::Committed { text },
+            IpcResponse::Committed {
+                text,
+                temporary_english,
+            } => SchemeResult::Committed {
+                text,
+                temporary_english,
+            },
             IpcResponse::Ignored => SchemeResult::Ignored,
             // Settings is only handled directly in sync_settings_from_daemon,
             // never converted to SchemeResult.
@@ -112,3 +130,54 @@ pub fn read_response<R: BufRead>(reader: &mut R) -> Result<IpcResponse, io::Erro
 
 /// Daemon 端 IPC 服务器地址
 pub const IPC_SERVER_ADDR: &str = "127.0.0.1:52719";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Committed 经 IPC 往返须保留 temporary_english（跨 daemon↔TSF 的关键
+    /// 字段，静默丢失会使临时英文上屏后的自动切换锁定失效）。
+    #[test]
+    fn committed_round_trip_preserves_temporary_english() {
+        for temp in [false, true] {
+            let result = SchemeResult::Committed {
+                text: "hello ".to_string(),
+                temporary_english: temp,
+            };
+            let response = IpcResponse::from(result);
+            assert_eq!(
+                IpcResponse::Committed {
+                    text: "hello ".to_string(),
+                    temporary_english: temp,
+                },
+                response
+            );
+            // 经 JSON 序列化/反序列化（与 read_response 同一通道）后仍保留
+            let json = to_string(&response).unwrap();
+            let back: IpcResponse = from_str(&json).unwrap();
+            let restored = SchemeResult::from(back);
+            assert_eq!(
+                restored,
+                SchemeResult::Committed {
+                    text: "hello ".to_string(),
+                    temporary_english: temp,
+                }
+            );
+        }
+    }
+
+    /// 旧版本 daemon 的 Committed JSON 不含 temporary_english 字段时，
+    /// #[serde(default)] 应兜底为 false 而非反序列化失败。
+    #[test]
+    fn committed_missing_temporary_english_defaults_to_false() {
+        let legacy = r#"{"Committed":{"text":"abc"}}"#;
+        let response: IpcResponse = from_str(legacy).unwrap();
+        assert_eq!(
+            response,
+            IpcResponse::Committed {
+                text: "abc".to_string(),
+                temporary_english: false,
+            }
+        );
+    }
+}

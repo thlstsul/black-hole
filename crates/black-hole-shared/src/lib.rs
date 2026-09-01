@@ -102,6 +102,10 @@ pub enum SchemeResult {
     },
     Committed {
         text: String,
+        /// 本次上屏是否为"临时英文模式"（按住 Shift/CapsLock 输入的英文）的结束上屏。
+        /// 为 true 时，平台层在英文语境下应锁定自动切换，
+        /// 避免上屏后立即被自动切换拉回英文/中文。
+        temporary_english: bool,
     },
     Ignored,
 }

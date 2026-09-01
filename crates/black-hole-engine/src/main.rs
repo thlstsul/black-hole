@@ -121,7 +121,7 @@ fn main() {
                         info!("    (no candidates)");
                     }
                 }
-                SchemeResult::Committed { text } => {
+                SchemeResult::Committed { text, .. } => {
                     info!("  committed: {}", text);
                 }
                 SchemeResult::Ignored => {
@@ -143,7 +143,7 @@ fn main() {
             state: KeyState::Press,
         };
         let result = engine.process(&EngineCommand::Key(enter_key), &ctx);
-        if let SchemeResult::Committed { text } = result {
+        if let SchemeResult::Committed { text, .. } = result {
             info!("  committed: {}", text);
         }
 

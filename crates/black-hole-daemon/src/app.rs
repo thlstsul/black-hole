@@ -674,7 +674,7 @@ impl App {
             EngineCommand::Key(key) => {
                 let mut engine = engine.lock().unwrap();
                 let result = engine.process(&EngineCommand::Key(key), ctx);
-                if let SchemeResult::Committed { ref text } = result {
+                if let SchemeResult::Committed { ref text, .. } = result {
                     let _ = ui_tx.send(UiCommand::CommitText(text.clone()));
                     // 选中/上屏：递增代际号，终止所有在途补全请求
                     completion_generation.fetch_add(1, Ordering::SeqCst);
@@ -691,7 +691,7 @@ impl App {
             EngineCommand::SelectCandidate(idx) => {
                 let mut engine = engine.lock().unwrap();
                 let result = engine.process(&EngineCommand::SelectCandidate(idx), ctx);
-                if let SchemeResult::Committed { ref text } = result {
+                if let SchemeResult::Committed { ref text, .. } = result {
                     let _ = ui_tx.send(UiCommand::CommitText(text.clone()));
                     // 选中候选上屏：递增代际号，终止所有在途补全请求
                     completion_generation.fetch_add(1, Ordering::SeqCst);

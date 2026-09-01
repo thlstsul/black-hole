@@ -302,6 +302,7 @@ impl InputScheme for ShuangpinScheme {
                         self.english_buffer = None;
                         SchemeResult::Committed {
                             text: "".to_string(),
+                            temporary_english: false,
                         }
                     } else {
                         SchemeResult::Composing {
@@ -319,12 +320,20 @@ impl InputScheme for ShuangpinScheme {
                 "Space" => {
                     let text = format!("{} ", buffer);
                     self.english_buffer = None;
-                    SchemeResult::Committed { text }
+                    // 临时英文结束上屏：通知平台层锁定自动切换
+                    SchemeResult::Committed {
+                        text,
+                        temporary_english: true,
+                    }
                 }
                 "Enter" => {
                     let text = buffer.clone();
                     self.english_buffer = None;
-                    SchemeResult::Committed { text }
+                    // 临时英文结束上屏：通知平台层锁定自动切换
+                    SchemeResult::Committed {
+                        text,
+                        temporary_english: true,
+                    }
                 }
                 _ => {
                     let ch = match key.key.chars().next() {
@@ -360,6 +369,7 @@ impl InputScheme for ShuangpinScheme {
                 self.selected_index = 0;
                 return SchemeResult::Committed {
                     text: "".to_string(),
+                    temporary_english: false,
                 };
             }
             "Escape" => {
@@ -383,14 +393,20 @@ impl InputScheme for ShuangpinScheme {
                 self.expanded = false;
                 self.selected_index = 0;
                 self.last_query = None;
-                return SchemeResult::Committed { text };
+                return SchemeResult::Committed {
+                    text,
+                    temporary_english: false,
+                };
             }
             "Enter" => {
                 let text = self.codec.code().to_string();
                 self.codec.reset();
                 self.expanded = false;
                 self.selected_index = 0;
-                return SchemeResult::Committed { text };
+                return SchemeResult::Committed {
+                    text,
+                    temporary_english: false,
+                };
             }
             "Tab" => {
                 // 整句上屏：校验 LLM 补全仍匹配当前编码与选中项，匹配则拼入
@@ -415,7 +431,10 @@ impl InputScheme for ShuangpinScheme {
                 self.selected_index = 0;
                 self.last_query = None;
                 self.completion = None;
-                return SchemeResult::Committed { text };
+                return SchemeResult::Committed {
+                    text,
+                    temporary_english: false,
+                };
             }
             "ArrowLeft" => {
                 let candidates = self.current_candidates();
@@ -531,6 +550,7 @@ impl InputScheme for ShuangpinScheme {
                 if self.codec.code().is_empty() {
                     return SchemeResult::Committed {
                         text: key.key.clone(),
+                        temporary_english: false,
                     };
                 }
                 let Ok(digit) = key.key.parse::<usize>() else {
@@ -579,6 +599,7 @@ impl InputScheme for ShuangpinScheme {
         if self.codec.code().is_empty() && ch == ';' {
             return SchemeResult::Committed {
                 text: "；".to_string(),
+                temporary_english: false,
             };
         }
         match self.codec.push(ch) {
@@ -614,7 +635,10 @@ impl InputScheme for ShuangpinScheme {
                 } else {
                     format!("{}{}", committed, cn)
                 };
-                SchemeResult::Committed { text }
+                SchemeResult::Committed {
+                    text,
+                    temporary_english: false,
+                }
             }
         }
     }
@@ -630,7 +654,10 @@ impl InputScheme for ShuangpinScheme {
         self.expanded = false;
         self.selected_index = 0;
         self.last_query = None;
-        Some(SchemeResult::Committed { text })
+        Some(SchemeResult::Committed {
+            text,
+            temporary_english: false,
+        })
     }
 
     fn update_completion(&mut self, completion: Option<CompletionHint>) {
@@ -691,6 +718,53 @@ mod tests {
         }
     }
 
+    /// 构造按住 Shift 的按键事件（触发临时英文模式）
+    fn shift_key_event(key: &str) -> KeyEvent {
+        let mut e = key_event(key);
+        e.modifiers.shift = true;
+        e
+    }
+
+    #[test]
+    fn test_temporary_english_commit_flags() {
+        let mut scheme = ShuangpinScheme::new();
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // Shift+字母 进入临时英文模式
+        let r = scheme.handle_key(&shift_key_event("a"), &ctx);
+        assert!(matches!(r, SchemeResult::Composing { ref code, .. } if code == "a"));
+
+        // 继续追加字母
+        let _ = scheme.handle_key(&shift_key_event("b"), &ctx);
+
+        // Space 结束上屏：临时英文上屏（temporary_english=true，带尾随空格）
+        let r = scheme.handle_key(&key_event("Space"), &ctx);
+        assert!(
+            matches!(r, SchemeResult::Committed { ref text, temporary_english: true } if text == "ab "),
+            "临时英文 Space 上屏应标记 temporary_english=true，实际: {:?}",
+            r
+        );
+
+        // 重新进入临时英文，Enter 结束上屏（不带空格）
+        let _ = scheme.handle_key(&shift_key_event("c"), &ctx);
+        let _ = scheme.handle_key(&shift_key_event("d"), &ctx);
+        let r = scheme.handle_key(&key_event("Enter"), &ctx);
+        assert!(
+            matches!(r, SchemeResult::Committed { ref text, temporary_english: true } if text == "cd"),
+            "临时英文 Enter 上屏应标记 temporary_english=true，实际: {:?}",
+            r
+        );
+
+        // 进入临时英文后全部 Backspace 清空：上屏空串，非临时英文结束
+        let _ = scheme.handle_key(&shift_key_event("e"), &ctx);
+        let r = scheme.handle_key(&key_event("Backspace"), &ctx);
+        assert!(
+            matches!(r, SchemeResult::Committed { ref text, temporary_english: false } if text.is_empty()),
+            "临时英文清空上屏应为非临时英文，实际: {:?}",
+            r
+        );
+    }
+
     #[test]
     fn test_shuangpin_scheme_quote_pairing() {
         let mut scheme = ShuangpinScheme::new();
@@ -698,7 +772,7 @@ mod tests {
         // 前文为空 → 输出左引号
         let r1 = scheme.handle_key(&key_event("\""), &InputContext::caret(0, 0, 20));
         assert!(
-            matches!(r1, SchemeResult::Committed { ref text } if text == "“"),
+            matches!(r1, SchemeResult::Committed { ref text, .. } if text == "“"),
             "空前文应按引号输出左引号，实际: {:?}",
             r1
         );
@@ -706,7 +780,7 @@ mod tests {
         // 前文包含未闭合的左引号 → 输出右引号（配对闭合）
         let r2 = scheme.handle_key(&key_event("\""), &ctx_with_preceding("他说“你好"));
         assert!(
-            matches!(r2, SchemeResult::Committed { ref text } if text == "”"),
+            matches!(r2, SchemeResult::Committed { ref text, .. } if text == "”"),
             "前文有未闭合左引号应输出右引号，实际: {:?}",
             r2
         );
@@ -714,7 +788,7 @@ mod tests {
         // 前文已闭合 → 再次输出左引号
         let r3 = scheme.handle_key(&key_event("\""), &ctx_with_preceding("他说“你好”"));
         assert!(
-            matches!(r3, SchemeResult::Committed { ref text } if text == "“"),
+            matches!(r3, SchemeResult::Committed { ref text, .. } if text == "“"),
             "前文已闭合应输出左引号，实际: {:?}",
             r3
         );
@@ -724,9 +798,9 @@ mod tests {
     fn test_shuangpin_scheme_single_quote_pairing() {
         let mut scheme = ShuangpinScheme::new();
         let r1 = scheme.handle_key(&key_event("'"), &InputContext::caret(0, 0, 20));
-        assert!(matches!(r1, SchemeResult::Committed { ref text } if text == "‘"));
+        assert!(matches!(r1, SchemeResult::Committed { ref text, .. } if text == "‘"));
         let r2 = scheme.handle_key(&key_event("'"), &ctx_with_preceding("他说‘你好"));
-        assert!(matches!(r2, SchemeResult::Committed { ref text } if text == "’"));
+        assert!(matches!(r2, SchemeResult::Committed { ref text, .. } if text == "’"));
     }
 
     #[test]
@@ -991,7 +1065,8 @@ mod tests {
         assert_eq!(
             result,
             SchemeResult::Committed {
-                text: "书".to_string()
+                text: "书".to_string(),
+                temporary_english: false,
             },
             "编码不匹配时 Tab 应回退为仅提交选中词"
         );
@@ -1009,7 +1084,8 @@ mod tests {
         assert_eq!(
             result,
             SchemeResult::Committed {
-                text: "书本".to_string()
+                text: "书本".to_string(),
+                temporary_english: false,
             },
             "编码匹配时 Tab 应将选中词与补全拼为整句上屏"
         );

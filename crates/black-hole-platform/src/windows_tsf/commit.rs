@@ -148,9 +148,25 @@ pub(crate) fn apply_result(
                 send_ui_command_inner(&inner_arc, cmd);
             }
         }
-        SchemeResult::Committed { text } => {
+        SchemeResult::Committed {
+            text,
+            temporary_english,
+        } => {
+            // 临时英文结束上屏后，以英文为基线锁定自动切换，避免紧随其后的
+            // 中→英自动切换把用户拉入全英文模式（临时英文的本意是停留在中文
+            // 模式、随时再弹英文）。临时英文上屏文本为纯 ASCII 字母（方案层
+            // 只接受 is_ascii_alphabetic），Space 结束路径可带一个尾部空格
+            // （suggest_input_mode 的信号扫描会跳过空白），故上屏后语境必为
+            // 英文，直接以 Some(true) 作基线，无需回读文档（回读可能取到
+            // 上屏前的陈旧文本）。基线为英文：同英文语境的中→英建议被抑制
+            // （保持中文），用户移动光标到非英文语境后 evaluate 自动解锁、
+            // 恢复自动切换。
+            // 与取 composition 共用一次加锁（lock_manual 是纯字段写，AutoModeSwitch 为 Copy）。
             let composition = {
                 let mut inner = inner_arc.lock().unwrap();
+                if *temporary_english {
+                    inner.auto_mode.lock_manual(Some(true));
+                }
                 inner.composition.take()
             };
 

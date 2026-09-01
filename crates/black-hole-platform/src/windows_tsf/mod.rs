@@ -463,7 +463,7 @@ fn handle_ipc_client(
         match request {
             IpcRequest::KeyEvent(key) => {
                 let result = send_engine(EngineCommand::Key(key))?;
-                if let SchemeResult::Committed { ref text } = result {
+                if let SchemeResult::Committed { ref text, .. } = result {
                     let _ = ui_tx.send(UiCommand::CommitText(text.clone()));
                 }
                 write_response(&mut writer, result)?;
