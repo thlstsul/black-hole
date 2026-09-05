@@ -124,6 +124,9 @@ fn main() {
                 SchemeResult::Committed { text, .. } => {
                     info!("  committed: {}", text);
                 }
+                SchemeResult::Cancelled => {
+                    info!("  cancelled");
+                }
                 SchemeResult::Ignored => {
                     // 忽略非字母输入
                 }

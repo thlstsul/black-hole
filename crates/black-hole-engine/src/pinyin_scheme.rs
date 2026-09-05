@@ -328,7 +328,7 @@ impl InputScheme for PinyinScheme {
                 }
                 "Escape" => {
                     self.english_buffer = None;
-                    SchemeResult::Ignored
+                    SchemeResult::Cancelled
                 }
                 "Space" => {
                     let text = format!("{} ", buffer);
@@ -388,12 +388,20 @@ impl InputScheme for PinyinScheme {
                 }
             }
             "Escape" => {
-                self.codec.reset();
-                self.input_version += 1;
-                self.expanded = false;
-                self.selected_index = 0;
-                self.last_query = None;
-                SchemeResult::Ignored
+                // 无活动编码时透传给应用（Linux 非合成态会把 Esc 直接送引擎，
+                // 吞掉会丢失应用自身的 Esc）；有活动编码时取消输入（通知平台层
+                // 结束合成并隐藏候选窗）。Windows 侧 TSF 仅在合成中拦截 Esc，
+                // 故此分支在 Windows 必为有编码态。
+                if self.codec.full_code().is_empty() {
+                    SchemeResult::Ignored
+                } else {
+                    self.codec.reset();
+                    self.input_version += 1;
+                    self.expanded = false;
+                    self.selected_index = 0;
+                    self.last_query = None;
+                    SchemeResult::Cancelled
+                }
             }
             "Space" => {
                 let candidates = self.current_candidates();
@@ -795,6 +803,61 @@ mod tests {
         assert!(
             matches!(r, SchemeResult::Committed { ref text, temporary_english: false } if text.is_empty()),
             "临时英文清空上屏应为非临时英文，实际: {:?}",
+            r
+        );
+    }
+
+    #[test]
+    fn test_pinyin_escape_cancels_composition() {
+        let mut scheme = PinyinScheme::new();
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 输入编码后按 Esc：取消输入（Cancelled），平台层据此结束合成并隐藏候选窗
+        for ch in ["z", "h", "o", "n", "g"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let r = scheme.handle_key(&key_event("Escape"), &ctx);
+        assert_eq!(
+            r,
+            SchemeResult::Cancelled,
+            "有活动编码时 Esc 应取消输入，实际: {:?}",
+            r
+        );
+        // 取消后编码已重置：再次输入 Esc 应透传（Ignored），不吞应用自身的 Esc
+        assert_eq!(
+            scheme.handle_key(&key_event("Escape"), &ctx),
+            SchemeResult::Ignored
+        );
+    }
+
+    #[test]
+    fn test_pinyin_escape_passes_through_when_no_code() {
+        let mut scheme = PinyinScheme::new();
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 无活动编码时 Esc 应透传给应用（Ignored），避免吞掉应用自身的 Esc
+        assert_eq!(
+            scheme.handle_key(&key_event("Escape"), &ctx),
+            SchemeResult::Ignored,
+            "无活动编码时 Esc 应透传，避免吞掉应用自身的 Esc"
+        );
+    }
+
+    #[test]
+    fn test_pinyin_temporary_english_escape_cancels() {
+        let mut scheme = PinyinScheme::new();
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 临时英文模式：Shift+字母 进入后按 Esc 取消
+        let _ = scheme.handle_key(&shift_key_event("a"), &ctx);
+        let _ = scheme.handle_key(&shift_key_event("b"), &ctx);
+        let r = scheme.handle_key(&key_event("Escape"), &ctx);
+        assert_eq!(r, SchemeResult::Cancelled, "临时英文 Esc 应取消输入");
+        // 已退出临时英文模式：后续普通字母按拼音编码处理（非英文缓冲）
+        let r = scheme.handle_key(&shift_key_event("c"), &ctx);
+        assert!(
+            matches!(r, SchemeResult::Composing { ref code, .. } if code == "c"),
+            "取消临时英文后 Shift+字母 应重新进入临时英文，实际: {:?}",
             r
         );
     }

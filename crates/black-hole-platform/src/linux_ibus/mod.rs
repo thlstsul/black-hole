@@ -314,6 +314,14 @@ impl IbusEngine {
                 });
                 true
             }
+            SchemeResult::Cancelled => {
+                // 取消输入（Esc / cancel 绑定）：消费按键，避免 IBus 把 Esc
+                // 转发给宿主应用。引擎已重置编码，daemon 处理 Cancelled 时已发
+                // HideCandidates 隐藏候选窗（见 daemon::App::process_engine_command），
+                // 此处只需清空记录的编码。
+                *self.last_code.lock().unwrap() = None;
+                true
+            }
             SchemeResult::Ignored => false,
         }
     }

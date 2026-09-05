@@ -107,6 +107,10 @@ pub enum SchemeResult {
         /// 避免上屏后立即被自动切换拉回英文/中文。
         temporary_english: bool,
     },
+    /// 用户取消输入（Esc / cancel 绑定）：平台层须结束进行中的合成（清空
+    /// 行内编码）并隐藏候选窗，同时消费该按键（不透传给宿主应用，避免
+    /// 焦点转移导致候选窗被系统收起）。
+    Cancelled,
     Ignored,
 }
 

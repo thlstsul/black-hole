@@ -315,7 +315,7 @@ impl InputScheme for ShuangpinScheme {
                 }
                 "Escape" => {
                     self.english_buffer = None;
-                    SchemeResult::Ignored
+                    SchemeResult::Cancelled
                 }
                 "Space" => {
                     let text = format!("{} ", buffer);
@@ -373,10 +373,16 @@ impl InputScheme for ShuangpinScheme {
                 };
             }
             "Escape" => {
+                // 无活动编码时透传给应用（Linux 非合成态会把 Esc 直接送引擎，
+                // 吞掉会丢失应用自身的 Esc）；有活动编码时取消输入（通知平台层
+                // 结束合成并隐藏候选窗）。
+                if self.codec.full_code().is_empty() {
+                    return SchemeResult::Ignored;
+                }
                 self.codec.reset();
                 self.expanded = false;
                 self.selected_index = 0;
-                return SchemeResult::Ignored;
+                return SchemeResult::Cancelled;
             }
             "Space" => {
                 let candidates = self.current_candidates();
@@ -763,6 +769,53 @@ mod tests {
             "临时英文清空上屏应为非临时英文，实际: {:?}",
             r
         );
+    }
+
+    #[test]
+    fn test_shuangpin_escape_cancels_composition() {
+        let mut scheme = ShuangpinScheme::new();
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 输入编码（ni）后按 Esc：取消输入（Cancelled）
+        for ch in ["n", "i"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let r = scheme.handle_key(&key_event("Escape"), &ctx);
+        assert_eq!(
+            r,
+            SchemeResult::Cancelled,
+            "有活动编码时 Esc 应取消输入，实际: {:?}",
+            r
+        );
+        // 取消后编码已重置：再次输入 Esc 应透传（Ignored）
+        assert_eq!(
+            scheme.handle_key(&key_event("Escape"), &ctx),
+            SchemeResult::Ignored
+        );
+    }
+
+    #[test]
+    fn test_shuangpin_escape_passes_through_when_no_code() {
+        let mut scheme = ShuangpinScheme::new();
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 无活动编码时 Esc 应透传给应用（Ignored），避免吞掉应用自身的 Esc
+        assert_eq!(
+            scheme.handle_key(&key_event("Escape"), &ctx),
+            SchemeResult::Ignored,
+            "无活动编码时 Esc 应透传"
+        );
+    }
+
+    #[test]
+    fn test_shuangpin_temporary_english_escape_cancels() {
+        let mut scheme = ShuangpinScheme::new();
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 临时英文模式：Shift+字母 进入后按 Esc 取消
+        let _ = scheme.handle_key(&shift_key_event("a"), &ctx);
+        let r = scheme.handle_key(&key_event("Escape"), &ctx);
+        assert_eq!(r, SchemeResult::Cancelled, "临时英文 Esc 应取消输入");
     }
 
     #[test]

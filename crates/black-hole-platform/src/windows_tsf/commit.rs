@@ -7,8 +7,8 @@ use std::slice;
 use std::sync::{Arc, Mutex};
 use windows::Win32::UI::TextServices::{
     ITfCompositionSink, ITfContext, ITfContextComposition, ITfEditSession, ITfEditSession_Impl,
-    ITfInsertAtSelection, ITfSource, ITfTextLayoutSink, TF_AE_NONE, TF_ANCHOR_END,
-    TF_IAS_QUERYONLY, TF_SELECTION, TF_SELECTIONSTYLE,
+    ITfInsertAtSelection, ITfSource, ITfTextLayoutSink, TF_AE_NONE, TF_ANCHOR_END, TF_ES_READWRITE,
+    TF_ES_SYNC, TF_IAS_QUERYONLY, TF_SELECTION, TF_SELECTIONSTYLE,
 };
 use windows_core::{BOOL, Interface, Result, implement};
 
@@ -217,6 +217,28 @@ pub(crate) fn apply_result(
                     let _ = unsafe { source.UnadviseSink(cookie) };
                 }
             }
+        }
+        SchemeResult::Cancelled => {
+            // 取消输入（Esc / cancel 绑定）：结束进行中的合成（清空行内编码）
+            // 并隐藏候选窗。复用 CancelCompositionEditSession 的收尾（清空文本、
+            // EndComposition、作废光标缓存、取消布局订阅），与 OnSetFocus 失焦
+            // 取消路径一致。引擎侧已重置编码；此处只需收尾 TSF 合成 + 通知 UI。
+            // 由于 Esc 已被 OnTestKeyDown 拦截（不透传给应用），焦点不转移，
+            // 候选窗不会被系统失焦路径收起，隐藏由本分支显式发出。
+            let (ctx, client_id) = {
+                let inner = inner_arc.lock().unwrap();
+                (inner.context.clone(), inner.client_id)
+            };
+            if let Some(ctx) = ctx {
+                let edit_session: ITfEditSession = CancelCompositionEditSession {
+                    inner_arc: inner_arc.clone(),
+                }
+                .into();
+                let _ = unsafe {
+                    ctx.RequestEditSession(client_id, &edit_session, TF_ES_SYNC | TF_ES_READWRITE)
+                };
+            }
+            send_ui_command_inner(&inner_arc, UiCommand::HideCandidates);
         }
         SchemeResult::Ignored => {}
     }

@@ -678,6 +678,11 @@ impl App {
                     let _ = ui_tx.send(UiCommand::CommitText(text.clone()));
                     // 选中/上屏：递增代际号，终止所有在途补全请求
                     completion_generation.fetch_add(1, Ordering::SeqCst);
+                } else if matches!(result, SchemeResult::Cancelled) {
+                    // 取消输入：隐藏候选窗，并递增代际号终止所有在途补全请求
+                    // （编码已重置，旧补全结果已无意义）
+                    let _ = ui_tx.send(UiCommand::HideCandidates);
+                    completion_generation.fetch_add(1, Ordering::SeqCst);
                 }
                 maybe_request_completion(&result, ctx, completion_tx);
                 Some(result)

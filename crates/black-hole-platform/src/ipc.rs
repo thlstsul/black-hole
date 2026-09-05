@@ -42,6 +42,8 @@ pub enum IpcResponse {
         temporary_english: bool,
     },
     Ignored,
+    /// 用户取消输入（Esc / cancel 绑定），见 SchemeResult::Cancelled。
+    Cancelled,
     /// 响应 GetSettings 请求，返回 daemon 当前加载的设置。
     Settings {
         scheme_id: SchemeId,
@@ -75,6 +77,7 @@ impl From<SchemeResult> for IpcResponse {
                 text,
                 temporary_english,
             },
+            SchemeResult::Cancelled => IpcResponse::Cancelled,
             SchemeResult::Ignored => IpcResponse::Ignored,
         }
     }
@@ -101,6 +104,7 @@ impl From<IpcResponse> for SchemeResult {
                 text,
                 temporary_english,
             },
+            IpcResponse::Cancelled => SchemeResult::Cancelled,
             IpcResponse::Ignored => SchemeResult::Ignored,
             // Settings is only handled directly in sync_settings_from_daemon,
             // never converted to SchemeResult.

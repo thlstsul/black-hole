@@ -647,6 +647,9 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
                         | "ArrowRight"
                         | "ArrowUp"
                         | "ArrowDown"
+                        // Esc 仅合成中拦截：取消输入（结束合成、隐藏候选窗），
+                        // 不透传给宿主应用——透传会导致焦点转移、候选窗被系统收起
+                        | "Escape"
                 ) || is_input_char
             } else {
                 is_input_char
@@ -769,6 +772,10 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
             }
         };
 
+        // 非合成态且非字符键时放行给应用（BOOL(0)）。合成中的 Esc 不在此放行：
+        // 它会继续走编辑会话送引擎处理，引擎返回 Cancelled 后由 apply_result 取消
+        // 合成并隐藏候选窗；因 Esc 已被 OnTestKeyDown 拦截而未透传给应用，焦点不转移。
+        // 非合成态的 Esc 仍放行给应用（不吞掉应用自身的 Esc）。
         let composing = self.is_composing();
         if !composing && !is_input_char_event(&key_event) {
             return Ok(BOOL(0));
