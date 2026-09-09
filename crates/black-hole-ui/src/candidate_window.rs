@@ -115,245 +115,36 @@ impl App for ImeUiApp {
             return;
         }
 
-        if state.visible && !state.candidates.is_empty() {
-            // 显示窗口：完整列表保留在 state 中，渲染仅取包含选中项的窗口，
-            // 使高亮与引擎实际选择保持一致
-            let (win_start, win_end) = display_window(&state);
-            let win = &state.candidates[win_start..win_end];
-            let win_selected = state.selected_index - win_start;
-            let (desired_width, desired_height) = estimate_window_size(&state);
-            ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(
-                desired_width,
-                desired_height,
-            )));
-            // 当前 egui 版本仅支持 OuterPosition；OuterPosition 会自动乘以
-            // pixels_per_point 做 DPI 缩放，因此需将物理像素坐标先转为逻辑坐标
-            let ppp = ctx.pixels_per_point();
-            let caret_x = state.caret_x as f32 / ppp;
-            let caret_y = state.caret_y as f32 / ppp;
-            // 部分应用（如 Chromium）的 collapsed range 高度可能不准确，
-            // 因此至少按一行文本高度预留净空
-            let caret_h = (state.caret_h as f32 / ppp).max(16.0);
-            let gap = 6.0;
-
-            let mut pos_x = caret_x;
-            // 默认显示在光标下方
-            let mut pos_y = caret_y + gap;
-
-            // 防止候选窗越界，同时避免挡住输入位置
-            if let Some(screen) = get_screen_rect(frame) {
-                let logical_w = desired_width;
-                let logical_h = desired_height;
-
-                // y 方向：优先下方，下方放不下则放上方
-                if pos_y + logical_h > screen.max.y {
-                    pos_y = caret_y - caret_h - logical_h - gap;
-                    if pos_y < screen.min.y {
-                        // 上下都放不下，选择空间更大的一侧
-                        let space_below = screen.max.y - caret_y;
-                        let space_above = caret_y - caret_h - screen.min.y;
-                        if space_below >= space_above {
-                            pos_y = screen.max.y - logical_h;
-                        } else {
-                            pos_y = screen.min.y;
-                        }
-                    }
-                }
-
-                // x 方向防越界
-                if pos_x + logical_w > screen.max.x {
-                    pos_x = screen.max.x - logical_w;
-                }
-                pos_x = pos_x.max(screen.min.x);
-            }
-
-            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(Pos2::new(pos_x, pos_y)));
-            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-
-            let ThemeColors {
-                text_color,
-                bg_color,
-                highlight_color,
-                label_color,
-            } = theme_colors(state.theme);
-            ctx.set_visuals(theme_visuals(state.theme));
-
-            EguiFrame::new()
-                .fill(bg_color)
-                .corner_radius(CornerRadius::same(10))
-                .inner_margin(Margin::same(10))
-                .show(ui, |ui| {
-                    ui.set_min_size(Vec2::new(desired_width, desired_height));
-                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                        ui.spacing_mut().item_spacing.y = 6.0;
-
-                        // 第一行：选中词 + LLM 整句补全 ghost text。
-                        // 选中词单独使用高亮块（仅首选未导航时）；补全部分
-                        // 放在高亮块之外的普通背景上、以灰色显示，绝不呈现高亮。
-                        if !win.is_empty() {
-                            let selected = &win[win_selected];
-                            let text = selected.text.clone();
-                            let selected_font = selected_font_size(state.font_size);
-                            // 仅当首选被选中（未导航到其它行）时保持高亮样式
-                            let is_first = win_selected == 0;
-
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 8.0;
-                                // 选中词：独立高亮块（白字）或普通块（正文色）
-                                EguiFrame::new()
-                                    .fill(if is_first { highlight_color } else { bg_color })
-                                    .corner_radius(CornerRadius::same(6))
-                                    .inner_margin(Margin::same(8))
-                                    .show(ui, |ui| {
-                                        ui.add(
-                                            Label::new(
-                                                RichText::new(&text).size(selected_font).color(
-                                                    if is_first {
-                                                        Color32::WHITE
-                                                    } else {
-                                                        text_color
-                                                    },
-                                                ),
-                                            )
-                                            .selectable(false),
-                                        );
-                                    });
-                                // LLM 补全：仅当与当前编码及当前选中项一致时展示，
-                                // 避免异步错位；始终以普通灰色显示（不在高亮块内）。
-                                let show_completion = state.completion_code == state.code
-                                    && state.completion_index == state.selected_index
-                                    && state.completion.is_some();
-                                if show_completion {
-                                    let completion = state.completion.as_ref().unwrap();
-                                    ui.add(
-                                        Label::new(
-                                            RichText::new(completion)
-                                                .size(selected_font)
-                                                .color(text_color.gamma_multiply(0.45)),
-                                        )
-                                        .selectable(false)
-                                        .truncate(),
-                                    );
-                                    ui.add(
-                                        Label::new(
-                                            RichText::new(&state.commit_sentence)
-                                                .size(11.0)
-                                                .color(label_color),
-                                        )
-                                        .selectable(false),
-                                    );
-                                }
-                            });
-
-                            ui.add_space(6.0);
-                        }
-
-                        if state.expanded {
-                            // 展开状态：可滚动的多行不规则网格（排除首选词，第一行已单独展示）
-                            if win.len() > 1 {
-                                let rows = layout_candidates_into_rows_excluding(
-                                    win,
-                                    EXPANDED_AVAILABLE_WIDTH,
-                                    ITEM_SPACING,
-                                    Some(0),
-                                );
-                                ScrollArea::vertical()
-                                    .max_height(SCROLL_AREA_MAX_HEIGHT)
-                                    .show(ui, |ui| {
-                                        for row in rows {
-                                            let is_selected_row = row.contains(&win_selected);
-                                            ui.horizontal(|ui| {
-                                                ui.spacing_mut().item_spacing.x = ITEM_SPACING;
-                                                for (col, i) in row.iter().enumerate() {
-                                                    let is_selected = *i == win_selected;
-                                                    let (lc, tc, bg) = if is_selected {
-                                                        (
-                                                            Color32::WHITE,
-                                                            Color32::WHITE,
-                                                            Some(highlight_color),
-                                                        )
-                                                    } else {
-                                                        (label_color, text_color, None)
-                                                    };
-                                                    let response = EguiFrame::new()
-                                                        .fill(bg.unwrap_or(bg_color))
-                                                        .corner_radius(CornerRadius::same(4))
-                                                        .inner_margin(Margin::same(4))
-                                                        .show(ui, |ui| {
-                                                            ui.horizontal(|ui| {
-                                                                render_candidate_item(
-                                                                    ui,
-                                                                    col + 1,
-                                                                    &win[*i],
-                                                                    tc,
-                                                                    lc,
-                                                                    is_selected_row,
-                                                                    state.font_size,
-                                                                );
-                                                            });
-                                                        });
-                                                    if is_selected {
-                                                        // 仅在选中项滚出可视区时做
-                                                        // 最小滚动，避免上下导航时
-                                                        // 整个表格反复居中跳动
-                                                        response.response.scroll_to_me(None);
-                                                    }
-                                                }
-                                            });
-                                        }
-                                    });
-                            }
-                        } else {
-                            // 折叠状态：第二行显示网格布局的第一行（排除首选词）
-                            if win.len() > 1 {
-                                let rows = layout_candidates_into_rows_excluding(
-                                    win,
-                                    EXPANDED_AVAILABLE_WIDTH,
-                                    ITEM_SPACING,
-                                    Some(0),
-                                );
-                                if let Some(first_row) = rows.first() {
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = ITEM_SPACING;
-                                        for (col, i) in first_row.iter().enumerate() {
-                                            let is_selected = *i == win_selected;
-                                            let (tc, lc) = if is_selected {
-                                                (Color32::WHITE, Color32::WHITE)
-                                            } else {
-                                                (text_color, label_color)
-                                            };
-                                            let bg = if is_selected {
-                                                Some(highlight_color)
-                                            } else {
-                                                None
-                                            };
-                                            EguiFrame::new()
-                                                .fill(bg.unwrap_or(bg_color))
-                                                .corner_radius(CornerRadius::same(4))
-                                                .inner_margin(Margin::same(4))
-                                                .show(ui, |ui| {
-                                                    ui.horizontal(|ui| {
-                                                        render_candidate_item(
-                                                            ui,
-                                                            col + 1,
-                                                            &win[*i],
-                                                            tc,
-                                                            lc,
-                                                            true,
-                                                            state.font_size,
-                                                        );
-                                                    });
-                                                });
-                                        }
-                                    });
-                                }
-                            }
-                        }
-                    });
-                });
-        } else {
+        // 不可见或无候选时隐藏窗口
+        if !(state.visible && !state.candidates.is_empty()) {
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            return;
         }
+
+        // 显示窗口：完整列表保留在 state 中，渲染仅取包含选中项的窗口，
+        // 使高亮与引擎实际选择保持一致
+        let (win_start, win_end) = display_window(&state);
+        let win = &state.candidates[win_start..win_end];
+        let win_selected = state.selected_index - win_start;
+        let (desired_width, desired_height) = estimate_window_size(&state);
+        position_window(&ctx, &state, frame, desired_width, desired_height);
+
+        let colors = theme_colors(state.theme);
+        ctx.set_visuals(theme_visuals(state.theme));
+
+        EguiFrame::new()
+            .fill(colors.bg_color)
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_min_size(Vec2::new(desired_width, desired_height));
+                ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    render_first_row(ui, &state, win, win_selected, &colors);
+                    ui.add_space(6.0);
+                    render_candidate_rows(ui, &state, win, win_selected, &colors);
+                });
+            });
     }
 }
 
@@ -395,34 +186,8 @@ fn get_screen_rect(frame: &Frame) -> Option<Rect> {
             .or_else(|| window.primary_monitor())?;
         let scale = monitor.scale_factor() as f32;
 
-        #[cfg(target_os = "windows")]
-        {
-            let handle = window.window_handle().ok()?;
-            let RawWindowHandle::Win32(h) = handle.as_raw() else {
-                return None;
-            };
-            let hwnd = HWND(h.hwnd.get() as *mut c_void);
-            unsafe {
-                let hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-                let mut info = MONITORINFO {
-                    cbSize: mem::size_of::<MONITORINFO>() as u32,
-                    rcMonitor: RECT::default(),
-                    rcWork: RECT::default(),
-                    dwFlags: 0,
-                };
-                if GetMonitorInfoW(hmonitor, &mut info).as_bool() {
-                    return Some(Rect::from_min_max(
-                        Pos2::new(
-                            info.rcWork.left as f32 / scale,
-                            info.rcWork.top as f32 / scale,
-                        ),
-                        Pos2::new(
-                            info.rcWork.right as f32 / scale,
-                            info.rcWork.bottom as f32 / scale,
-                        ),
-                    ));
-                }
-            }
+        if let Some(rect) = windows_work_area(window, scale) {
+            return Some(rect);
         }
 
         // 非 Windows 或获取工作区失败时回退到完整监视器尺寸
@@ -437,6 +202,44 @@ fn get_screen_rect(frame: &Frame) -> Option<Rect> {
     {
         None
     }
+}
+
+/// Windows 下通过 Win32 API 获取工作区逻辑矩形；失败返回 None。
+#[cfg(target_os = "windows")]
+fn windows_work_area(window: &Window, scale: f32) -> Option<Rect> {
+    let handle = window.window_handle().ok()?;
+    let RawWindowHandle::Win32(h) = handle.as_raw() else {
+        return None;
+    };
+    let hwnd = HWND(h.hwnd.get() as *mut c_void);
+    unsafe {
+        let hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: mem::size_of::<MONITORINFO>() as u32,
+            rcMonitor: RECT::default(),
+            rcWork: RECT::default(),
+            dwFlags: 0,
+        };
+        if !GetMonitorInfoW(hmonitor, &mut info).as_bool() {
+            return None;
+        }
+        Some(Rect::from_min_max(
+            Pos2::new(
+                info.rcWork.left as f32 / scale,
+                info.rcWork.top as f32 / scale,
+            ),
+            Pos2::new(
+                info.rcWork.right as f32 / scale,
+                info.rcWork.bottom as f32 / scale,
+            ),
+        ))
+    }
+}
+
+/// 非 Windows 平台没有 Win32 工作区可查，始终回退到监视器尺寸。
+#[cfg(not(target_os = "windows"))]
+fn windows_work_area(_window: &Window, _scale: f32) -> Option<Rect> {
+    None
 }
 
 /// 选中候选（首行）字号：在基础字号上放大，保持与候选项的视觉层级
@@ -581,7 +384,6 @@ fn run_candidate_window_inner(
         max_candidates: initial_cw.max_candidates,
         ..AppState::default()
     }));
-    let state_for_thread = Arc::clone(&state);
 
     #[cfg(target_os = "windows")]
     let event_loop_builder = Some(Box::new(|builder: &mut EventLoopBuilder<_>| {
@@ -611,103 +413,7 @@ fn run_candidate_window_inner(
         options,
         Box::new(|cc| {
             configure_fonts(&cc.egui_ctx);
-            let ctx = cc.egui_ctx.clone();
-
-            thread::spawn(move || {
-                info!("channel thread started");
-                while let Ok(cmd) = ui_rx.recv() {
-                    info!(
-                        cmd = ?mem::discriminant(&cmd),
-                        "channel thread recv"
-                    );
-                    let mut s = state_for_thread.lock().unwrap();
-                    let mut should_repaint = s.visible;
-                    match cmd {
-                        UiCommand::ShowCandidates {
-                            code,
-                            candidates,
-                            selected_index,
-                            context,
-                            expanded,
-                        } => {
-                            // 只在首次展示时固定位置，避免后续更新候选列表时闪动
-                            if !s.visible {
-                                s.caret_x = context.caret_x;
-                                s.caret_y = context.caret_y;
-                                s.caret_h = context.caret_h;
-                            }
-                            s.visible = true;
-                            s.code = code;
-                            // 保留引擎的完整候选列表与真实选中索引；渲染时按
-                            // max_candidates 仅显示一个包含选中项的窗口，避免截断
-                            // 导致 UI 高亮与引擎实际提交的候选不一致。
-                            s.candidates = candidates;
-                            s.selected_index =
-                                selected_index.min(s.candidates.len().saturating_sub(1));
-                            s.expanded = expanded;
-                            should_repaint = true;
-                        }
-                        UiCommand::SetCandidateWindowSettings(cw) => {
-                            s.font_size = cw.font_size;
-                            s.max_candidates = cw.max_candidates.max(1);
-                            // 完整列表与选中索引均保留，显示窗口在渲染时按
-                            // 新的 max_candidates 即时重算，无需在此截断
-                            should_repaint = true;
-                        }
-                        UiCommand::SetCommitSentenceKey(key) => {
-                            s.commit_sentence = key;
-                            should_repaint = true;
-                        }
-                        UiCommand::UpdatePosition { context } => {
-                            if s.visible {
-                                s.caret_x = context.caret_x;
-                                s.caret_y = context.caret_y;
-                                s.caret_h = context.caret_h;
-                            }
-                        }
-                        UiCommand::HideCandidates => {
-                            s.visible = false;
-                            // 清空补全状态，防止重打相同编码时旧 ghost text 重现
-                            s.completion = None;
-                            s.completion_code.clear();
-                            should_repaint = false;
-                        }
-                        UiCommand::CommitText(_) => {
-                            s.visible = false;
-                            // 上屏后清空补全状态：旧补全与已提交内容分离，
-                            // 重打相同编码且新补全未到达时不再显示过期 ghost text
-                            s.completion = None;
-                            s.completion_code.clear();
-                            should_repaint = false;
-                        }
-                        UiCommand::Completion {
-                            code,
-                            selected_index,
-                            text,
-                        } => {
-                            s.completion_code = code;
-                            s.completion_index = selected_index;
-                            s.completion = text;
-                            should_repaint = true;
-                        }
-                        UiCommand::SetTheme(theme) => {
-                            s.theme = theme;
-                            should_repaint = true;
-                        }
-                        UiCommand::Exit => {
-                            s.should_exit = true;
-                            should_repaint = true;
-                        }
-                        _ => {}
-                    }
-                    drop(s);
-                    if should_repaint {
-                        ctx.request_repaint();
-                    }
-                }
-                info!("channel thread exited");
-            });
-
+            spawn_command_thread(cc.egui_ctx.clone(), ui_rx, Arc::clone(&state));
             Ok(Box::new(ImeUiApp::new(cc, state)))
         }),
     );
@@ -715,4 +421,396 @@ fn run_candidate_window_inner(
     if let Err(e) = result {
         error!(error = ?e, "eframe run_native error");
     }
+}
+
+/// 启动后台线程：从 channel 接收 UI 命令并应用到共享状态，
+/// 需要重绘时通知 egui。
+fn spawn_command_thread(ctx: Context, ui_rx: Receiver<UiCommand>, state: Arc<Mutex<AppState>>) {
+    thread::spawn(move || {
+        info!("channel thread started");
+        while let Ok(cmd) = ui_rx.recv() {
+            info!(
+                cmd = ?mem::discriminant(&cmd),
+                "channel thread recv"
+            );
+            let should_repaint = apply_ui_command(&mut state.lock().unwrap(), cmd);
+            if should_repaint {
+                ctx.request_repaint();
+            }
+        }
+        info!("channel thread exited");
+    });
+}
+
+/// 根据光标位置与屏幕工作区计算窗口位置并下发视口命令
+fn position_window(
+    ctx: &Context,
+    state: &AppState,
+    frame: &Frame,
+    desired_width: f32,
+    desired_height: f32,
+) {
+    ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(
+        desired_width,
+        desired_height,
+    )));
+    // 当前 egui 版本仅支持 OuterPosition；OuterPosition 会自动乘以
+    // pixels_per_point 做 DPI 缩放，因此需将物理像素坐标先转为逻辑坐标
+    let ppp = ctx.pixels_per_point();
+    let caret_x = state.caret_x as f32 / ppp;
+    let caret_y = state.caret_y as f32 / ppp;
+    // 部分应用（如 Chromium）的 collapsed range 高度可能不准确，
+    // 因此至少按一行文本高度预留净空
+    let caret_h = (state.caret_h as f32 / ppp).max(16.0);
+    let gap = 6.0;
+
+    let (pos_x, pos_y) = clamp_window_position(
+        get_screen_rect(frame),
+        caret_x,
+        caret_y,
+        caret_h,
+        desired_width,
+        desired_height,
+        gap,
+    );
+
+    ctx.send_viewport_cmd(ViewportCommand::OuterPosition(Pos2::new(pos_x, pos_y)));
+    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+}
+
+/// 防止候选窗越界：y 方向优先下方，放不下则放上方，仍放不下时选空间
+/// 更大的一侧；x 方向夹回工作区内。
+#[allow(clippy::too_many_arguments)]
+fn clamp_window_position(
+    screen: Option<Rect>,
+    caret_x: f32,
+    caret_y: f32,
+    caret_h: f32,
+    logical_w: f32,
+    logical_h: f32,
+    gap: f32,
+) -> (f32, f32) {
+    // 默认显示在光标下方
+    let mut pos_y = caret_y + gap;
+    let Some(screen) = screen else {
+        return (caret_x, pos_y);
+    };
+
+    if pos_y + logical_h > screen.max.y {
+        pos_y = caret_y - caret_h - logical_h - gap;
+        if pos_y < screen.min.y {
+            // 上下都放不下，选择空间更大的一侧
+            let space_below = screen.max.y - caret_y;
+            let space_above = caret_y - caret_h - screen.min.y;
+            pos_y = if space_below >= space_above {
+                screen.max.y - logical_h
+            } else {
+                screen.min.y
+            };
+        }
+    }
+
+    let mut pos_x = caret_x;
+    if pos_x + logical_w > screen.max.x {
+        pos_x = screen.max.x - logical_w;
+    }
+    pos_x = pos_x.max(screen.min.x);
+    (pos_x, pos_y)
+}
+
+/// 第一行：选中词 + LLM 整句补全 ghost text。
+/// 选中词单独使用高亮块（仅首选未导航时）；补全部分放在高亮块之外的
+/// 普通背景上、以灰色显示，绝不呈现高亮。
+fn render_first_row(
+    ui: &mut Ui,
+    state: &AppState,
+    win: &[Candidate],
+    win_selected: usize,
+    colors: &ThemeColors,
+) {
+    if win.is_empty() {
+        return;
+    }
+    let selected_font = selected_font_size(state.font_size);
+    // 仅当首选被选中（未导航到其它行）时保持高亮样式
+    let is_first = win_selected == 0;
+
+    let selected = &win[win_selected];
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        // 选中词：独立高亮块（白字）或普通块（正文色）
+        render_selected_block(ui, selected, selected_font, is_first, colors);
+        render_completion(ui, state, selected_font, colors);
+    });
+}
+
+/// 首行的选中词块：首选被选中时使用高亮（白字），否则普通正文色。
+fn render_selected_block(
+    ui: &mut Ui,
+    selected: &Candidate,
+    selected_font: f32,
+    is_first: bool,
+    colors: &ThemeColors,
+) {
+    let (fill, text_color) = if is_first {
+        (colors.highlight_color, Color32::WHITE)
+    } else {
+        (colors.bg_color, colors.text_color)
+    };
+    EguiFrame::new()
+        .fill(fill)
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::same(8))
+        .show(ui, |ui| {
+            ui.add(
+                Label::new(
+                    RichText::new(&selected.text)
+                        .size(selected_font)
+                        .color(text_color),
+                )
+                .selectable(false),
+            );
+        });
+}
+
+/// LLM 补全：仅当与当前编码及当前选中项一致时展示，避免异步错位；
+/// 始终以普通灰色显示（不在高亮块内）。
+fn render_completion(ui: &mut Ui, state: &AppState, selected_font: f32, colors: &ThemeColors) {
+    if state.completion_code != state.code
+        || state.completion_index != state.selected_index
+        || state.completion.is_none()
+    {
+        return;
+    }
+    let completion = state.completion.as_deref().unwrap_or_default();
+    ui.add(
+        Label::new(
+            RichText::new(completion)
+                .size(selected_font)
+                .color(colors.text_color.gamma_multiply(0.45)),
+        )
+        .selectable(false)
+        .truncate(),
+    );
+    ui.add(
+        Label::new(
+            RichText::new(&state.commit_sentence)
+                .size(11.0)
+                .color(colors.label_color),
+        )
+        .selectable(false),
+    );
+}
+
+/// 候选项网格：展开状态渲染可滚动的多行不规则网格，折叠状态仅渲染
+/// 第一行（两者均排除首选词，第一行已单独展示）。
+fn render_candidate_rows(
+    ui: &mut Ui,
+    state: &AppState,
+    win: &[Candidate],
+    win_selected: usize,
+    colors: &ThemeColors,
+) {
+    if win.len() <= 1 {
+        return;
+    }
+    let rows =
+        layout_candidates_into_rows_excluding(win, EXPANDED_AVAILABLE_WIDTH, ITEM_SPACING, Some(0));
+    if state.expanded {
+        render_expanded_rows(ui, &rows, win, win_selected, state.font_size, colors);
+    } else if let Some(first_row) = rows.first() {
+        render_collapsed_row(ui, first_row, win, win_selected, colors, state.font_size);
+    }
+}
+
+/// 一条候选项的高亮/普通配色：(文字色, 序号色, 背景色)
+fn item_colors(is_selected: bool, colors: &ThemeColors) -> (Color32, Color32, Option<Color32>) {
+    if is_selected {
+        (Color32::WHITE, Color32::WHITE, Some(colors.highlight_color))
+    } else {
+        (colors.text_color, colors.label_color, None)
+    }
+}
+
+fn render_expanded_rows(
+    ui: &mut Ui,
+    rows: &[Vec<usize>],
+    win: &[Candidate],
+    win_selected: usize,
+    font_size: u32,
+    colors: &ThemeColors,
+) {
+    ScrollArea::vertical()
+        .max_height(SCROLL_AREA_MAX_HEIGHT)
+        .show(ui, |ui| {
+            for row in rows {
+                render_expanded_row(ui, row, win, win_selected, font_size, colors);
+            }
+        });
+}
+
+/// 展开状态的一行候选项（遍历渲染 + 选中项滚动跟随）。
+fn render_expanded_row(
+    ui: &mut Ui,
+    row: &[usize],
+    win: &[Candidate],
+    win_selected: usize,
+    font_size: u32,
+    colors: &ThemeColors,
+) {
+    let is_selected_row = row.contains(&win_selected);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = ITEM_SPACING;
+        for (col, i) in row.iter().enumerate() {
+            let response = render_candidate_cell(
+                ui,
+                col,
+                &win[*i],
+                *i == win_selected,
+                is_selected_row,
+                font_size,
+                colors,
+            );
+            if *i == win_selected {
+                // 仅在选中项滚出可视区时做最小滚动，避免上下
+                // 导航时整个表格反复居中跳动
+                response.response.scroll_to_me(None);
+            }
+        }
+    });
+}
+
+/// 渲染单个候选项单元格，返回其响应（供滚动跟随使用）。
+fn render_candidate_cell(
+    ui: &mut Ui,
+    col: usize,
+    candidate: &Candidate,
+    is_selected: bool,
+    show_label: bool,
+    font_size: u32,
+    colors: &ThemeColors,
+) -> eframe::egui::InnerResponse<()> {
+    let (tc, lc, bg) = item_colors(is_selected, colors);
+    candidate_item_frame(ui, bg.unwrap_or(colors.bg_color), |ui| {
+        render_candidate_item(ui, col + 1, candidate, tc, lc, show_label, font_size);
+    })
+}
+
+fn render_collapsed_row(
+    ui: &mut Ui,
+    row: &[usize],
+    win: &[Candidate],
+    win_selected: usize,
+    colors: &ThemeColors,
+    font_size: u32,
+) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = ITEM_SPACING;
+        for (col, i) in row.iter().enumerate() {
+            render_candidate_cell(
+                ui,
+                col,
+                &win[*i],
+                *i == win_selected,
+                true,
+                font_size,
+                colors,
+            );
+        }
+    });
+}
+
+fn candidate_item_frame(
+    ui: &mut Ui,
+    fill: Color32,
+    content: impl FnOnce(&mut Ui),
+) -> eframe::egui::InnerResponse<()> {
+    EguiFrame::new()
+        .fill(fill)
+        .corner_radius(CornerRadius::same(4))
+        .inner_margin(Margin::same(4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| content(ui));
+        })
+}
+
+/// 应用一条 UI 命令到共享状态，返回是否需要重绘。
+/// 命令仅在窗口可见（或刚显示/退出）时触发重绘，避免隐藏时频繁刷新。
+fn apply_ui_command(s: &mut AppState, cmd: UiCommand) -> bool {
+    let mut should_repaint = s.visible;
+    match cmd {
+        UiCommand::ShowCandidates {
+            code,
+            candidates,
+            selected_index,
+            context,
+            expanded,
+        } => {
+            // 只在首次展示时固定位置，避免后续更新候选列表时闪动
+            if !s.visible {
+                s.caret_x = context.caret_x;
+                s.caret_y = context.caret_y;
+                s.caret_h = context.caret_h;
+            }
+            s.visible = true;
+            s.code = code;
+            // 保留引擎的完整候选列表与真实选中索引；渲染时按
+            // max_candidates 仅显示一个包含选中项的窗口，避免截断
+            // 导致 UI 高亮与引擎实际提交的候选不一致。
+            s.candidates = candidates;
+            s.selected_index = selected_index.min(s.candidates.len().saturating_sub(1));
+            s.expanded = expanded;
+            should_repaint = true;
+        }
+        UiCommand::SetCandidateWindowSettings(cw) => {
+            s.font_size = cw.font_size;
+            s.max_candidates = cw.max_candidates.max(1);
+            // 完整列表与选中索引均保留，显示窗口在渲染时按
+            // 新的 max_candidates 即时重算，无需在此截断
+            should_repaint = true;
+        }
+        UiCommand::SetCommitSentenceKey(key) => {
+            s.commit_sentence = key;
+            should_repaint = true;
+        }
+        UiCommand::UpdatePosition { context } => {
+            if s.visible {
+                s.caret_x = context.caret_x;
+                s.caret_y = context.caret_y;
+                s.caret_h = context.caret_h;
+            }
+        }
+        UiCommand::HideCandidates | UiCommand::CommitText(_) => {
+            s.visible = false;
+            clear_completion(s);
+            should_repaint = false;
+        }
+        UiCommand::Completion {
+            code,
+            selected_index,
+            text,
+        } => {
+            s.completion_code = code;
+            s.completion_index = selected_index;
+            s.completion = text;
+            should_repaint = true;
+        }
+        UiCommand::SetTheme(theme) => {
+            s.theme = theme;
+            should_repaint = true;
+        }
+        UiCommand::Exit => {
+            s.should_exit = true;
+            should_repaint = true;
+        }
+        _ => {}
+    }
+    should_repaint
+}
+
+/// 清空补全状态：防止重打相同编码时旧 ghost text 重现（隐藏与上屏
+/// 后都需清空，旧补全与已提交内容分离）。
+fn clear_completion(s: &mut AppState) {
+    s.completion = None;
+    s.completion_code.clear();
 }

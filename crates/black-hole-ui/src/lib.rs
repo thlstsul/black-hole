@@ -40,6 +40,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 #[cfg(target_os = "windows")]
 use winit::platform::windows::EventLoopBuilderExtWindows;
+use winit::window::Window;
 
 mod candidate_window;
 pub mod settings_manager;
