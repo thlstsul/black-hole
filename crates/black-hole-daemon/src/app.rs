@@ -173,7 +173,7 @@ impl App {
                 completion_engine_tx,
                 completion_ui_render_tx,
                 completion_config_worker,
-                Arc::new(completion::HttpLlmClient),
+                Arc::new(completion::HttpLlmClient::new().expect("HTTP 客户端构建失败")),
                 completion_generation_worker,
                 completion_stop_worker,
             );
@@ -423,13 +423,11 @@ impl App {
         }));
 
         if let Err(e) = result {
-            let msg = if let Some(s) = e.downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = e.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic".to_string()
-            };
+            let msg = e
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
             error!(msg, "Engine thread panicked");
             // 尽量通知 UI 隐藏候选窗，避免界面残留
             let _ = ui_tx.send(UiCommand::HideCandidates);
@@ -482,6 +480,18 @@ impl App {
         mgr
     }
 
+    /// 以磁盘最新可用值为基线修改设置，保存并同步 last_applied。
+    fn modify_and_save_settings<F>(last_applied: &Arc<Mutex<Settings>>, mutate: F)
+    where
+        F: FnOnce(&mut Settings),
+    {
+        let last = last_applied.lock().unwrap().clone();
+        let mut settings_mgr = Self::settings_manager_with_latest(&last);
+        mutate(settings_mgr.settings_mut());
+        *last_applied.lock().unwrap() = settings_mgr.settings().clone();
+        settings_mgr.save();
+    }
+
     /// 分发来自平台层/UI 层的命令到对应处理者
     fn dispatch_ui_command(
         cmd: UiCommand,
@@ -510,12 +520,7 @@ impl App {
                 // 先克隆基线再读盘：settings_manager_with_latest 内部会加载
                 // settings.json，避免持 last_applied 锁跨磁盘 I/O（watcher
                 // 线程每次文件变更也要获取该锁，缩短锁竞争窗口）。
-                let last = last_applied.lock().unwrap().clone();
-                let mut settings_mgr = Self::settings_manager_with_latest(&last);
-                settings_mgr.settings_mut().default_scheme = scheme_id;
-                // 先同步"最后已生效设置"基线，再落盘，watcher 可识别本次为自身写入而跳过
-                *last_applied.lock().unwrap() = settings_mgr.settings().clone();
-                settings_mgr.save();
+                Self::modify_and_save_settings(last_applied, |s| s.default_scheme = scheme_id);
                 // 同步共享状态，使平台线程（IPC GetSettings）返回最新值
                 {
                     let mut cur = current_settings.lock().unwrap();
@@ -524,11 +529,7 @@ impl App {
             }
             UiCommand::SetTheme(theme) => {
                 info!("UI dispatch: set theme to {:?}", theme);
-                let last = last_applied.lock().unwrap().clone();
-                let mut settings_mgr = Self::settings_manager_with_latest(&last);
-                settings_mgr.settings_mut().theme = theme;
-                *last_applied.lock().unwrap() = settings_mgr.settings().clone();
-                settings_mgr.save();
+                Self::modify_and_save_settings(last_applied, |s| s.theme = theme);
                 // 同步共享状态
                 {
                     let mut cur = current_settings.lock().unwrap();
@@ -543,11 +544,7 @@ impl App {
                     warn!("Failed to set auto start ({}): {}", enabled, e);
                 }
                 // 持久化到设置，使重启后保持本次选择
-                let last = last_applied.lock().unwrap().clone();
-                let mut settings_mgr = Self::settings_manager_with_latest(&last);
-                settings_mgr.settings_mut().auto_start = enabled;
-                *last_applied.lock().unwrap() = settings_mgr.settings().clone();
-                settings_mgr.save();
+                Self::modify_and_save_settings(last_applied, |s| s.auto_start = enabled);
             }
             UiCommand::SetInputMode(english) | UiCommand::SetInputModeTransient(english) => {
                 // 中英模式是运行时状态而非设置项：手动切换（SetInputMode）与自动切换
@@ -561,11 +558,7 @@ impl App {
             UiCommand::SetAutoSwitch(enabled) => {
                 info!("UI dispatch: set auto switch mode to {}", enabled);
                 // 持久化到设置，使重启后保持本次选择
-                let last = last_applied.lock().unwrap().clone();
-                let mut settings_mgr = Self::settings_manager_with_latest(&last);
-                settings_mgr.settings_mut().auto_switch_mode = enabled;
-                *last_applied.lock().unwrap() = settings_mgr.settings().clone();
-                settings_mgr.save();
+                Self::modify_and_save_settings(last_applied, |s| s.auto_switch_mode = enabled);
                 // 同步共享状态，使平台线程（IPC GetSettings）返回最新值
                 {
                     let mut cur = current_settings.lock().unwrap();
@@ -657,6 +650,24 @@ impl App {
         }
     }
 
+    /// 处理上屏/取消结果：通知 UI 并递增补全代际号以废弃在途请求。
+    fn handle_commit_result(
+        result: &SchemeResult,
+        ui_tx: &mpsc::Sender<UiCommand>,
+        completion_generation: &Arc<AtomicU64>,
+    ) {
+        if let SchemeResult::Committed { text, .. } = result {
+            let _ = ui_tx.send(UiCommand::CommitText(text.clone()));
+            // 选中/上屏：递增代际号，终止所有在途补全请求
+            completion_generation.fetch_add(1, Ordering::SeqCst);
+        } else if matches!(result, SchemeResult::Cancelled) {
+            // 取消输入：隐藏候选窗，并递增代际号终止所有在途补全请求
+            // （编码已重置，旧补全结果已无意义）
+            let _ = ui_tx.send(UiCommand::HideCandidates);
+            completion_generation.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     /// 处理单个引擎命令，返回需要发送给平台层的结果
     fn process_engine_command(
         engine: &Arc<Mutex<Engine>>,
@@ -671,61 +682,26 @@ impl App {
                 *ctx = new_ctx;
                 None
             }
-            EngineCommand::Key(key) => {
+            EngineCommand::Shutdown => None,
+            EngineCommand::SwitchScheme(_)
+            | EngineCommand::UpdateKeyBindings(_)
+            | EngineCommand::UpdateCompletion(_) => {
                 let mut engine = engine.lock().unwrap();
-                let result = engine.process(&EngineCommand::Key(key), ctx);
-                if let SchemeResult::Committed { ref text, .. } = result {
-                    let _ = ui_tx.send(UiCommand::CommitText(text.clone()));
-                    // 选中/上屏：递增代际号，终止所有在途补全请求
-                    completion_generation.fetch_add(1, Ordering::SeqCst);
-                } else if matches!(result, SchemeResult::Cancelled) {
-                    // 取消输入：隐藏候选窗，并递增代际号终止所有在途补全请求
-                    // （编码已重置，旧补全结果已无意义）
-                    let _ = ui_tx.send(UiCommand::HideCandidates);
-                    completion_generation.fetch_add(1, Ordering::SeqCst);
-                }
-                maybe_request_completion(&result, ctx, completion_tx);
-                Some(result)
+                engine.process(&cmd, ctx);
+                None
             }
             EngineCommand::Reset => {
                 let mut engine = engine.lock().unwrap();
-                let result = engine.process(&EngineCommand::Reset, ctx);
+                let result = engine.process(&cmd, ctx);
                 let _ = ui_tx.send(UiCommand::HideCandidates);
                 Some(result)
             }
-            EngineCommand::SelectCandidate(idx) => {
+            _ => {
                 let mut engine = engine.lock().unwrap();
-                let result = engine.process(&EngineCommand::SelectCandidate(idx), ctx);
-                if let SchemeResult::Committed { ref text, .. } = result {
-                    let _ = ui_tx.send(UiCommand::CommitText(text.clone()));
-                    // 选中候选上屏：递增代际号，终止所有在途补全请求
-                    completion_generation.fetch_add(1, Ordering::SeqCst);
-                }
+                let result = engine.process(&cmd, ctx);
+                Self::handle_commit_result(&result, ui_tx, completion_generation);
+                maybe_request_completion(&result, ctx, completion_tx);
                 Some(result)
-            }
-            EngineCommand::SwitchScheme(id) => {
-                let mut engine = engine.lock().unwrap();
-                engine.process(&EngineCommand::SwitchScheme(id), ctx);
-                // SwitchScheme 来自托盘而非 IPC 客户端，没有人等待 platform_rx 上的响应，
-                // 发送 Ignored 会污染共享响应通道，导致后续按键请求/响应错位。
-                None
-            }
-            EngineCommand::UpdateKeyBindings(bindings) => {
-                let mut engine = engine.lock().unwrap();
-                engine.process(&EngineCommand::UpdateKeyBindings(bindings), ctx);
-                // 与 SwitchScheme 同理：由 daemon 主循环触发，无需响应。
-                None
-            }
-            EngineCommand::UpdateCompletion(completion) => {
-                let mut engine = engine.lock().unwrap();
-                engine.process(&EngineCommand::UpdateCompletion(completion), ctx);
-                // 由补全 worker 线程触发，无需响应。
-                None
-            }
-            EngineCommand::Shutdown => {
-                // 引擎线程循环已拦截 Shutdown 并退出，正常不会到达此处；
-                // 保留分支以穷尽匹配。
-                None
             }
         }
     }

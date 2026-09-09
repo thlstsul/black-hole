@@ -73,10 +73,8 @@ impl LanguageModel {
     /// 相同 text 在不同 code 下出现时会合并 score。
     pub fn from_entries(entries: &[(String, Vec<Candidate>)]) -> Self {
         let mut text_scores: FxHashMap<String, i64> = FxHashMap::default();
-        for (_code, cands) in entries {
-            for cand in cands {
-                *text_scores.entry(cand.text.clone()).or_insert(0) += cand.score.max(1);
-            }
+        for cand in entries.iter().flat_map(|(_, cands)| cands) {
+            *text_scores.entry(cand.text.clone()).or_insert(0) += cand.score.max(1);
         }
         let total: i64 = text_scores.values().sum();
         Self::from_text_scores(total, text_scores)

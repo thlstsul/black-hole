@@ -7,6 +7,7 @@ pub mod pinyin_scheme;
 pub mod punctuation;
 pub mod ranker;
 pub mod rime_dict;
+mod scheme_helpers;
 pub mod scheme_registry;
 pub mod shuangpin;
 pub mod shuangpin_scheme;
@@ -73,9 +74,8 @@ pub trait Dictionary: Send {
         self.prefix_lookup(pattern)
     }
     /// 模糊匹配查询（支持通配符）
-    fn fuzzy_match(&self, pattern: &str) -> Vec<Candidate> {
+    fn fuzzy_match(&self, _pattern: &str) -> Vec<Candidate> {
         // 默认实现：返回空，子类可覆盖
-        let _ = pattern;
         Vec::new()
     }
 }
@@ -103,17 +103,13 @@ pub fn sort_candidates(
             _ => 3,
         };
         let length_priority = |c: &Candidate| {
-            if is_fully_segmented {
-                let text_len = c.text.chars().count();
-                if text_len == syllable_count {
-                    0
-                } else if text_len < syllable_count {
-                    1
-                } else {
-                    2
-                }
-            } else {
-                2
+            if !is_fully_segmented {
+                return 2;
+            }
+            match c.text.chars().count().cmp(&syllable_count) {
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Less => 1,
+                std::cmp::Ordering::Greater => 2,
             }
         };
         length_priority(a)
@@ -133,11 +129,7 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(scheme: Box<dyn InputScheme>) -> Self {
-        Self {
-            scheme,
-            registry: SchemeRegistry::new(),
-            key_bindings: KeyBindings::default(),
-        }
+        Self::with_registry(scheme, SchemeRegistry::new())
     }
 
     pub fn with_registry(scheme: Box<dyn InputScheme>, registry: SchemeRegistry) -> Self {
@@ -205,25 +197,17 @@ impl Engine {
             };
             !is_letter || (!m.shift && !m.capslock)
         };
-        let canonical = if plain == self.key_bindings.next_candidate
-            && remappable(&self.key_bindings.next_candidate)
-        {
-            Some("ArrowDown")
-        } else if plain == self.key_bindings.prev_candidate
-            && remappable(&self.key_bindings.prev_candidate)
-        {
-            Some("ArrowUp")
-        } else if plain == self.key_bindings.commit && remappable(&self.key_bindings.commit) {
-            Some("Space")
-        } else if plain == self.key_bindings.cancel && remappable(&self.key_bindings.cancel) {
-            Some("Escape")
-        } else if plain == self.key_bindings.commit_sentence
-            && remappable(&self.key_bindings.commit_sentence)
-        {
-            Some("Tab")
-        } else {
-            None
-        };
+        let bindings = [
+            (&self.key_bindings.next_candidate, "ArrowDown"),
+            (&self.key_bindings.prev_candidate, "ArrowUp"),
+            (&self.key_bindings.commit, "Space"),
+            (&self.key_bindings.cancel, "Escape"),
+            (&self.key_bindings.commit_sentence, "Tab"),
+        ];
+        let canonical = bindings
+            .iter()
+            .find(|(binding, _)| plain == binding.as_str() && remappable(binding))
+            .map(|(_, canonical)| *canonical);
         if let Some(name) = canonical {
             let mut k = key.clone();
             k.key = name.to_string();

@@ -196,6 +196,10 @@ pub fn navigate_grid_excluding(
         .iter()
         .position(|&idx| idx == selected_index)?;
 
+    fn clamped_col(row: &[usize], col: usize) -> usize {
+        row[col.min(row.len().saturating_sub(1))]
+    }
+
     match direction {
         GridDirection::Left => current_col_idx
             .checked_sub(1)
@@ -204,13 +208,12 @@ pub fn navigate_grid_excluding(
             let row = &rows[current_row_idx];
             (current_col_idx + 1 < row.len()).then(|| row[current_col_idx + 1])
         }
-        GridDirection::Up => current_row_idx.checked_sub(1).map(|r| {
-            let prev_row = &rows[r];
-            prev_row[current_col_idx.min(prev_row.len().saturating_sub(1))]
-        }),
+        GridDirection::Up => current_row_idx
+            .checked_sub(1)
+            .map(|r| clamped_col(&rows[r], current_col_idx)),
         GridDirection::Down => rows
             .get(current_row_idx + 1)
-            .map(|next_row| next_row[current_col_idx.min(next_row.len().saturating_sub(1))]),
+            .map(|next_row| clamped_col(next_row, current_col_idx)),
     }
 }
 

@@ -211,10 +211,10 @@ impl BlackHoleTextService {
     /// Check whether an active composition exists.
     fn is_composing(&self) -> bool {
         let inner = self.inner.lock().unwrap();
-        match &inner.composition {
-            None => false,
-            Some(c) => unsafe { c.GetRange().is_ok() },
-        }
+        inner
+            .composition
+            .as_ref()
+            .is_some_and(|c| unsafe { c.GetRange().is_ok() })
     }
 
     /// 英文→中文自动切换：英文模式的 OnTestKeyDown 中每个按键调用一次。
@@ -246,14 +246,40 @@ impl BlackHoleTextService {
         }
 
         let switched = *result.lock().unwrap();
-        match switched {
-            Some(target) => {
-                apply_auto_mode_toggle(&self.inner, target);
-                // 此场景 target 必为 false（英文→中文）；!target 即"已切回中文"
-                !target
-            }
-            None => false,
+        switched.is_some_and(|target| {
+            apply_auto_mode_toggle(&self.inner, target);
+            // 此场景 target 必为 false（英文→中文）；!target 即"已切回中文"
+            !target
+        })
+    }
+
+    /// 构造英文→中文自动切换决策，并依据决策刷新 context（若 pic 非空）。
+    /// 调用方仍需根据 decision.evaluate 决定是否调用 try_auto_switch_to_chinese。
+    fn evaluate_english_auto_switch(
+        &self,
+        pic: &Ref<'_, ITfContext>,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        vk: VIRTUAL_KEY,
+        already_evaluated: bool,
+    ) -> EnglishEvalDecision {
+        let inner = self.inner.lock().unwrap();
+        let pic_present = (*pic).to_owned().is_some();
+        let is_input_key = virtual_key_to_key_event(vk, wparam, lparam, KeyState::Press)
+            .is_some_and(|evt| is_input_char_event(&evt));
+        let decision = decide_english_auto_switch(
+            inner.auto_switch,
+            inner.composition.is_some(),
+            inner.context.is_some(),
+            pic_present,
+            is_input_key,
+            already_evaluated,
+        );
+        drop(inner);
+        if decision.refresh_context {
+            self.inner.lock().unwrap().context = (*pic).to_owned();
         }
+        decision
     }
 
     /// 采样当前语境建议：手动 Ctrl 切换时作为自动切换状态机的锁定基线。
@@ -348,46 +374,44 @@ impl BlackHoleTextService {
 /// sync_settings_from_daemon 的自由函数版本：供 IPC 重连成功等无 service
 /// 实例上下文的路径复用（语义与该方法一致）。始终应用 daemon 当前中英模式。
 pub(crate) fn sync_settings_from_daemon_inner(inner_arc: &Arc<Mutex<ServiceInner>>) {
-    let english = {
+    let settings = {
         let mut inner = inner_arc.lock().unwrap();
-        if let Some(ref mut conn) = inner.ipc_conn {
-            let request = IpcRequest::GetSettings;
-            if send_request(&mut conn.writer, &request).is_ok()
-                && let Ok(IpcResponse::Settings {
-                    scheme_id,
-                    theme,
-                    english,
-                    auto_switch,
-                }) = read_response(&mut conn.reader)
-            {
-                inner.current_scheme = scheme_id;
-                inner.current_theme = theme;
-                inner.auto_switch = auto_switch;
-                info!(
-                    "Synced settings from daemon: scheme={:?}, theme={:?}, english={}, auto_switch={}",
-                    scheme_id, theme, english, auto_switch
-                );
-                Some(english)
-            } else {
-                None
-            }
-        } else {
-            None
+        let Some(ref mut conn) = inner.ipc_conn else {
+            return;
+        };
+        let request = IpcRequest::GetSettings;
+        if send_request(&mut conn.writer, &request).is_err() {
+            return;
         }
+        let Ok(IpcResponse::Settings {
+            scheme_id,
+            theme,
+            english,
+            auto_switch,
+        }) = read_response(&mut conn.reader)
+        else {
+            return;
+        };
+        inner.current_scheme = scheme_id;
+        inner.current_theme = theme;
+        inner.auto_switch = auto_switch;
+        info!(
+            "Synced settings from daemon: scheme={:?}, theme={:?}, english={}, auto_switch={}",
+            scheme_id, theme, english, auto_switch
+        );
+        english
     };
     // 先释放 inner 锁再应用模式切换：apply_input_mode_toggle 内部会重新加锁。
-    if let Some(english) = english {
-        let changed = {
-            let mut inner = inner_arc.lock().unwrap();
-            inner.mode_switch.set_english(english).is_some()
-        };
-        if changed {
-            info!(
-                "Input mode synced from daemon: {}",
-                if english { "英文" } else { "中文" }
-            );
-            apply_input_mode_toggle(inner_arc, english);
-        }
+    let changed = {
+        let mut inner = inner_arc.lock().unwrap();
+        inner.mode_switch.set_english(settings).is_some()
+    };
+    if changed {
+        info!(
+            "Input mode synced from daemon: {}",
+            if settings { "英文" } else { "中文" }
+        );
+        apply_input_mode_toggle(inner_arc, settings);
     }
 }
 
@@ -603,24 +627,8 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
             let mut inner = self.inner.lock().unwrap();
             if inner.mode_switch.is_english() {
                 inner.last_key_event = None;
-                // 决策提取为纯函数（见 decide_english_auto_switch）：无条件
-                // 刷新 context 防陈旧 ITfContext、空 pic 保留既有有效上下文、
-                // 仅字符输入键触发评估。
-                let pic_present = pic.to_owned().is_some();
-                let is_input_key = virtual_key_to_key_event(vk, wparam, lparam, KeyState::Press)
-                    .is_some_and(|evt| is_input_char_event(&evt));
-                let decision = decide_english_auto_switch(
-                    inner.auto_switch,
-                    inner.composition.is_some(),
-                    inner.context.is_some(),
-                    pic_present,
-                    is_input_key,
-                    false, // OnTestKeyDown 是去重记录的源头，本路径不查去重
-                );
-                if decision.refresh_context {
-                    inner.context = pic.to_owned();
-                }
                 drop(inner);
+                let decision = self.evaluate_english_auto_switch(&pic, wparam, lparam, vk, false);
                 if !decision.evaluate {
                     return Ok(BOOL(0));
                 }
@@ -713,37 +721,22 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         // 评估必须在此补做，否则该类应用中英→中永远不触发；命中切回中文后
         // 继续走下方中文模式流程，消费本次按键（与 OnTestKeyDown 路径语义一致）。
         {
-            let mut inner = self.inner.lock().unwrap();
+            let inner = self.inner.lock().unwrap();
             if inner.mode_switch.is_english() {
-                // 决策提取为纯函数（见 decide_english_auto_switch）：无条件
-                // 刷新 context 防陈旧 ITfContext、空 pic 保留既有有效上下文、
-                // 仅字符输入键触发评估、去重窗口防双重评估。
-                let pic_present = pic.to_owned().is_some();
-                let is_input_key = virtual_key_to_key_event(
-                    VIRTUAL_KEY(wparam.0 as u16),
-                    wparam,
-                    lparam,
-                    KeyState::Press,
-                )
-                .is_some_and(|evt| is_input_char_event(&evt));
                 // 同一按键已在 OnTestKeyDown 评估过（时间窗内同键视为同一次按下），
                 // 直接放行：部分应用对同一按键两个回调都会调用，避免双重评估
                 let already_evaluated = match &inner.last_eng_eval_key {
                     Some((w, t)) => *w == wparam.0 && t.elapsed() < ENG_EVAL_DEDUP_WINDOW,
                     None => false,
                 };
-                let decision = decide_english_auto_switch(
-                    inner.auto_switch,
-                    inner.composition.is_some(),
-                    inner.context.is_some(),
-                    pic_present,
-                    is_input_key,
+                drop(inner);
+                let decision = self.evaluate_english_auto_switch(
+                    &pic,
+                    wparam,
+                    lparam,
+                    VIRTUAL_KEY(wparam.0 as u16),
                     already_evaluated,
                 );
-                if decision.refresh_context {
-                    inner.context = pic.to_owned();
-                }
-                drop(inner);
                 if !decision.evaluate || !self.try_auto_switch_to_chinese() {
                     return Ok(BOOL(0));
                 }

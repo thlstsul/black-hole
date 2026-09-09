@@ -24,9 +24,9 @@ use tracing::{debug, error, info, warn};
 
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, WPARAM};
 use windows::Win32::UI::TextServices::{
-    ITfComposition, ITfContext, ITfLangBarItem, ITfLangBarItemSink, ITfThreadMgr,
+    ITfComposition, ITfContext, ITfLangBarItem, ITfLangBarItemSink, ITfSource, ITfThreadMgr,
 };
-use windows_core::{GUID, PCWSTR, w};
+use windows_core::{GUID, Interface, PCWSTR, w};
 
 use super::{PlatformError, PlatformIme};
 use black_hole_shared::{
@@ -246,6 +246,24 @@ impl ServiceInner {
             caret_pos,
             version,
         };
+    }
+
+    /// 清除 composition 状态并反注册 layout sink（两处 edit session 共用收尾逻辑）。
+    pub(crate) fn clear_composition(
+        &mut self,
+        ctx: Option<&ITfContext>,
+        layout_cookie: Option<u32>,
+    ) {
+        self.composition = None;
+        self.last_caret_pos = None;
+        self.context_version += 1;
+        if let Some(cookie) = layout_cookie
+            && let Some(ctx) = ctx
+            && let Ok(source) = ctx.cast::<ITfSource>()
+        {
+            let _ = unsafe { source.UnadviseSink(cookie) };
+        }
+        self.layout_sink_cookie = None;
     }
 }
 

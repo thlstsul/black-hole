@@ -46,7 +46,7 @@ impl ShuangpinCodec {
             result.push_str(s);
         }
         if let Some(ch) = self.pending.chars().next() {
-            if let Some(prefix) = initial_to_pinyin(ch) {
+            if let Some(prefix) = get_initial(ch) {
                 result.push_str(prefix);
             } else {
                 result.push(ch);
@@ -60,7 +60,6 @@ impl ShuangpinCodec {
         self.syllables.join(" ")
     }
 
-    /// 是否有未完成的挂起字符
     pub fn has_pending(&self) -> bool {
         !self.pending.is_empty()
     }
@@ -72,7 +71,7 @@ impl ShuangpinCodec {
     /// 用于在词典中前缀查找 "shu yao" / "shu ye" / "shu yu" 等双字词。
     pub fn spaced_code_with_pending_initial(&self) -> Option<String> {
         let ch = self.pending.chars().next()?;
-        let initial = initial_to_pinyin(ch)?;
+        let initial = get_initial(ch)?;
         let spaced = self.spaced_code();
         if spaced.is_empty() {
             return None;
@@ -80,12 +79,10 @@ impl ShuangpinCodec {
         Some(format!("{} {}", spaced, initial))
     }
 
-    /// 返回音节切分图（DAG），用于整句解码
     pub fn syllable_graph(&self) -> SyllableGraph {
         SyllableGraph::from_single_segmentation(&self.syllables)
     }
 
-    /// 删除最后一个字符，返回是否成功删除
     pub fn pop(&mut self) -> bool {
         if self.full_input.is_empty() {
             return false;
@@ -139,11 +136,6 @@ impl Codec for ShuangpinCodec {
         self.pending.clear();
         self.full_input.clear();
     }
-}
-
-/// 将声母键转换为全拼声母前缀
-const fn initial_to_pinyin(ch: char) -> Option<&'static str> {
-    get_initial(ch)
 }
 
 /// 获取声母键对应的全拼声母前缀

@@ -9,10 +9,8 @@ pub struct PinyinCodec {
     syllables: Vec<String>,
     raw_input: String,
     full_input: String,
-    valid_syllables: &'static HashSet<String>,
-    /// 存储所有可能的切分结果（用于多策略查询）
+    valid_syllables: &'static HashSet<&'static str>,
     all_segmentations: Vec<Vec<String>>,
-    /// 优化：缓存历史计算结果，避免删除时重复计算
     segmentation_cache: HashMap<String, Vec<Vec<String>>>,
 }
 
@@ -47,7 +45,6 @@ impl PinyinCodec {
         greedy_segment(&self.full_input, self.valid_syllables).0
     }
 
-    /// 返回完整的原始输入（包括已切分和未切分部分）
     pub fn full_code(&self) -> String {
         self.syllables.join("") + &self.raw_input
     }
@@ -57,7 +54,6 @@ impl PinyinCodec {
         self.syllables_resegmented().join(" ")
     }
 
-    /// 返回所有可能的切分结果（空格分隔的字符串列表）
     pub fn all_spaced_codes(&self) -> Vec<String> {
         self.all_segmentations
             .iter()
@@ -65,7 +61,6 @@ impl PinyinCodec {
             .collect()
     }
 
-    /// 返回音节切分图（DAG）
     pub fn syllable_graph(&self) -> SyllableGraph {
         SyllableGraph::from_segmentations(&self.all_segmentations)
     }
@@ -78,7 +73,6 @@ impl PinyinCodec {
             .collect()
     }
 
-    /// 删除最后一个字符，返回是否成功删除
     pub fn pop(&mut self) -> bool {
         if self.full_input.is_empty() {
             return false;
@@ -93,7 +87,6 @@ impl PinyinCodec {
         self.syllables.clear();
         self.raw_input.clear();
 
-        // 优化：先检查缓存，避免重复计算
         if let Some(cached) = self.segmentation_cache.get(&self.full_input) {
             self.all_segmentations = cached.clone();
         } else {
@@ -106,10 +99,8 @@ impl PinyinCodec {
             self.try_segment();
         }
 
-        // 如果缓存中没有，才重新计算
         if self.all_segmentations.is_empty() && !self.full_input.is_empty() {
             self.compute_all_segmentations();
-            // 限制缓存大小，防止无限增长
             if self.segmentation_cache.len() >= 100 {
                 self.segmentation_cache.clear();
             }
@@ -188,9 +179,7 @@ impl Codec for PinyinCodec {
 const MAX_SEGMENTATIONS: usize = 50;
 
 /// 贪心最长匹配切分
-///
-/// 对给定输入字符串，从前往后做最长匹配，返回切分结果和剩余未识别部分。
-fn greedy_segment(input: &str, valid_syllables: &HashSet<String>) -> (Vec<String>, String) {
+fn greedy_segment(input: &str, valid_syllables: &HashSet<&str>) -> (Vec<String>, String) {
     let mut remaining = input;
     let mut result = Vec::new();
 
@@ -242,7 +231,7 @@ fn materialize_path(path: &SegPath) -> Vec<String> {
 /// 长输入逐键重建不再随长度二次增长。
 fn dp_segment(
     input: &str,
-    valid_syllables: &HashSet<String>,
+    valid_syllables: &HashSet<&str>,
     max_segmentations: usize,
 ) -> Vec<Vec<String>> {
     let len = input.len();
@@ -281,8 +270,8 @@ fn dp_segment(
 }
 
 /// 构建有效拼音音节集合（使用 OnceLock 全局缓存）
-fn build_syllable_set() -> &'static HashSet<String> {
-    static SET: OnceLock<HashSet<String>> = OnceLock::new();
+fn build_syllable_set() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
     SET.get_or_init(|| {
         let syllables = [
             "a", "ai", "an", "ang", "ao", "ba", "bai", "ban", "bang", "bao", "bei", "ben", "beng",
@@ -323,7 +312,7 @@ fn build_syllable_set() -> &'static HashSet<String> {
             "zui", "zun", "zuo",
         ];
 
-        syllables.iter().map(|s| s.to_string()).collect()
+        syllables.iter().copied().collect()
     })
 }
 

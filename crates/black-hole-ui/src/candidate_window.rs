@@ -65,19 +65,23 @@ struct ThemeColors {
 }
 
 fn theme_colors(theme: Theme) -> ThemeColors {
-    match theme {
-        Theme::Dark | Theme::System => ThemeColors {
-            text_color: Color32::from_rgb(240, 240, 240),
-            bg_color: Color32::from_rgb(40, 40, 40),
-            highlight_color: Color32::from_rgb(0, 120, 215),
-            label_color: Color32::from_rgb(160, 160, 160),
-        },
-        _ => ThemeColors {
-            text_color: Color32::from_rgb(26, 26, 26),
-            bg_color: Color32::from_rgb(245, 245, 245),
-            highlight_color: Color32::from_rgb(0, 120, 215),
-            label_color: Color32::from_rgb(120, 120, 120),
-        },
+    let (text_color, bg_color, label_color) = match theme {
+        Theme::Dark | Theme::System => (
+            Color32::from_rgb(240, 240, 240),
+            Color32::from_rgb(40, 40, 40),
+            Color32::from_rgb(160, 160, 160),
+        ),
+        _ => (
+            Color32::from_rgb(26, 26, 26),
+            Color32::from_rgb(245, 245, 245),
+            Color32::from_rgb(120, 120, 120),
+        ),
+    };
+    ThemeColors {
+        text_color,
+        bg_color,
+        highlight_color: Color32::from_rgb(0, 120, 215),
+        label_color,
     }
 }
 
@@ -216,10 +220,11 @@ impl App for ImeUiApp {
                                     });
                                 // LLM 补全：仅当与当前编码及当前选中项一致时展示，
                                 // 避免异步错位；始终以普通灰色显示（不在高亮块内）。
-                                if state.completion_code == state.code
+                                let show_completion = state.completion_code == state.code
                                     && state.completion_index == state.selected_index
-                                    && let Some(completion) = &state.completion
-                                {
+                                    && state.completion.is_some();
+                                if show_completion {
+                                    let completion = state.completion.as_ref().unwrap();
                                     ui.add(
                                         Label::new(
                                             RichText::new(completion)
@@ -525,11 +530,8 @@ fn estimate_window_size(state: &AppState) -> (f32, f32) {
         );
         // ScrollArea 内部每行之间有 item_spacing.y = 6.0，需计入
         let inter_row_spacing = 6.0f32;
-        let content_height = if rows.len() <= 1 {
-            rows.len() as f32 * candidate_row_height
-        } else {
-            rows.len() as f32 * candidate_row_height + (rows.len() - 1) as f32 * inter_row_spacing
-        };
+        let content_height = rows.len() as f32 * candidate_row_height
+            + rows.len().saturating_sub(1) as f32 * inter_row_spacing;
         let scroll_height = content_height.min(SCROLL_AREA_MAX_HEIGHT);
         (first_row_height + scroll_height + row_spacing + frame_padding).max(64.0)
     } else {
@@ -558,13 +560,11 @@ pub fn run_candidate_window(
     let Err(e) = result else {
         return;
     };
-    let msg = match e.downcast_ref::<&str>() {
-        Some(s) => s.to_string(),
-        None => match e.downcast_ref::<String>() {
-            Some(s) => s.clone(),
-            None => "unknown panic".to_string(),
-        },
-    };
+    let msg = e
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| e.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string());
     error!(msg, "run_candidate_window panicked");
 }
 

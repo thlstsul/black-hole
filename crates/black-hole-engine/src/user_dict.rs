@@ -176,10 +176,8 @@ impl UserDictionary {
 
     /// 立即落盘（进程退出 / 切方案前调用，确保防抖期间的修改不丢失）
     pub fn flush(&self) {
-        if self.dir.is_some() {
-            self.save(SchemeId::Pinyin);
-            self.save(SchemeId::Shuangpin);
-        }
+        self.save(SchemeId::Pinyin);
+        self.save(SchemeId::Shuangpin);
     }
 
     /// 获取某个编码下的用户候选词（按词频降序）

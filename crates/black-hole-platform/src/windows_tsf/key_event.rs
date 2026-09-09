@@ -322,11 +322,7 @@ fn handle_key_event_internal(
         }
     }));
 
-    match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(E_UNEXPECTED.into()),
-    }
+    result.unwrap_or_else(|_| Err(E_UNEXPECTED.into()))
 }
 
 #[cfg(test)]

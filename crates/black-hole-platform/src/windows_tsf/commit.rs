@@ -292,17 +292,10 @@ impl ITfEditSession_Impl for CommitCompositionEditSession_Impl {
                 Ok(())
             })();
 
-            let mut inner = self.inner_arc.lock().unwrap();
-            inner.composition = None;
-            inner.last_caret_pos = None;
-            inner.context_version += 1;
-            if let Some(cookie) = layout_cookie
-                && let Some(ref ctx) = ctx
-                && let Ok(source) = ctx.cast::<ITfSource>()
-            {
-                let _ = unsafe { source.UnadviseSink(cookie) };
-            }
-            inner.layout_sink_cookie = None;
+            self.inner_arc
+                .lock()
+                .unwrap()
+                .clear_composition(ctx.as_ref(), layout_cookie);
         }
 
         Ok(())
@@ -332,17 +325,10 @@ impl ITfEditSession_Impl for CancelCompositionEditSession_Impl {
                 Ok(())
             })();
 
-            let mut inner = self.inner_arc.lock().unwrap();
-            inner.composition = None;
-            inner.last_caret_pos = None;
-            inner.context_version += 1;
-            if let Some(cookie) = layout_cookie
-                && let Some(ref ctx) = ctx
-                && let Ok(source) = ctx.cast::<ITfSource>()
-            {
-                let _ = unsafe { source.UnadviseSink(cookie) };
-            }
-            inner.layout_sink_cookie = None;
+            self.inner_arc
+                .lock()
+                .unwrap()
+                .clear_composition(ctx.as_ref(), layout_cookie);
         }
 
         Ok(())

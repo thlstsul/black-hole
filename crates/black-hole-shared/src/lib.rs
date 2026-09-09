@@ -184,17 +184,9 @@ impl InputModeSwitch {
 /// 其它字符（如 emoji、其它文字）视为中性继续向前。前文无强信号时，再对
 /// 后文从头向后做同样扫描；均无强信号则返回 None。
 pub fn suggest_input_mode(preceding: Option<&str>, following: Option<&str>) -> Option<bool> {
-    if let Some(text) = preceding
-        && let Some(mode) = scan_mode_signal(text.chars().rev())
-    {
-        return Some(mode);
-    }
-    if let Some(text) = following
-        && let Some(mode) = scan_mode_signal(text.chars())
-    {
-        return Some(mode);
-    }
-    None
+    preceding
+        .and_then(|text| scan_mode_signal(text.chars().rev()))
+        .or_else(|| following.and_then(|text| scan_mode_signal(text.chars())))
 }
 
 /// 逐字符扫描强信号：ASCII 字母/数字 → 英文；CJK 字符/中文标点 → 中文；

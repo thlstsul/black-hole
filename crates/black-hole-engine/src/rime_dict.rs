@@ -169,7 +169,6 @@ impl RimeDict {
         // 加载校验并读取音节表（table 与 prism 的音节 id 一致：均为排序去重列表）
         let table = Table::load(&table_bin)?;
         let syllabary = table.syllabary_entries()?;
-        Prism::load(&prism_bin)?;
 
         let syllable_to_id: FxHashMap<String, SyllableId> = syllabary
             .iter()
@@ -246,14 +245,15 @@ impl RimeDict {
         let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let cache = SHARED_DICTS.get_or_init(|| Mutex::new(HashMap::new()));
 
-        if let Some(dict) = cache.lock().unwrap().get(&key) {
+        let mut cache = cache.lock().unwrap();
+        if let Some(dict) = cache.get(&key) {
             return Some(dict.clone());
         }
 
         match Self::from_rime_dict_cached(path, cache_dir) {
             Ok(dict) => {
                 let dict = Arc::new(dict);
-                cache.lock().unwrap().insert(key, dict.clone());
+                cache.insert(key, dict.clone());
                 Some(dict)
             }
             Err(e) => {
@@ -661,27 +661,12 @@ impl Dictionary for RimeDict {
         // 按文本去重（保留最高分），降序，截断
         let mut best: FxHashMap<String, i64> = FxHashMap::default();
         for (text, score) in results {
-            best.entry(text)
-                .and_modify(|s| {
-                    if score > *s {
-                        *s = score;
-                    }
-                })
-                .or_insert(score);
+            upsert_max(&mut best, text, score);
         }
         // 补充精确匹配结果：确保单字候选（如 碳、炭 等低频字）
         // 不会被多音节词条挤掉（#issue: prefix_lookup 按分数截断时）
-        if !code.is_empty() {
-            let exact = self.lookup(code);
-            for c in &exact {
-                best.entry(c.text.clone())
-                    .and_modify(|s| {
-                        if c.score > *s {
-                            *s = c.score;
-                        }
-                    })
-                    .or_insert(c.score);
-            }
+        for c in &self.lookup(code) {
+            upsert_max(&mut best, c.text.clone(), c.score);
         }
         let mut out: Vec<Candidate> = best
             .into_iter()
@@ -721,6 +706,16 @@ impl Dictionary for Arc<RimeDict> {
     }
 }
 
+fn upsert_max(best: &mut FxHashMap<String, i64>, text: String, score: i64) {
+    best.entry(text)
+        .and_modify(|s| {
+            if score > *s {
+                *s = score;
+            }
+        })
+        .or_insert(score);
+}
+
 // 线程安全断言：共享缓存要求 RimeDict 可跨线程使用
 const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
@@ -748,10 +743,9 @@ fn collect_syllabary(entries: &[RawEntry]) -> Vec<String> {
 fn text_to_pinyin_code(text: &str) -> Option<String> {
     let syllables: Vec<String> = text
         .chars()
-        .filter_map(|ch| ch.to_pinyin().map(|py| py.plain().to_string()))
-        .collect();
-
-    if syllables.is_empty() || syllables.len() != text.chars().count() {
+        .map(|ch| ch.to_pinyin().map(|py| py.plain().to_string()))
+        .collect::<Option<_>>()?;
+    if syllables.is_empty() {
         None
     } else {
         Some(syllables.join(" "))
@@ -760,14 +754,13 @@ fn text_to_pinyin_code(text: &str) -> Option<String> {
 
 /// 解析词库文件内容：`.dict.yaml` 直接解析；无 YAML 头的纯码表按 `[text]` 列合成头部
 fn parse_dict_content(content: &str) -> Result<DictYaml, RimeDictError> {
-    if content.starts_with("---") || content.contains("\n---") {
-        DictYaml::parse(content).map_err(|e| RimeDictError::Parse(e.to_string()))
+    let input = if content.starts_with("---") || content.contains("\n---") {
+        content.to_string()
     } else {
         // 无头纯码表：每行 `文本[\t编码[\t权重]]`，缺码词条后续自动注音
-        let synthesized =
-            format!("---\nname: custom\ncolumns:\n  - text\n  - code\n  - weight\n...\n{content}");
-        DictYaml::parse(&synthesized).map_err(|e| RimeDictError::Parse(e.to_string()))
-    }
+        format!("---\nname: custom\ncolumns:\n  - text\n  - code\n  - weight\n...\n{content}")
+    };
+    DictYaml::parse(&input).map_err(|e| RimeDictError::Parse(e.to_string()))
 }
 
 /// 加载词库及全部 import 的词条，返回 `(去重词条, 源文件 CRC-32)`
@@ -815,15 +808,8 @@ fn load_entries_recursive(
     for name in &dict.import_tables {
         let yaml_path = base_dir.join(format!("{name}.dict.yaml"));
         let txt_path = base_dir.join(format!("{name}.txt"));
-        let import_path = if yaml_path.exists() {
-            Some(yaml_path)
-        } else if txt_path.exists() {
-            Some(txt_path)
-        } else {
-            None
-        };
         // 与 RIME 行为一致：导入文件不存在时静默跳过
-        if let Some(p) = import_path {
+        if let Some(p) = [yaml_path, txt_path].into_iter().find(|p| p.exists()) {
             let import_content = fs::read_to_string(&p)?;
             load_entries_recursive(&p, &import_content, visited, entries, seen)?;
         }

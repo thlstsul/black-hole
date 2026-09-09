@@ -66,30 +66,17 @@ impl SettingsPanelApp {
     fn normalize_key_bindings(&mut self) -> bool {
         let defaults = KeyBindings::default();
         let mut restored = false;
-        {
-            let b = &mut self.settings_mgr.settings_mut().key_bindings;
-            if b.next_candidate.trim().is_empty() {
-                b.next_candidate = defaults.next_candidate;
-                restored = true;
-            }
-            if b.prev_candidate.trim().is_empty() {
-                b.prev_candidate = defaults.prev_candidate;
-                restored = true;
-            }
-            if b.commit.trim().is_empty() {
-                b.commit = defaults.commit;
-                restored = true;
-            }
-            if b.cancel.trim().is_empty() {
-                b.cancel = defaults.cancel;
-                restored = true;
-            }
-            if b.switch_scheme.trim().is_empty() {
-                b.switch_scheme = defaults.switch_scheme;
-                restored = true;
-            }
-            if b.commit_sentence.trim().is_empty() {
-                b.commit_sentence = defaults.commit_sentence;
+        let b = &mut self.settings_mgr.settings_mut().key_bindings;
+        for (field, default) in [
+            (&mut b.next_candidate, defaults.next_candidate),
+            (&mut b.prev_candidate, defaults.prev_candidate),
+            (&mut b.commit, defaults.commit),
+            (&mut b.cancel, defaults.cancel),
+            (&mut b.switch_scheme, defaults.switch_scheme),
+            (&mut b.commit_sentence, defaults.commit_sentence),
+        ] {
+            if field.trim().is_empty() {
+                *field = default;
                 restored = true;
             }
         }

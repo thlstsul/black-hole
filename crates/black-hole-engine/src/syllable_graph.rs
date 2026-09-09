@@ -51,18 +51,7 @@ impl SyllableGraph {
 
     /// 从单条切分路径构建图（用于增量切分场景）
     pub fn from_single_segmentation(syllables: &[String]) -> Self {
-        let total_len: usize = syllables.iter().map(|s| s.len()).sum();
-        let mut edges: Vec<Vec<(usize, String)>> = vec![Vec::new(); total_len + 1];
-
-        let mut pos = 0;
-        for syllable in syllables {
-            let start = pos;
-            let end = pos + syllable.len();
-            edges[start].push((end, syllable.clone()));
-            pos = end;
-        }
-
-        Self { edges, total_len }
+        Self::from_segmentations(&[syllables.to_vec()])
     }
 
     /// 获取从指定字节位置出发的所有边

@@ -4,13 +4,8 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 
 /// 基于词频的简单候选排序器
+#[derive(Default)]
 pub struct SimpleRanker;
-
-impl Default for SimpleRanker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 impl SimpleRanker {
     pub fn new() -> Self {

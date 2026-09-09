@@ -59,23 +59,11 @@ impl PinyinPreprocessor {
 
     /// 对拼音输入进行预处理，返回所有可能的变体
     pub fn preprocess(&self, input: &str) -> Vec<String> {
-        let mut results = Vec::new();
-
-        // 1. 原始输入
-        results.push(input.to_string());
-
-        // 2. 模糊音变体
-        let fuzzy_variants = self.generate_fuzzy_variants(input);
-        results.extend(fuzzy_variants);
-
-        // 3. 纠错变体
-        let correction_variants = self.generate_correction_variants(input);
-        results.extend(correction_variants);
-
-        // 去重
+        let mut results = vec![input.to_string()];
+        results.extend(self.generate_fuzzy_variants(input));
+        results.extend(self.generate_correction_variants(input));
         results.sort();
         results.dedup();
-
         results
     }
 
@@ -136,11 +124,7 @@ impl PinyinPreprocessor {
 
     /// 扩展简拼为可能的全拼组合
     /// 例如：zw -> ["zhongwen", "ziwen", "zhuangwang", ...]
-    pub fn expand_abbreviated(&self, abbreviated: &str) -> Vec<String> {
-        if abbreviated.is_empty() {
-            return Vec::new();
-        }
-
+    pub fn expand_abbreviated(&self, _abbreviated: &str) -> Vec<String> {
         // 这里返回空，因为完整扩展需要大量计算
         // 实际使用时应根据上下文智能扩展
         Vec::new()

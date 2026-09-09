@@ -1,13 +1,10 @@
 #[cfg(test)]
 use crate::RawEntry;
-use crate::punctuation::{QuotePair, convert_punctuation};
+use crate::punctuation::QuotePair;
+use crate::scheme_helpers;
 use crate::{
-    Codec, CodecState, Dictionary, GraphDecoder, InputScheme, LanguageModel, PinyinCodec,
-    PinyinPreprocessor, RimeDict, UserDictionary, global_user_dict, sort_candidates,
-};
-use black_hole_shared::candidate_layout::{
-    EXPANDED_AVAILABLE_WIDTH, GridDirection, digit_to_candidate_index_excluding,
-    navigate_grid_excluding,
+    Codec, CodecState, Dictionary, GraphDecoder, InputScheme, LanguageModel, PinyinCodec, RimeDict,
+    UserDictionary, global_user_dict, sort_candidates,
 };
 use black_hole_shared::{
     Candidate, CompletionHint, InputContext, KeyEvent, KeyState, SchemeId, SchemeResult,
@@ -25,8 +22,6 @@ pub struct PinyinScheme {
     codec: PinyinCodec,
     dictionary: Box<dyn Dictionary>,
     lm: LanguageModel,
-    #[allow(dead_code)]
-    preprocessor: PinyinPreprocessor,
     user_dict: Option<Arc<Mutex<UserDictionary>>>,
     /// 缓存用户词频（避免每次查询 SQLite）
     user_freq_cache: FxHashMap<String, i64>,
@@ -56,24 +51,7 @@ impl Default for PinyinScheme {
 
 impl PinyinScheme {
     pub fn new() -> Self {
-        let dict = RimeDict::from_builtin();
-        let lm = dict.build_language_model();
-        Self {
-            codec: PinyinCodec::new(),
-            dictionary: Box::new(dict),
-            lm,
-            preprocessor: PinyinPreprocessor::new(),
-            user_dict: None,
-            user_freq_cache: FxHashMap::default(),
-            last_query: None,
-            input_version: 0,
-            cached_version: 0,
-            expanded: false,
-            selected_index: 0,
-            completion: None,
-            english_buffer: None,
-            quote_pair: QuotePair::new(),
-        }
+        Self::with_dictionary(Arc::new(RimeDict::from_builtin()))
     }
 
     pub fn with_dictionary(dict: Arc<RimeDict>) -> Self {
@@ -82,7 +60,6 @@ impl PinyinScheme {
             codec: PinyinCodec::new(),
             dictionary: Box::new(dict),
             lm,
-            preprocessor: PinyinPreprocessor::new(),
             user_dict: None,
             user_freq_cache: FxHashMap::default(),
             last_query: None,
@@ -106,26 +83,15 @@ impl PinyinScheme {
         self.user_dict.clone().or_else(global_user_dict)
     }
 
-    /// 记录用户上屏，更新词频缓存和持久化存储
     fn record_user_commit(&mut self, text: &str) {
-        let code = self.codec.spaced_code();
-        if code.is_empty() || text == code {
-            return;
-        }
-        // 仅当 text 与当前编码精确匹配时才记录用户词频。
-        // 否则用户从前缀匹配结果中选择一个不完全匹配当前编码的词（如输入 shu 选择 shuo 的“说”）
-        // 会被错误地学习为 code -> text 映射，导致下次输入同一编码时首选错误的词。
-        let exact_match = self.dictionary.lookup(&code).iter().any(|c| c.text == text);
-        if !exact_match {
-            return;
-        }
-        if let Some(ref ud) = self.user_dict_ref() {
-            ud.lock()
-                .unwrap()
-                .record_commit(SchemeId::Pinyin, &code, text);
-            // 刷新缓存，下次查询时重新加载
-            self.user_freq_cache.remove(text);
-        }
+        scheme_helpers::record_user_commit(
+            &self.codec.spaced_code(),
+            text,
+            &*self.dictionary,
+            self.user_dict_ref(),
+            SchemeId::Pinyin,
+            &mut self.user_freq_cache,
+        );
     }
 
     fn current_candidates(&mut self) -> Vec<Candidate> {
@@ -134,7 +100,6 @@ impl PinyinScheme {
             self.codec.full_code()
         );
 
-        // 防御性清理：防止用户词频缓存无限增长
         if self.user_freq_cache.len() > 500 {
             self.user_freq_cache.clear();
         }
@@ -153,8 +118,8 @@ impl PinyinScheme {
 
         let mut candidates: Vec<Candidate> = Vec::new();
         let mut seen_texts = FxHashSet::default();
+        let mut acc = scheme_helpers::CandidateSet::new(&mut candidates, &mut seen_texts);
 
-        // === 核心流水线：音节图 → 词典检索 → 维特比解码 ===
         let graph = self.codec.syllable_graph();
         if graph.total_len() > 0 {
             let decoder = GraphDecoder::new(&*self.dictionary)
@@ -172,81 +137,42 @@ impl PinyinScheme {
             );
 
             for result in decode_results {
-                if seen_texts.insert(result.text.clone()) {
-                    let comment = if result.is_partial {
-                        Some("组合".to_string())
-                    } else {
-                        Some("整句".to_string())
-                    };
-                    candidates.push(Candidate {
-                        text: result.text,
-                        comment,
-                        score: (result.score * 100.0) as i64,
-                    });
-                }
+                let comment = if result.is_partial {
+                    Some("组合".to_string())
+                } else {
+                    Some("整句".to_string())
+                };
+                acc.push(result.text, (result.score * 100.0) as i64, comment);
             }
         }
 
-        // === 补充：空格分隔编码的前缀匹配 ===
         let prefix_query = if !spaced_code.is_empty() {
             &spaced_code
         } else {
-            // 当输入无法完成音节切分时（如第一个字符），直接用 full_code 回退查询
             &full_code
         };
         if !prefix_query.is_empty() {
-            let prefix_results = self.dictionary.prefix_lookup(prefix_query);
-            for cand in prefix_results {
-                if seen_texts.insert(cand.text.clone()) {
-                    candidates.push(Candidate {
-                        text: cand.text.clone(),
-                        comment: Some(prefix_query.clone()),
-                        score: cand.score,
-                    });
-                } else if let Some(existing) = candidates.iter_mut().find(|c| c.text == cand.text)
-                    && cand.score > existing.score
-                {
-                    existing.score = cand.score;
-                }
+            for cand in self.dictionary.prefix_lookup(prefix_query) {
+                acc.push_or_replace(cand.text, cand.score, Some(prefix_query.clone()));
             }
         }
 
-        // === 补充：简拼匹配 ===
         if !abbreviated.is_empty() && abbreviated.len() >= 2 {
-            let abbr_results = self.dictionary.prefix_lookup(&abbreviated);
-            for cand in abbr_results {
-                if seen_texts.insert(cand.text.clone()) {
-                    candidates.push(Candidate {
-                        text: cand.text.clone(),
-                        comment: Some(format!("简拼 {}", abbreviated)),
-                        score: cand.score / 2, // 简拼降权
-                    });
-                } else if let Some(existing) = candidates.iter_mut().find(|c| c.text == cand.text)
-                    && cand.score / 2 > existing.score
-                {
-                    existing.score = cand.score / 2;
-                }
+            for cand in self.dictionary.prefix_lookup(&abbreviated) {
+                acc.push_or_replace(
+                    cand.text,
+                    cand.score / 2,
+                    Some(format!("简拼 {}", abbreviated)),
+                );
             }
         }
 
-        // === 用户词典查询：将用户高频词合并到候选列表 ===
         if let Some(ref ud) = self.user_dict_ref() {
             let user_cands = ud.lock().unwrap().lookup(SchemeId::Pinyin, &spaced_code);
             for cand in user_cands {
-                // 更新词频缓存，供 GraphDecoder 的 user_bonus 使用
                 self.user_freq_cache.insert(cand.text.clone(), cand.score);
-                let user_boost = (cand.score * 50).min(3000) + 500;
-                if seen_texts.insert(cand.text.clone()) {
-                    candidates.push(Candidate {
-                        text: cand.text,
-                        comment: Some("用户".to_string()),
-                        score: user_boost,
-                    });
-                } else if let Some(existing) = candidates.iter_mut().find(|c| c.text == cand.text) {
-                    // 已存在则提升分数并标记为用户词
-                    existing.score += user_boost;
-                    existing.comment = Some("用户".to_string());
-                }
+                let boost = scheme_helpers::user_boost(cand.score);
+                acc.push_or_boost(cand.text, boost, Some("用户".to_string()));
             }
         }
 
@@ -259,7 +185,6 @@ impl PinyinScheme {
         // 输入完整切分时，字数等于音节数的候选额外优先
         sort_candidates(&mut candidates, syllable_count, is_fully_segmented);
 
-        // 更新缓存与版本号
         self.last_query = Some((full_code.clone(), candidates.clone()));
         self.cached_version = self.input_version;
 
@@ -275,19 +200,25 @@ impl PinyinScheme {
     /// 提交当前编码：优先返回当前选中的候选词，否则返回编码本身。
     fn commit_current_input(&mut self) -> String {
         let candidates = self.current_candidates();
-        let text = if candidates.is_empty() {
-            self.codec.full_code()
+        let text = if let Some(text) =
+            scheme_helpers::pick_candidate_text(&candidates, self.selected_index)
+        {
+            self.record_user_commit(&text);
+            text
         } else {
-            let idx = self.selected_index.min(candidates.len().saturating_sub(1));
-            candidates[idx].text.clone()
+            self.codec.full_code()
         };
-        self.record_user_commit(&text);
+        self.reset_codec_state();
+        self.last_query = None;
+        text
+    }
+
+    /// 重置输入编码与 UI 状态，但不触碰补全/英文缓冲等跨合成状态。
+    fn reset_codec_state(&mut self) {
         self.codec.reset();
         self.input_version += 1;
         self.expanded = false;
         self.selected_index = 0;
-        self.last_query = None;
-        text
     }
 }
 
@@ -307,72 +238,18 @@ impl InputScheme for PinyinScheme {
         }
 
         // 临时英文模式优先处理
-        if let Some(ref mut buffer) = self.english_buffer {
-            return match key.key.as_str() {
-                "Backspace" => {
-                    buffer.pop();
-                    if buffer.is_empty() {
-                        self.english_buffer = None;
-                        SchemeResult::Committed {
-                            text: "".to_string(),
-                            temporary_english: false,
-                        }
-                    } else {
-                        SchemeResult::Composing {
-                            code: buffer.clone(),
-                            candidates: vec![],
-                            selected_index: 0,
-                            expanded: false,
-                        }
-                    }
-                }
-                "Escape" => {
-                    self.english_buffer = None;
-                    SchemeResult::Cancelled
-                }
-                "Space" => {
-                    let text = format!("{} ", buffer);
-                    self.english_buffer = None;
-                    // 临时英文结束上屏：通知平台层锁定自动切换
-                    SchemeResult::Committed {
-                        text,
-                        temporary_english: true,
-                    }
-                }
-                "Enter" => {
-                    let text = buffer.clone();
-                    self.english_buffer = None;
-                    // 临时英文结束上屏：通知平台层锁定自动切换
-                    SchemeResult::Committed {
-                        text,
-                        temporary_english: true,
-                    }
-                }
-                _ => {
-                    let ch = match key.key.chars().next() {
-                        Some(c) if key.key.len() == 1 && c.is_ascii_alphabetic() => c,
-                        _ => return SchemeResult::Ignored,
-                    };
-                    buffer.push(ch);
-                    SchemeResult::Composing {
-                        code: buffer.clone(),
-                        candidates: vec![],
-                        selected_index: 0,
-                        expanded: false,
-                    }
-                }
-            };
+        if let Some(result) =
+            scheme_helpers::handle_temporary_english_key(&mut self.english_buffer, key)
+        {
+            return result;
         }
 
         let result = match key.key.as_str() {
             "Backspace" => {
                 if !self.codec.pop() {
-                    self.codec.reset();
-                    self.input_version += 1;
-                    self.expanded = false;
-                    self.selected_index = 0;
+                    self.reset_codec_state();
                     return SchemeResult::Committed {
-                        text: "".to_string(),
+                        text: String::new(),
                         temporary_english: false,
                     };
                 }
@@ -395,29 +272,22 @@ impl InputScheme for PinyinScheme {
                 if self.codec.full_code().is_empty() {
                     SchemeResult::Ignored
                 } else {
-                    self.codec.reset();
-                    self.input_version += 1;
-                    self.expanded = false;
-                    self.selected_index = 0;
+                    self.reset_codec_state();
                     self.last_query = None;
                     SchemeResult::Cancelled
                 }
             }
             "Space" => {
                 let candidates = self.current_candidates();
-                let text = if !candidates.is_empty() {
-                    let idx = self.selected_index.min(candidates.len().saturating_sub(1));
-                    candidates[idx].text.clone()
+                let text = if let Some(text) =
+                    scheme_helpers::pick_candidate_text(&candidates, self.selected_index)
+                {
+                    self.record_user_commit(&text);
+                    text
                 } else {
                     format!("{} ", self.codec.full_code())
                 };
-                if !candidates.is_empty() {
-                    self.record_user_commit(&text);
-                }
-                self.codec.reset();
-                self.input_version += 1;
-                self.expanded = false;
-                self.selected_index = 0;
+                self.reset_codec_state();
                 self.last_query = None;
                 SchemeResult::Committed {
                     text,
@@ -426,10 +296,7 @@ impl InputScheme for PinyinScheme {
             }
             "Enter" => {
                 let text = self.codec.full_code();
-                self.codec.reset();
-                self.input_version += 1;
-                self.expanded = false;
-                self.selected_index = 0;
+                self.reset_codec_state();
                 SchemeResult::Committed {
                     text,
                     temporary_english: false,
@@ -438,11 +305,11 @@ impl InputScheme for PinyinScheme {
             "Tab" => {
                 // 整句上屏：校验 LLM 补全仍匹配当前编码与选中项，匹配则拼入
                 let candidates = self.current_candidates();
-                if candidates.is_empty() {
+                let Some(base) =
+                    scheme_helpers::pick_candidate_text(&candidates, self.selected_index)
+                else {
                     return SchemeResult::Ignored;
-                }
-                let idx = self.selected_index.min(candidates.len().saturating_sub(1));
-                let base = candidates[idx].text.clone();
+                };
                 // 只记录选中词部分上屏词频，LLM 预测的补全部分不写入用户词典，
                 // 避免模型输出污染候选排序（须在 base 被 move 进 text 前记录）
                 self.record_user_commit(&base);
@@ -453,10 +320,7 @@ impl InputScheme for PinyinScheme {
                 } else {
                     base
                 };
-                self.codec.reset();
-                self.input_version += 1;
-                self.expanded = false;
-                self.selected_index = 0;
+                self.reset_codec_state();
                 self.last_query = None;
                 self.completion = None;
                 SchemeResult::Committed {
@@ -464,143 +328,38 @@ impl InputScheme for PinyinScheme {
                     temporary_english: false,
                 }
             }
-            "ArrowLeft" => {
+            "ArrowLeft" | "ArrowRight" | "ArrowDown" | "ArrowUp" => {
                 let candidates = self.current_candidates();
-                if candidates.is_empty() || !self.expanded {
-                    return SchemeResult::Ignored;
-                }
-                let Some(new_index) = navigate_grid_excluding(
-                    &candidates,
-                    self.selected_index,
-                    EXPANDED_AVAILABLE_WIDTH,
-                    GridDirection::Left,
-                    Some(0),
-                ) else {
-                    return SchemeResult::Ignored;
-                };
-                self.selected_index = new_index;
-                SchemeResult::Composing {
-                    code: self.codec.full_code(),
+                if let Some(result) = scheme_helpers::handle_arrow_key(
+                    &key.key,
+                    self.codec.full_code(),
                     candidates,
-                    selected_index: self.selected_index,
-                    expanded: self.expanded,
+                    &mut self.selected_index,
+                    &mut self.expanded,
+                ) {
+                    return result;
                 }
-            }
-            "ArrowRight" => {
-                let candidates = self.current_candidates();
-                if candidates.is_empty() || !self.expanded {
-                    return SchemeResult::Ignored;
-                }
-                let Some(new_index) = navigate_grid_excluding(
-                    &candidates,
-                    self.selected_index,
-                    EXPANDED_AVAILABLE_WIDTH,
-                    GridDirection::Right,
-                    Some(0),
-                ) else {
-                    return SchemeResult::Ignored;
-                };
-                self.selected_index = new_index;
-                SchemeResult::Composing {
-                    code: self.codec.full_code(),
-                    candidates,
-                    selected_index: self.selected_index,
-                    expanded: self.expanded,
-                }
-            }
-            "ArrowDown" => {
-                let candidates = self.current_candidates();
-                if candidates.is_empty() {
-                    return SchemeResult::Ignored;
-                }
-                if !self.expanded {
-                    self.expanded = true;
-                    if self.selected_index == 0 && candidates.len() > 1 {
-                        self.selected_index = 1;
-                    }
-                    return SchemeResult::Composing {
-                        code: self.codec.full_code(),
-                        candidates,
-                        selected_index: self.selected_index,
-                        expanded: self.expanded,
-                    };
-                }
-                let Some(new_index) = navigate_grid_excluding(
-                    &candidates,
-                    self.selected_index,
-                    EXPANDED_AVAILABLE_WIDTH,
-                    GridDirection::Down,
-                    Some(0),
-                ) else {
-                    return SchemeResult::Ignored;
-                };
-                self.selected_index = new_index;
-                SchemeResult::Composing {
-                    code: self.codec.full_code(),
-                    candidates,
-                    selected_index: self.selected_index,
-                    expanded: self.expanded,
-                }
-            }
-            "ArrowUp" => {
-                let candidates = self.current_candidates();
-                if candidates.is_empty() || !self.expanded {
-                    return SchemeResult::Ignored;
-                }
-                let Some(new_index) = navigate_grid_excluding(
-                    &candidates,
-                    self.selected_index,
-                    EXPANDED_AVAILABLE_WIDTH,
-                    GridDirection::Up,
-                    Some(0),
-                ) else {
-                    self.expanded = false;
-                    if self.selected_index != 0 {
-                        self.selected_index = 0;
-                    }
-                    return SchemeResult::Composing {
-                        code: self.codec.full_code(),
-                        candidates,
-                        selected_index: self.selected_index,
-                        expanded: self.expanded,
-                    };
-                };
-                self.selected_index = new_index;
-                SchemeResult::Composing {
-                    code: self.codec.full_code(),
-                    candidates,
-                    selected_index: self.selected_index,
-                    expanded: self.expanded,
-                }
+                SchemeResult::Ignored
             }
             "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
-                // 无编码输入时直接输出数字
-                if self.codec.code().is_empty() {
-                    return SchemeResult::Committed {
-                        text: key.key.clone(),
-                        temporary_english: false,
-                    };
-                }
-                let Ok(digit) = key.key.parse::<usize>() else {
-                    return SchemeResult::Ignored;
-                };
-                // 数字 0 不用于选择候选
-                if digit == 0 {
-                    return SchemeResult::Ignored;
-                }
+                let code = self.codec.code().to_string();
                 let candidates = self.current_candidates();
-                let Some(index) = digit_to_candidate_index_excluding(
+                match scheme_helpers::handle_digit_key(
+                    &code,
+                    key,
                     &candidates,
                     self.selected_index,
                     self.expanded,
-                    digit,
-                    Some(0),
-                ) else {
-                    return SchemeResult::Ignored;
-                };
-                self.expanded = false;
-                self.select_candidate(index)
-                    .unwrap_or(SchemeResult::Ignored)
+                ) {
+                    scheme_helpers::DigitKeyAction::Direct(result) => return result,
+                    scheme_helpers::DigitKeyAction::Select(index) => {
+                        self.expanded = false;
+                        return self
+                            .select_candidate(index)
+                            .unwrap_or(SchemeResult::Ignored);
+                    }
+                    scheme_helpers::DigitKeyAction::Ignore => SchemeResult::Ignored,
+                }
             }
             _ => {
                 if key.key.len() != 1 {
@@ -635,14 +394,10 @@ impl InputScheme for PinyinScheme {
                         }
                     }
                     CodecState::Rejected => {
-                        // 引号键启用配对（交替输出左右引号），其余标点直接转换
-                        let cn = if ch == '\'' || ch == '"' {
-                            self.quote_pair.next(ch, ctx.preceding_text.as_deref())
-                        } else {
-                            let Some(cn) = convert_punctuation(ch) else {
-                                return SchemeResult::Ignored;
-                            };
-                            cn
+                        let Some(cn) =
+                            scheme_helpers::convert_to_cn_punct(ch, &mut self.quote_pair, ctx)
+                        else {
+                            return SchemeResult::Ignored;
                         };
                         let committed = if self.codec.full_code().is_empty() {
                             String::new()
@@ -679,9 +434,7 @@ impl InputScheme for PinyinScheme {
         }
         let text = candidates[index].text.clone();
         self.record_user_commit(&text);
-        self.codec.reset();
-        self.expanded = false;
-        self.selected_index = 0;
+        self.reset_codec_state();
         self.last_query = None;
         Some(SchemeResult::Committed {
             text,

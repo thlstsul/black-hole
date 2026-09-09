@@ -47,7 +47,21 @@ pub trait LlmClient: Send + Sync {
 /// 同一协议同时覆盖本地（Ollama / llama.cpp / LM Studio）与云端服务。
 /// 使用 async + 可 abort 的 future：终止补全时取消任务即关闭底层连接，
 /// 网络请求本身不再发出/不再等待。
-pub struct HttpLlmClient;
+pub struct HttpLlmClient {
+    client: reqwest::Client,
+}
+
+impl HttpLlmClient {
+    pub fn new() -> Result<Self, String> {
+        let client = reqwest::Client::builder()
+            // 连接超时固定 15s：国内直连 api.deepseek.com 实测建连可耗时数秒，
+            // 过短会在连接阶段就误报超时。
+            .connect_timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|e| format!("HTTP 客户端构建失败: {}", e))?;
+        Ok(Self { client })
+    }
+}
 
 impl LlmClient for HttpLlmClient {
     fn complete(
@@ -80,31 +94,21 @@ impl LlmClient for HttpLlmClient {
                 prompt.len()
             );
 
-            // 分阶段超时：连接阶段短超时快速失败（DNS/建连），读取阶段用完整
-            // 配置超时——云端 LLM（如 DeepSeek）推理耗时可能数秒。reqwest 的
-            // `timeout` 是整体请求超时（含连接+读取），`connect_timeout` 单独
-            // 限制建连。连接超时不宜过短：国内直连 api.deepseek.com 实测建连
-            // 可耗时数秒，压到 5s 会在连接阶段就误报超时。
-            let read_timeout = Duration::from_millis(settings.timeout_ms);
-            let connect_timeout = read_timeout.min(Duration::from_secs(15));
-            let client = reqwest::Client::builder()
-                .connect_timeout(connect_timeout)
-                .timeout(read_timeout)
-                .build()
-                .map_err(|e| format!("HTTP 客户端构建失败: {}", e))?;
-
-            let mut request = client.post(&settings.endpoint).json(&body);
+            let mut request = self.client.post(&settings.endpoint).json(&body);
             if !settings.api_key.is_empty() {
                 request = request.bearer_auth(&settings.api_key);
             }
 
-            let response = request
-                .send()
+            // per-request 超时：reqwest Client 级 timeout 在构建时设为连接超时，
+            // 此处用 tokio::time::timeout 包裹发送与响应体读取两个阶段。
+            let read_timeout = Duration::from_millis(settings.timeout_ms);
+            let response = tokio::time::timeout(read_timeout, request.send())
                 .await
+                .map_err(|_| format!("LLM 请求超时（{}ms）", settings.timeout_ms))?
                 .map_err(|e| format!("LLM 请求失败: {}", describe_llm_error(&e, &settings)))?;
-            let value: serde_json::Value = response
-                .json()
+            let value: serde_json::Value = tokio::time::timeout(read_timeout, response.json())
                 .await
+                .map_err(|_| format!("LLM 响应读取超时（{}ms）", settings.timeout_ms))?
                 .map_err(|e| format!("LLM 响应解析失败: {}", e))?;
 
             // 提取补全文本：只取标准 content（兼容旧式 choices[0].text），
@@ -135,13 +139,9 @@ impl LlmClient for HttpLlmClient {
 /// 构造 LLM 提示词：优先利用光标前文作为句意上下文，再要求续写选中词。
 /// 前文为空时退化为仅基于选中词的提示。
 fn build_prompt(req: &CompletionRequest) -> String {
-    let context = match (&req.preceding_text, &req.following_text) {
-        (Some(pre), Some(post)) => format!("{}【{}】{}", pre, req.selected_text, post),
-        (Some(pre), None) => format!("{}【{}】", pre, req.selected_text),
-        (None, Some(post)) => format!("【{}】{}", req.selected_text, post),
-        (None, None) => format!("【{}】", req.selected_text),
-    };
-    format!("光标处文本是：{}", context)
+    let pre = req.preceding_text.as_deref().unwrap_or("");
+    let post = req.following_text.as_deref().unwrap_or("");
+    format!("光标处文本是：{}【{}】{}", pre, req.selected_text, post)
 }
 
 /// 清理 LLM 返回：去首尾空白与前导标点；若结果以选中词开头（模型重复了种子）
@@ -300,12 +300,7 @@ pub fn run_completion_worker(
         let settings = config.lock().unwrap().clone();
         if !settings.enabled {
             // 未启用：清空两侧旧补全，避免残留 ghost text
-            let _ = engine_tx.send(EngineCommand::UpdateCompletion(None));
-            let _ = ui_render_tx.send(UiCommand::Completion {
-                code: req.code.clone(),
-                selected_index: req.selected_index,
-                text: None,
-            });
+            clear_completion(&engine_tx, &ui_render_tx, &req);
             continue;
         }
 
@@ -332,6 +327,20 @@ pub fn run_completion_worker(
     }
 }
 
+/// 清空引擎/UI 两侧补全状态（无补全或失败时复用）
+fn clear_completion(
+    engine_tx: &mpsc::Sender<EngineCommand>,
+    ui_render_tx: &mpsc::Sender<UiCommand>,
+    req: &CompletionRequest,
+) {
+    let _ = engine_tx.send(EngineCommand::UpdateCompletion(None));
+    let _ = ui_render_tx.send(UiCommand::Completion {
+        code: req.code.clone(),
+        selected_index: req.selected_index,
+        text: None,
+    });
+}
+
 /// 将请求结果经引擎/UI 双通道回传（调用方已确保 seq 未过期）
 fn deliver_result(
     engine_tx: &mpsc::Sender<EngineCommand>,
@@ -339,44 +348,33 @@ fn deliver_result(
     req: CompletionRequest,
     result: Result<Option<String>, String>,
 ) {
-    match result {
-        Ok(Some(text)) => {
-            debug!("completion worker: result='{}'", text);
-            let hint = CompletionHint {
-                code: req.code.clone(),
-                selected_index: req.selected_index,
-                text: text.clone(),
-            };
-            let _ = engine_tx.send(EngineCommand::UpdateCompletion(Some(hint)));
-            let _ = ui_render_tx.send(UiCommand::Completion {
-                code: req.code.clone(),
-                selected_index: req.selected_index,
-                text: Some(text),
-            });
-        }
+    let text = match result {
+        Ok(Some(text)) => text,
         Ok(None) => {
-            // 模型返回空：视为无补全
             debug!(
                 "completion worker: empty result for code='{}' text='{}'",
                 req.code, req.selected_text
             );
-            let _ = engine_tx.send(EngineCommand::UpdateCompletion(None));
-            let _ = ui_render_tx.send(UiCommand::Completion {
-                code: req.code.clone(),
-                selected_index: req.selected_index,
-                text: None,
-            });
+            return clear_completion(engine_tx, ui_render_tx, &req);
         }
         Err(e) => {
             warn!("LLM completion failed: {}", e);
-            let _ = engine_tx.send(EngineCommand::UpdateCompletion(None));
-            let _ = ui_render_tx.send(UiCommand::Completion {
-                code: req.code.clone(),
-                selected_index: req.selected_index,
-                text: None,
-            });
+            return clear_completion(engine_tx, ui_render_tx, &req);
         }
-    }
+    };
+
+    debug!("completion worker: result='{}'", text);
+    let hint = CompletionHint {
+        code: req.code.clone(),
+        selected_index: req.selected_index,
+        text: text.clone(),
+    };
+    let _ = engine_tx.send(EngineCommand::UpdateCompletion(Some(hint)));
+    let _ = ui_render_tx.send(UiCommand::Completion {
+        code: req.code.clone(),
+        selected_index: req.selected_index,
+        text: Some(text),
+    });
 }
 
 #[cfg(test)]
