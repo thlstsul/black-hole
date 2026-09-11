@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{E_FAIL, POINT, RECT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::TextServices::{
-    ITfComposition, ITfContext, ITfEditSession, ITfEditSession_Impl, ITfRange, TF_ANCHOR_END,
-    TF_ANCHOR_START, TF_DEFAULT_SELECTION, TF_SELECTION,
+    ITfComposition, ITfContext, ITfContextView, ITfEditSession, ITfEditSession_Impl, ITfRange,
+    TF_ANCHOR_END, TF_ANCHOR_START, TF_DEFAULT_SELECTION, TF_SELECTION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
@@ -161,6 +161,16 @@ pub(crate) fn truncate_for_log(text: &str) -> &str {
     &text[start..]
 }
 
+/// 取文本范围在屏幕上的矩形（`ITfContextView::GetTextExt`）；
+/// 失败（应用无文本视图/范围失效）返回 None。
+fn text_ext(ec: u32, view: &ITfContextView, range: &ITfRange) -> Option<RECT> {
+    let mut rect = RECT::default();
+    let mut clipped = BOOL(0);
+    unsafe { view.GetTextExt(ec, range, &mut rect, &mut clipped) }
+        .is_ok()
+        .then_some(rect)
+}
+
 /// Get the screen coordinates of the current caret position.
 ///
 /// Uses a three-layer fallback strategy:
@@ -187,44 +197,57 @@ pub(crate) fn get_caret_position(
     if hr.is_ok() && fetched > 0 {
         let range_opt = unsafe { mem::ManuallyDrop::take(&mut sel_buf[0].range) };
         if let Some(range) = range_opt
-            && let Ok(context_view) = unsafe { ctx.GetActiveView() }
+            && let Ok(view) = unsafe { ctx.GetActiveView() }
+            && let Some(rect) = text_ext(ec, &view, &range)
         {
-            let mut rect = RECT::default();
-            let mut clipped = BOOL(0);
-            let hr = unsafe { context_view.GetTextExt(ec, &range, &mut rect, &mut clipped) };
-            if hr.is_ok() {
-                return Ok((rect.left, rect.bottom, rect.bottom - rect.top));
-            }
+            return Ok((rect.left, rect.bottom, rect.bottom - rect.top));
         }
     }
 
     // Layer 2: Composition range fallback
     if let Some(comp) = composition
         && let Ok(range) = unsafe { comp.GetRange() }
-        && let Ok(context_view) = unsafe { ctx.GetActiveView() }
+        && let Ok(view) = unsafe { ctx.GetActiveView() }
     {
         if let Ok(collapsed) = unsafe { range.Clone() } {
-            unsafe {
-                let _ = collapsed.Collapse(ec, TF_ANCHOR_END);
-                let mut rect = RECT::default();
-                let mut clipped = BOOL(0);
-                let hr = context_view.GetTextExt(ec, &collapsed, &mut rect, &mut clipped);
-                if hr.is_ok() {
-                    return Ok((rect.left, rect.bottom, rect.bottom - rect.top));
-                }
+            let _ = unsafe { collapsed.Collapse(ec, TF_ANCHOR_END) };
+            if let Some(rect) = text_ext(ec, &view, &collapsed) {
+                return Ok((rect.left, rect.bottom, rect.bottom - rect.top));
             }
         }
-
-        let mut rect = RECT::default();
-        let mut clipped = BOOL(0);
-        let hr = unsafe { context_view.GetTextExt(ec, &range, &mut rect, &mut clipped) };
-        if hr.is_ok() {
+        if let Some(rect) = text_ext(ec, &view, &range) {
             return Ok((rect.right, rect.bottom, rect.bottom - rect.top));
         }
     }
 
     // Layer 3: GetGUIThreadInfo (last resort)
     get_caret_position_via_gui_thread_info()
+}
+
+/// 候选窗锚点位置。
+///
+/// 合成期间固定取合成串**起点**坐标：候选窗应在整个合成期间保持稳定，而
+/// `set_caret_to_range_end` 会把选区移到合成串末尾，且每次按键 `SetText` 与
+/// `SetSelection` 之间触发的布局回调会让选区处于过渡态，若直接跟随选区，
+/// 候选窗会在每次按键时移动/抖动。合成串起点不随编码增长而变化，也与应用
+/// 是否跟踪选区无关。无可用合成时退回光标位置。
+pub(crate) fn get_candidate_position(
+    ec: u32,
+    ctx: &ITfContext,
+    composition: Option<&ITfComposition>,
+) -> Result<(i32, i32, i32)> {
+    if let Some(comp) = composition
+        && let Ok(range) = unsafe { comp.GetRange() }
+        && let Ok(start) = unsafe { range.Clone() }
+        && let Ok(view) = unsafe { ctx.GetActiveView() }
+    {
+        let _ = unsafe { start.Collapse(ec, TF_ANCHOR_START) };
+        if let Some(rect) = text_ext(ec, &view, &start) {
+            return Ok((rect.left, rect.bottom, rect.bottom - rect.top));
+        }
+    }
+
+    get_caret_position(ec, ctx, composition)
 }
 
 /// Get caret position via `GetGUIThreadInfo` Windows API.
@@ -279,7 +302,7 @@ impl ITfEditSession_Impl for LayoutChangeEditSession_Impl {
         let comp = inner.composition.as_ref().cloned();
         drop(inner);
 
-        if let Ok((caret_x, caret_y, caret_h)) = get_caret_position(ec, &ctx, comp.as_ref()) {
+        if let Ok((caret_x, caret_y, caret_h)) = get_candidate_position(ec, &ctx, comp.as_ref()) {
             let mut inner = self.inner_arc.lock().unwrap();
             inner.last_caret_pos = Some((caret_x, caret_y, caret_h));
             drop(inner);

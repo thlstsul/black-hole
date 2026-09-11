@@ -1,4 +1,4 @@
-use super::caret::{get_caret_position, get_caret_position_via_gui_thread_info};
+use super::caret::get_candidate_position;
 use super::service::BlackHoleTextService;
 use super::{ServiceInner, send_ui_command_inner};
 use black_hole_shared::{InputContext, SchemeResult, UiCommand};
@@ -7,10 +7,32 @@ use std::slice;
 use std::sync::{Arc, Mutex};
 use windows::Win32::UI::TextServices::{
     ITfCompositionSink, ITfContext, ITfContextComposition, ITfEditSession, ITfEditSession_Impl,
-    ITfInsertAtSelection, ITfSource, ITfTextLayoutSink, TF_AE_NONE, TF_ANCHOR_END, TF_ES_READWRITE,
-    TF_ES_SYNC, TF_IAS_QUERYONLY, TF_SELECTION, TF_SELECTIONSTYLE,
+    ITfInsertAtSelection, ITfRange, ITfSource, ITfTextLayoutSink, TF_AE_NONE, TF_ANCHOR_END,
+    TF_ES_READWRITE, TF_ES_SYNC, TF_IAS_QUERYONLY, TF_SELECTION, TF_SELECTIONSTYLE,
 };
 use windows_core::{BOOL, Interface, Result, implement};
+
+/// 把选区（插入光标）折叠到 `range` 末尾。
+///
+/// 文本写入后必须显式重设选区：TSF 规范上 range 会随 `SetText` 自动增长，
+/// 但部分文本存储（如记事本使用的 RichEdit）不会跟踪更早设置的选区端点，
+/// 光标会停留在新写入文本之前。每处写入文本后调用本函数，保证光标始终位于
+/// 已输入内容之后，与应用实现无关。
+fn set_caret_to_range_end(ec: u32, ctx: &ITfContext, range: &ITfRange) {
+    let Ok(caret) = (unsafe { range.Clone() }) else {
+        return;
+    };
+    let _ = unsafe { caret.Collapse(ec, TF_ANCHOR_END) };
+    let mut sel = TF_SELECTION {
+        range: mem::ManuallyDrop::new(Some(caret)),
+        style: TF_SELECTIONSTYLE {
+            ase: TF_AE_NONE,
+            fInterimChar: BOOL(0),
+        },
+    };
+    let _ = unsafe { ctx.SetSelection(ec, slice::from_ref(&sel)) };
+    let _ = unsafe { mem::ManuallyDrop::take(&mut sel.range) };
+}
 
 /// Apply the engine result to TSF and the UI.
 pub(crate) fn apply_result(
@@ -74,15 +96,8 @@ pub(crate) fn apply_result(
                     }
                 }
 
-                let mut sel = TF_SELECTION {
-                    range: mem::ManuallyDrop::new(Some(range)),
-                    style: TF_SELECTIONSTYLE {
-                        ase: TF_AE_NONE,
-                        fInterimChar: BOOL(0),
-                    },
-                };
-                unsafe { ctx.SetSelection(ec, slice::from_ref(&sel))? };
-                let _ = unsafe { mem::ManuallyDrop::take(&mut sel.range) };
+                // 光标位置在下方写入编码后由 set_caret_to_range_end 统一设置，
+                // 此处无需先设一次空选区（合成串为空时随后即结束合成）。
             }
 
             if code.is_empty() {
@@ -110,28 +125,19 @@ pub(crate) fn apply_result(
             if let Some(range) = range {
                 let text: Vec<u16> = code.encode_utf16().collect();
                 unsafe { range.SetText(ec, 0, &text)? };
+                set_caret_to_range_end(ec, ctx, &range);
             }
 
-            let caret_pos = if need_start {
-                match get_caret_position_via_gui_thread_info() {
-                    Ok(pos) => Some(pos),
-                    Err(_) => {
-                        let inner = inner_arc.lock().unwrap();
-                        let comp = inner.composition.as_ref();
-                        match get_caret_position(ec, ctx, comp) {
-                            Ok(pos) => Some(pos),
-                            Err(_) => inner.last_caret_pos,
-                        }
-                    }
-                }
-            } else {
+            // 候选窗锚点：合成期间固定取合成串起点（见 get_candidate_position），
+            // 使窗口不随编码增长而移动；取不到时退回缓存位置
+            // （get_caret_position 内部已含 GUI 线程光标兜底）。
+            let (composition, cached_caret) = {
                 let inner = inner_arc.lock().unwrap();
-                let comp = inner.composition.as_ref();
-                match get_caret_position(ec, ctx, comp) {
-                    Ok(pos) => Some(pos),
-                    Err(_) => inner.last_caret_pos,
-                }
+                (inner.composition.clone(), inner.last_caret_pos)
             };
+            let caret_pos = get_candidate_position(ec, ctx, composition.as_ref())
+                .ok()
+                .or(cached_caret);
 
             if let Some((caret_x, caret_y, caret_h)) = caret_pos {
                 let mut inner = inner_arc.lock().unwrap();
@@ -177,6 +183,8 @@ pub(crate) fn apply_result(
                     // 使用 QUERYONLY 获取插入点 range（避免 NOQUERY 返回空指针导致 Drop 时崩溃）
                     let range = unsafe { insert.InsertTextAtSelection(ec, TF_IAS_QUERYONLY, &[])? };
                     unsafe { range.SetText(ec, 0, &utf16)? };
+                    // 数字/符号等无合成直插路径同样需把光标移到插入文本末尾
+                    set_caret_to_range_end(ec, ctx, &range);
                     Ok(())
                 })();
                 // 直插文本（无合成）：文档已变化，一并清空光标位置并作废缓存
@@ -191,20 +199,7 @@ pub(crate) fn apply_result(
                 let utf16: Vec<u16> = text.encode_utf16().collect();
                 unsafe { range.SetText(ec, 0, &utf16)? };
                 let _ = unsafe { composition.EndComposition(ec) };
-
-                let Ok(collapsed) = (unsafe { range.Clone() }) else {
-                    return Ok(());
-                };
-                let _ = unsafe { collapsed.Collapse(ec, TF_ANCHOR_END) };
-                let mut sel = TF_SELECTION {
-                    range: mem::ManuallyDrop::new(Some(collapsed)),
-                    style: TF_SELECTIONSTYLE {
-                        ase: TF_AE_NONE,
-                        fInterimChar: BOOL(0),
-                    },
-                };
-                let _ = unsafe { ctx.SetSelection(ec, slice::from_ref(&sel)) };
-                let _ = unsafe { mem::ManuallyDrop::take(&mut sel.range) };
+                set_caret_to_range_end(ec, ctx, &range);
                 Ok(())
             })();
             {
