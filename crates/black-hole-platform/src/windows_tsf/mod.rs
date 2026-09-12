@@ -30,8 +30,8 @@ use windows_core::{GUID, Interface, PCWSTR, w};
 
 use super::{PlatformError, PlatformIme};
 use black_hole_shared::{
-    AutoModeSwitch, EngineCommand, InputModeSwitch, KeyEvent, RuntimeSettings, SchemeId,
-    SchemeResult, Theme, UiCommand,
+    AutoModeSwitch, EngineCommand, InputModeSwitch, KeyEvent, ModeSuggestion, RuntimeSettings,
+    SchemeId, SchemeResult, Theme, UiCommand,
 };
 
 pub mod auto_register;
@@ -126,8 +126,8 @@ pub(crate) struct IpcConnection {
 /// 供钩子路径手动切换（hook.rs）作锁定基线。
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ContextSample {
-    /// 语境建议（None=无信号或读取失败）。
-    pub(crate) suggestion: Option<bool>,
+    /// 语境建议（Neutral=无信号或读取失败）。
+    pub(crate) suggestion: ModeSuggestion,
     /// 采样时的 TSF 焦点线程 id（FOREGROUND_TID 快照）：多进程应用（WebView2
     /// 等）中 GetForegroundWindow 不可靠，窗口身份以焦点线程为锚。
     pub(crate) focus_tid: Option<u32>,
@@ -235,7 +235,7 @@ impl ServiceInner {
     /// "旧文本+新版本"的错位，钩子路径的版本门控会空真通过或误拒。
     pub(crate) fn record_context_sample(
         &mut self,
-        suggestion: Option<bool>,
+        suggestion: ModeSuggestion,
         focus_tid: Option<u32>,
         caret_pos: Option<(i32, i32, i32)>,
         version: u64,

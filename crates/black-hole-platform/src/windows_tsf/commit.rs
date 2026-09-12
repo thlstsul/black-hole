@@ -158,20 +158,20 @@ pub(crate) fn apply_result(
             text,
             temporary_english,
         } => {
-            // 临时英文结束上屏后，以英文为基线锁定自动切换，避免紧随其后的
-            // 中→英自动切换把用户拉入全英文模式（临时英文的本意是停留在中文
-            // 模式、随时再弹英文）。临时英文上屏文本为纯 ASCII 字母（方案层
-            // 只接受 is_ascii_alphabetic），Space 结束路径可带一个尾部空格
-            // （suggest_input_mode 的信号扫描会跳过空白），故上屏后语境必为
-            // 英文，直接以 Some(true) 作基线，无需回读文档（回读可能取到
-            // 上屏前的陈旧文本）。基线为英文：同英文语境的中→英建议被抑制
-            // （保持中文），用户移动光标到非英文语境后 evaluate 自动解锁、
-            // 恢复自动切换。
-            // 与取 composition 共用一次加锁（lock_manual 是纯字段写，AutoModeSwitch 为 Copy）。
+            // 临时英文/原样上屏英文编码结束上屏后，抑制紧随其后的一次中→英
+            // 自动切换：上屏文本立即使语境变为英文，若无抑制，用户敲下的下
+            // 一个字母会在合成开始前被中→英自动切换拉进英文模式直输（临时
+            // 英文/原样上屏的本意是停留在中文模式、随时再弹英文）。
+            // 用单次抑制而非持久锁定——持久锁定在英文语境（如 IDE）持续存在
+            // 时会吞掉后续所有自动切换，使功能整体失效。
+            // 仅在自动切换开启时武装：开关关闭期间 evaluate 不会被调用，
+            // 抑制标志无法被消费，武装会产生滞留状态（日后开启自动切换时
+            // 误吞一次无关的切换评估）。
+            // 与取 composition 共用一次加锁（suppress_next_zh_to_en 是纯字段写）。
             let composition = {
                 let mut inner = inner_arc.lock().unwrap();
-                if *temporary_english {
-                    inner.auto_mode.lock_manual(Some(true));
+                if *temporary_english && inner.auto_switch {
+                    inner.auto_mode.suppress_next_zh_to_en();
                 }
                 inner.composition.take()
             };

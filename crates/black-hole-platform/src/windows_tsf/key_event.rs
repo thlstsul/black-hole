@@ -6,7 +6,9 @@ use super::commit::apply_result;
 use super::hook::focused_thread_id;
 use super::{ServiceInner, try_reconnect_ipc};
 use crate::ipc::{IpcRequest, read_response, send_request};
-use black_hole_shared::{InputContext, KeyEvent, KeyState, Modifiers, suggest_input_mode};
+use black_hole_shared::{
+    InputContext, KeyEvent, KeyState, ModeSuggestion, Modifiers, suggest_input_mode,
+};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -313,7 +315,8 @@ fn handle_key_event_internal(
             service.lock().unwrap().record_context_sample(
                 surrounding
                     .as_ref()
-                    .and_then(|(p, f)| suggest_input_mode(p.as_deref(), f.as_deref())),
+                    .map(|(p, f)| suggest_input_mode(p.as_deref(), f.as_deref()))
+                    .unwrap_or(ModeSuggestion::Neutral),
                 focused_thread_id(),
                 last_caret_pos,
                 entry_version,

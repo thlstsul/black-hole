@@ -16,7 +16,7 @@ use super::hook::focused_thread_id;
 use super::key_event::context_changed;
 use super::service::apply_input_mode_toggle;
 use super::{ServiceInner, send_ui_command_inner};
-use black_hole_shared::{UiCommand, suggest_input_mode};
+use black_hole_shared::{ModeSuggestion, UiCommand, suggest_input_mode};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 use windows::Win32::UI::TextServices::{
@@ -45,7 +45,7 @@ pub(crate) fn suggest_from_surrounding_text(
     ec: u32,
     ctx: &ITfContext,
     composition: Option<&ITfComposition>,
-) -> (Option<bool>, bool) {
+) -> (ModeSuggestion, bool) {
     let (preceding, following, store_available) = read_surrounding_text(ec, ctx, composition);
     let suggestion = suggest_input_mode(preceding.as_deref(), following.as_deref());
     debug!(
@@ -150,8 +150,8 @@ impl ITfEditSession_Impl for AutoSwitchEditSession_Impl {
 #[implement(ITfEditSession)]
 pub(crate) struct SuggestionReadSession {
     pub(crate) inner_arc: Arc<Mutex<ServiceInner>>,
-    /// 采样结果输出：当前语境建议（None=无信号或读取失败）。
-    pub(crate) suggestion: Arc<Mutex<Option<bool>>>,
+    /// 采样结果输出：当前语境建议（Neutral=无信号或读取失败）。
+    pub(crate) suggestion: Arc<Mutex<ModeSuggestion>>,
 }
 
 impl ITfEditSession_Impl for SuggestionReadSession_Impl {

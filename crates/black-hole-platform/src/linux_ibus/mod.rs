@@ -4,8 +4,8 @@
 //! channel 与引擎线程通信处理按键，并通过 `black_hole_ui` 显示候选窗口。
 
 use black_hole_shared::{
-    AutoModeSwitch, EngineCommand, InputContext, InputModeSwitch, KeyEvent, KeyState, Modifiers,
-    RuntimeSettings, SchemeResult, UiCommand, suggest_input_mode,
+    AutoModeSwitch, EngineCommand, InputContext, InputModeSwitch, KeyEvent, KeyState,
+    ModeSuggestion, Modifiers, RuntimeSettings, SchemeResult, UiCommand, suggest_input_mode,
 };
 use std::future::pending;
 use std::sync::mpsc::{Receiver, Sender};
@@ -268,14 +268,15 @@ impl IbusEngine {
             } => {
                 // 已上屏，清空记录的编码，避免切换模式时重复上屏
                 *self.last_code.lock().unwrap() = None;
-                // 临时英文结束上屏后，以英文为基线锁定自动切换，避免紧随其后的
-                // 中→英自动切换把用户拉入全英文模式（与 Windows 侧一致）。
-                // 临时英文上屏文本为纯 ASCII 字母，Space 结束路径可带一个尾部
-                // 空格（suggest_input_mode 的信号扫描会跳过空白），故上屏后语境
-                // 必为英文，直接以 Some(true) 作基线，无需回读（缓存语境可能是
-                // 上屏前文本）。
-                if temporary_english {
-                    self.auto_mode.lock().unwrap().lock_manual(Some(true));
+                // 临时英文/原样上屏英文编码结束上屏后，抑制紧随其后的一次中→英
+                // 自动切换：上屏文本立即使语境变为英文，若无抑制，用户敲下的
+                // 下一个字母会在合成开始前被中→英自动切换拉进英文模式直输
+                // （与 Windows 侧一致）。用单次抑制而非持久锁定——持久锁定在
+                // 英文语境（如 IDE）持续存在时会吞掉后续所有自动切换，使功能
+                // 整体失效。仅在自动切换开启时武装：开关关闭期间 evaluate
+                // 不会被调用，武装会产生滞留状态（日后开启时误吞一次无关评估）。
+                if temporary_english && self.current_settings.lock().unwrap().auto_switch {
+                    self.auto_mode.lock().unwrap().suppress_next_zh_to_en();
                 }
                 // 发送 CommitText DBus 信号
                 let ibus_text = (text.as_str(), Vec::<(u32, u32, u32, u32)>::new());

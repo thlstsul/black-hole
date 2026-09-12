@@ -102,9 +102,10 @@ pub enum SchemeResult {
     },
     Committed {
         text: String,
-        /// 本次上屏是否为"临时英文模式"（按住 Shift/CapsLock 输入的英文）的结束上屏。
-        /// 为 true 时，平台层在英文语境下应锁定自动切换，
-        /// 避免上屏后立即被自动切换拉回英文/中文。
+        /// 本次上屏是否为"临时英文"性质：包括临时英文模式（按住 Shift/CapsLock
+        /// 输入的英文）的结束上屏，以及中文模式下原样上屏英文编码（Enter /
+        /// 无候选 Space，上屏文本为键盘输入的 ASCII 串）。为 true 时，平台层
+        /// 在英文语境下应锁定自动切换，避免上屏后立即被自动切换拉回英文/中文。
         temporary_english: bool,
     },
     /// 用户取消输入（Esc / cancel 绑定）：平台层须结束进行中的合成（清空
@@ -177,34 +178,92 @@ impl InputModeSwitch {
     }
 }
 
-/// 根据光标周围文本推断目标输入模式。true=英文，false=中文，None=无信号保持现状。
+/// 语境输入模式建议：根据光标周围文本推断。
 ///
-/// 前文从末尾向前逐字符扫描，跳过 Unicode 空白与 ASCII 标点，命中的第一个
-/// 强信号字符决定结果：ASCII 字母或数字 → 英文；CJK 字符或中文标点 → 中文；
-/// 其它字符（如 emoji、其它文字）视为中性继续向前。前文无强信号时，再对
-/// 后文从头向后做同样扫描；均无强信号则返回 None。
-pub fn suggest_input_mode(preceding: Option<&str>, following: Option<&str>) -> Option<bool> {
-    preceding
-        .and_then(|text| scan_mode_signal(text.chars().rev()))
-        .or_else(|| following.and_then(|text| scan_mode_signal(text.chars())))
+/// [`suggest_input_mode`] 的返回值。英文/中文为强信号；数字与无信号
+/// 都是"不动作"的中立结果，但语义不同——数字语境（[`ModeSuggestion::DigitsOnly`]）
+/// 中英文输入都会出现，任何模式下都不触发自动切换；纯无信号
+/// （[`ModeSuggestion::Neutral`]，空白文档/读取失败等）在英文模式下
+/// 默认回切中文，避免自动切换产生的英文状态"粘住"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModeSuggestion {
+    /// 英文强信号：光标周围最近的强信号字符是 ASCII 字母
+    English,
+    /// 中文强信号：光标周围最近的强信号字符是 CJK 字符或中文标点
+    Chinese,
+    /// 数字弱中性：扫描路径上出现过 ASCII 数字但无强信号。
+    /// 数字不认定为英文，也不触发英→中默认回切——用户在英文模式下
+    /// 输入 `123` 不应被切回中文。
+    DigitsOnly,
+    /// 无信号：空白/无上下文/文本读取失败。英文模式下默认回切中文
+    /// （见 [`AutoModeSwitch::evaluate`]）。作为 Default 对应"无采样"
+    /// 语境（与旧 Option<bool> 的 None 语义一致）。
+    #[default]
+    Neutral,
 }
 
-/// 逐字符扫描强信号：ASCII 字母/数字 → 英文；CJK 字符/中文标点 → 中文；
-/// 空白、ASCII 标点与其它中性字符（emoji、其它文字等）跳过。
-fn scan_mode_signal(chars: impl Iterator<Item = char>) -> Option<bool> {
+/// 根据光标周围文本推断目标输入模式。
+///
+/// 前文从末尾向前逐字符扫描，跳过 Unicode 空白、ASCII 标点与 ASCII 数字
+/// （数字中性：中英文语境都会出现，不构成切换信号），命中的第一个强信号
+/// 字符决定结果：ASCII 字母 → [`ModeSuggestion::English`]；CJK 字符或中文
+/// 标点 → [`ModeSuggestion::Chinese`]；其它字符（如 emoji、其它文字）视为
+/// 中性继续向前。前文无强信号时，再对后文从头向后做同样扫描；均无强信号
+/// 时，任一侧扫描路径上出现过数字则返回 [`ModeSuggestion::DigitsOnly`]，
+/// 否则返回 [`ModeSuggestion::Neutral`]。
+pub fn suggest_input_mode(preceding: Option<&str>, following: Option<&str>) -> ModeSuggestion {
+    let preceding_result = preceding
+        .map(|text| scan_mode_signal(text.chars().rev()))
+        .unwrap_or(ModeSuggestion::Neutral);
+    match preceding_result {
+        ModeSuggestion::English | ModeSuggestion::Chinese => preceding_result,
+        // 前文无强信号：后文从头扫描，强信号优先于前文的数字弱中性
+        _ => {
+            let following_result = following
+                .map(|text| scan_mode_signal(text.chars()))
+                .unwrap_or(ModeSuggestion::Neutral);
+            match following_result {
+                ModeSuggestion::English | ModeSuggestion::Chinese => following_result,
+                _ => {
+                    if preceding_result == ModeSuggestion::DigitsOnly
+                        || following_result == ModeSuggestion::DigitsOnly
+                    {
+                        ModeSuggestion::DigitsOnly
+                    } else {
+                        ModeSuggestion::Neutral
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 逐字符扫描强信号：ASCII 字母 → 英文；CJK 字符/中文标点 → 中文；
+/// 空白与 ASCII 标点跳过；ASCII 数字记录为弱中性后继续扫描。
+/// 扫描结束仍无强信号时：路径上出现过数字 → DigitsOnly，否则 Neutral。
+fn scan_mode_signal(chars: impl Iterator<Item = char>) -> ModeSuggestion {
+    let mut saw_digit = false;
     for ch in chars {
         if ch.is_whitespace() || ch.is_ascii_punctuation() {
             continue;
         }
-        if ch.is_ascii_alphanumeric() {
-            return Some(true);
+        if ch.is_ascii_digit() {
+            saw_digit = true;
+            continue;
+        }
+        if ch.is_ascii_alphabetic() {
+            return ModeSuggestion::English;
         }
         if is_cjk_or_zh_punct(ch) {
-            return Some(false);
+            return ModeSuggestion::Chinese;
         }
         // 中性字符：继续扫描
     }
-    None
+    if saw_digit {
+        ModeSuggestion::DigitsOnly
+    } else {
+        ModeSuggestion::Neutral
+    }
 }
 
 /// 是否 CJK 字符或中文标点（全角字符）
@@ -219,34 +278,56 @@ fn is_cjk_or_zh_punct(ch: char) -> bool {
 
 /// 根据光标周围文本自动切换中英模式的状态机。
 ///
-/// 配合 [`suggest_input_mode`] 使用：平台层在语境变化时调用 `evaluate`，
+/// 配合 [`ModeSuggestion`] 使用：平台层在语境变化时调用 `evaluate`，
 /// 返回 Some(target) 表示应自动切换；用户手动切换后调用 `lock_manual`
 /// 并传入手动切换时刻评估的当前语境建议作为锁定基线，锁定期间同语境的
 /// 建议不再撤销用户选择，语境变化后自动解锁、恢复自动切换。
+/// 临时英文/原样上屏英文编码后调用 `suppress_next_zh_to_en`，仅抑制
+/// 紧随其后的一次中→英自动切换（单次抑制，不产生持久锁定）。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct AutoModeSwitch {
     /// None=未锁定；Some(b)=已锁定，b 为锁定时语境基线
-    locked_baseline: Option<Option<bool>>,
+    locked_baseline: Option<ModeSuggestion>,
+    /// 单次抑制标志：置位后下一次"中文模式 + 英文建议"的中→英评估被吞掉
+    /// 一次并自动复位
+    suppress_zh_to_en_once: bool,
 }
 
 impl AutoModeSwitch {
     /// 评估一次建议；返回 Some(target) 表示应自动切换到 target（true=英文）。
-    pub fn evaluate(&mut self, suggestion: Option<bool>, current_english: bool) -> Option<bool> {
-        // 已锁定：语境未变（建议等于基线）则保持锁定不动作；
-        // 语境已变则解除锁定，继续向下正常评估。
+    pub fn evaluate(&mut self, suggestion: ModeSuggestion, current_english: bool) -> Option<bool> {
+        // 已锁定：语境未变（建议等于基线）则保持锁定不动作（抑制标志不被
+        // 无效评估消费）；语境已变则解除锁定，继续向下正常评估。
         if let Some(baseline) = self.locked_baseline {
             if suggestion == baseline {
                 return None;
             }
             self.locked_baseline = None;
         }
+        // 单次抑制：临时英文/原样上屏英文编码后，上屏文本本身使语境变为
+        // 英文，紧随其后的首次中→英评估应被吞掉（否则用户刚起的拼音合成
+        // 会在首键就被拉进英文模式直输）。仅在真正吞掉一次中→英切换时
+        // 消费复位；语境明确变为中文时提前解除（抑制已无意义）。
+        if self.suppress_zh_to_en_once {
+            match suggestion {
+                ModeSuggestion::English if !current_english => {
+                    self.suppress_zh_to_en_once = false;
+                    return None;
+                }
+                ModeSuggestion::Chinese => self.suppress_zh_to_en_once = false,
+                _ => {}
+            }
+        }
         match suggestion {
-            Some(target) if target != current_english => Some(target),
-            // 无信号（空白文档、新文件、文本读取失败等中立语境）：当前为英文时
-            // 默认回到中文，避免自动切换产生的英文状态在中立语境"粘住"
-            // （表现为新开文档/切换进程后默认英文）。手动 Ctrl 切到英文
-            // 由 lock_manual 锁定保护，不受此规则影响。
-            None if current_english => Some(false),
+            ModeSuggestion::English if !current_english => Some(true),
+            ModeSuggestion::Chinese if current_english => Some(false),
+            // 纯无信号（空白文档、新文件、文本读取失败等中立语境）：当前为
+            // 英文时默认回到中文，避免自动切换产生的英文状态在中立语境
+            // "粘住"（表现为新开文档/切换进程后默认英文）。手动 Ctrl 切到
+            // 英文由 lock_manual 锁定保护；数字语境（DigitsOnly）是弱中性，
+            // 中英文输入都会出现，不受此规则影响——英文模式下输入 `123`
+            // 不应被切回中文。
+            ModeSuggestion::Neutral if current_english => Some(false),
             _ => None,
         }
     }
@@ -254,8 +335,19 @@ impl AutoModeSwitch {
     /// 用户手动切换后调用：以手动切换时刻评估的当前语境建议作为锁定基线。
     /// 必须即时采样传入（而非复用旧评估结果），否则用户移动到其它语境后
     /// 手动切换会以陈旧基线锁定，下个按键即被自动切换撤销。
-    pub fn lock_manual(&mut self, current_suggestion: Option<bool>) {
+    /// 手动锁定覆盖单次抑制（用户明确的选择优先于上屏抑制）。
+    pub fn lock_manual(&mut self, current_suggestion: ModeSuggestion) {
         self.locked_baseline = Some(current_suggestion);
+        self.suppress_zh_to_en_once = false;
+    }
+
+    /// 临时英文 / 中文模式下原样上屏英文编码（Enter / 无候选 Space）结束后
+    /// 调用：仅抑制紧随其后的一次中→英自动切换。上屏的英文文本会使语境
+    /// 立即变为英文，若无抑制，用户敲下的下一个字母会在合成开始前触发
+    /// 中→英自动切换、被拉进英文模式直输。单次抑制而非持久锁定——持久
+    /// 锁定在英文语境（如 IDE）持续存在时会吞掉后续所有自动切换。
+    pub fn suppress_next_zh_to_en(&mut self) {
+        self.suppress_zh_to_en_once = true;
     }
 }
 
@@ -684,49 +776,113 @@ mod tests {
 
     #[test]
     fn suggest_preceding_chinese_returns_chinese() {
-        assert_eq!(suggest_input_mode(Some("你好"), None), Some(false));
+        assert_eq!(
+            suggest_input_mode(Some("你好"), None),
+            ModeSuggestion::Chinese
+        );
     }
 
     #[test]
     fn suggest_preceding_english_trailing_space_returns_english() {
         // 末尾空格跳过，命中 'd' → 英文
-        assert_eq!(suggest_input_mode(Some("hello world "), None), Some(true));
+        assert_eq!(
+            suggest_input_mode(Some("hello world "), None),
+            ModeSuggestion::English
+        );
     }
 
     #[test]
     fn suggest_preceding_chinese_punct_returns_chinese() {
         // 中文标点（全角逗号）是中文信号
-        assert_eq!(suggest_input_mode(Some("你好，"), None), Some(false));
+        assert_eq!(
+            suggest_input_mode(Some("你好，"), None),
+            ModeSuggestion::Chinese
+        );
     }
 
     #[test]
     fn suggest_blank_preceding_falls_back_to_following() {
         // 前文仅空白无信号，扫描后文命中英文
-        assert_eq!(suggest_input_mode(Some("   "), Some("abc")), Some(true));
+        assert_eq!(
+            suggest_input_mode(Some("   "), Some("abc")),
+            ModeSuggestion::English
+        );
     }
 
     #[test]
     fn suggest_no_signal_returns_none() {
-        assert_eq!(suggest_input_mode(None, None), None);
-        assert_eq!(suggest_input_mode(Some("  \t "), None), None);
-        assert_eq!(suggest_input_mode(Some(" "), Some("  ")), None);
+        assert_eq!(suggest_input_mode(None, None), ModeSuggestion::Neutral);
+        assert_eq!(
+            suggest_input_mode(Some("  \t "), None),
+            ModeSuggestion::Neutral
+        );
+        assert_eq!(
+            suggest_input_mode(Some(" "), Some("  ")),
+            ModeSuggestion::Neutral
+        );
     }
 
     #[test]
     fn suggest_preceding_alnum_returns_english() {
-        assert_eq!(suggest_input_mode(Some("abc123"), None), Some(true));
+        // 从末尾向前扫：数字中性跳过，命中 'c'（字母）→ 英文
+        assert_eq!(
+            suggest_input_mode(Some("abc123"), None),
+            ModeSuggestion::English
+        );
+    }
+
+    #[test]
+    fn suggest_preceding_digits_only_is_neutral() {
+        // 纯数字无强信号 → DigitsOnly（数字不认定为英文，不触发切换）
+        assert_eq!(
+            suggest_input_mode(Some("123"), None),
+            ModeSuggestion::DigitsOnly
+        );
+        assert_eq!(
+            suggest_input_mode(Some(" 42 "), None),
+            ModeSuggestion::DigitsOnly
+        );
+    }
+
+    #[test]
+    fn suggest_digits_skip_to_chinese_signal() {
+        // 数字跳过后命中 CJK → 中文（数字不吞掉中文信号）
+        assert_eq!(
+            suggest_input_mode(Some("章节3"), None),
+            ModeSuggestion::Chinese
+        );
+    }
+
+    #[test]
+    fn suggest_digits_before_following_signal() {
+        // 前文纯数字（弱中性）、后文命中字母：强信号优先于数字弱中性
+        assert_eq!(
+            suggest_input_mode(Some("123"), Some("abc")),
+            ModeSuggestion::English
+        );
+        // 两侧都只有数字：DigitsOnly
+        assert_eq!(
+            suggest_input_mode(Some("12"), Some("34")),
+            ModeSuggestion::DigitsOnly
+        );
     }
 
     #[test]
     fn suggest_preceding_mixed_chinese_returns_chinese() {
         // 从末尾向前扫：空格跳过，命中 '章'（CJK）→ 中文
-        assert_eq!(suggest_input_mode(Some("第 3 章 "), None), Some(false));
+        assert_eq!(
+            suggest_input_mode(Some("第 3 章 "), None),
+            ModeSuggestion::Chinese
+        );
     }
 
     #[test]
     fn suggest_neutral_chars_are_skipped() {
         // 末尾空格跳过、emoji 中性跳过，命中 'o' → 英文
-        assert_eq!(suggest_input_mode(Some("hello 🎉 "), None), Some(true));
+        assert_eq!(
+            suggest_input_mode(Some("hello 🎉 "), None),
+            ModeSuggestion::English
+        );
     }
 
     // ------------------------------------------------------------------
@@ -737,12 +893,22 @@ mod tests {
     fn auto_unlocked_switches_on_different_suggestion() {
         let mut sw = AutoModeSwitch::default();
         // 建议与当前不同 → 自动切换
-        assert_eq!(sw.evaluate(Some(true), false), Some(true));
-        assert_eq!(sw.evaluate(Some(false), true), Some(false));
+        assert_eq!(sw.evaluate(ModeSuggestion::English, false), Some(true));
+        assert_eq!(sw.evaluate(ModeSuggestion::Chinese, true), Some(false));
         // 建议与当前相同 → 不动作
-        assert_eq!(sw.evaluate(Some(true), true), None);
-        // 无建议 → 不动作
-        assert_eq!(sw.evaluate(None, false), None);
+        assert_eq!(sw.evaluate(ModeSuggestion::English, true), None);
+        // 数字弱中性 / 无信号且当前为中文 → 不动作
+        assert_eq!(sw.evaluate(ModeSuggestion::DigitsOnly, false), None);
+        assert_eq!(sw.evaluate(ModeSuggestion::Neutral, false), None);
+    }
+
+    #[test]
+    fn auto_digits_only_never_switches() {
+        let mut sw = AutoModeSwitch::default();
+        // 数字弱中性在英文模式下不触发英→中默认回切（用户输入 123 不被打断）
+        assert_eq!(sw.evaluate(ModeSuggestion::DigitsOnly, true), None);
+        // 中文模式下也不触发中→英切换（数字不认定为英文）
+        assert_eq!(sw.evaluate(ModeSuggestion::DigitsOnly, false), None);
     }
 
     #[test]
@@ -750,37 +916,89 @@ mod tests {
         let mut sw = AutoModeSwitch::default();
 
         // 用户在英文语境（建议=英文，当前已是英文）下手动切换
-        assert_eq!(sw.evaluate(Some(true), true), None);
-        sw.lock_manual(Some(true));
+        assert_eq!(sw.evaluate(ModeSuggestion::English, true), None);
+        sw.lock_manual(ModeSuggestion::English);
 
         // 锁定生效：同语境建议不再撤销用户选择（当前中文也不自动切回英文）
-        assert_eq!(sw.evaluate(Some(true), false), None);
+        assert_eq!(sw.evaluate(ModeSuggestion::English, false), None);
 
         // 语境变化（建议变为中文）→ 解锁；建议与当前相同，不动作
-        assert_eq!(sw.evaluate(Some(false), false), None);
+        assert_eq!(sw.evaluate(ModeSuggestion::Chinese, false), None);
 
         // 已解锁：恢复自动切换
-        assert_eq!(sw.evaluate(Some(true), false), Some(true));
+        assert_eq!(sw.evaluate(ModeSuggestion::English, false), Some(true));
     }
 
     #[test]
     fn auto_no_signal_defaults_back_to_chinese_when_english() {
         let mut sw = AutoModeSwitch::default();
         // 中立语境（无信号）且当前为英文 → 默认回到中文
-        assert_eq!(sw.evaluate(None, true), Some(false));
+        assert_eq!(sw.evaluate(ModeSuggestion::Neutral, true), Some(false));
         // 中立语境且当前为中文 → 保持中文不动作
-        assert_eq!(sw.evaluate(None, false), None);
+        assert_eq!(sw.evaluate(ModeSuggestion::Neutral, false), None);
+    }
+
+    #[test]
+    fn auto_suppress_only_first_zh_to_en_after_commit() {
+        let mut sw = AutoModeSwitch::default();
+
+        // 上屏英文编码后置位单次抑制：紧随其后的首次中→英评估被吞掉
+        sw.suppress_next_zh_to_en();
+        assert_eq!(sw.evaluate(ModeSuggestion::English, false), None);
+
+        // 抑制已消费（单次）：后续中→英自动切换恢复正常
+        assert_eq!(sw.evaluate(ModeSuggestion::English, false), Some(true));
+
+        // 再上屏一次：再次抑制一次，之后恢复
+        sw.suppress_next_zh_to_en();
+        assert_eq!(sw.evaluate(ModeSuggestion::English, false), None);
+        assert_eq!(sw.evaluate(ModeSuggestion::English, false), Some(true));
+    }
+
+    #[test]
+    fn auto_suppress_cleared_on_manual_lock_and_chinese_context() {
+        let mut sw = AutoModeSwitch::default();
+
+        // 置位抑制后语境变为中文：抑制提前解除（已无意义）
+        sw.suppress_next_zh_to_en();
+        assert_eq!(sw.evaluate(ModeSuggestion::Chinese, false), None);
+        // 解除后中→英自动切换不再受影响
+        assert_eq!(sw.evaluate(ModeSuggestion::English, false), Some(true));
+
+        // 置位抑制后用户手动切换：手动锁定覆盖抑制
+        sw.suppress_next_zh_to_en();
+        sw.lock_manual(ModeSuggestion::English);
+        // 锁定生效（同语境建议不动作），且抑制已被清除：
+        // 语境变化解锁后立即恢复自动切换
+        assert_eq!(sw.evaluate(ModeSuggestion::English, false), None);
+        assert_eq!(sw.evaluate(ModeSuggestion::Chinese, false), None);
+        assert_eq!(sw.evaluate(ModeSuggestion::English, false), Some(true));
+    }
+
+    #[test]
+    fn auto_suppress_keeps_manual_lock_behavior() {
+        let mut sw = AutoModeSwitch::default();
+
+        // 手动锁定与单次抑制并存：手动锁定优先语义不受抑制影响
+        sw.lock_manual(ModeSuggestion::Chinese);
+        sw.suppress_next_zh_to_en();
+        // 锁定期间同语境建议不动作（锁定优先于抑制评估，抑制不被消费）
+        assert_eq!(sw.evaluate(ModeSuggestion::Chinese, true), None);
+        // 语境变化 → 解锁；中文模式下该英文建议触发的中→英评估被单次抑制吞掉
+        assert_eq!(sw.evaluate(ModeSuggestion::English, false), None);
+        // 抑制消费完毕：恢复正常自动切换
+        assert_eq!(sw.evaluate(ModeSuggestion::English, false), Some(true));
     }
 
     #[test]
     fn auto_manual_english_lock_survives_no_signal() {
         let mut sw = AutoModeSwitch::default();
-        // 用户在中立语境手动切到英文并锁定（基线 None）
-        sw.lock_manual(None);
+        // 用户在中立语境手动切到英文并锁定（基线 Neutral）
+        sw.lock_manual(ModeSuggestion::Neutral);
         // 同语境（无信号）不再撤销手动选择
-        assert_eq!(sw.evaluate(None, true), None);
+        assert_eq!(sw.evaluate(ModeSuggestion::Neutral, true), None);
         // 语境变化（出现中文信号）→ 解锁并切回中文
-        assert_eq!(sw.evaluate(Some(false), true), Some(false));
+        assert_eq!(sw.evaluate(ModeSuggestion::Chinese, true), Some(false));
     }
 
     #[test]
@@ -788,17 +1006,17 @@ mod tests {
         let mut sw = AutoModeSwitch::default();
 
         // 此前在英文语境评估过（建议=英文），随后用户移动到中文语境
-        assert_eq!(sw.evaluate(Some(true), true), None);
+        assert_eq!(sw.evaluate(ModeSuggestion::English, true), None);
         // 手动切换为英文：以手动切换时刻采样的当前语境（中文建议）为锁定基线
-        sw.lock_manual(Some(false));
+        sw.lock_manual(ModeSuggestion::Chinese);
 
         // 同语境（中文建议）不再撤销用户选择：保持英文不自动切回中文
-        assert_eq!(sw.evaluate(Some(false), true), None);
+        assert_eq!(sw.evaluate(ModeSuggestion::Chinese, true), None);
 
         // 语境变化（建议变为英文）→ 解锁；建议与当前相同，不动作
-        assert_eq!(sw.evaluate(Some(true), true), None);
+        assert_eq!(sw.evaluate(ModeSuggestion::English, true), None);
 
         // 已解锁：恢复自动切换
-        assert_eq!(sw.evaluate(Some(false), true), Some(false));
+        assert_eq!(sw.evaluate(ModeSuggestion::Chinese, true), Some(false));
     }
 }

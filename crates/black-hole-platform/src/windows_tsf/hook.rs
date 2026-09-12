@@ -343,10 +343,11 @@ fn on_ctrl_released() {
 #[cfg(test)]
 mod tests {
     use super::{ContextSample, cached_baseline_usable};
+    use black_hole_shared::ModeSuggestion;
 
     fn sample(focus_tid: Option<u32>, pos: Option<(i32, i32, i32)>, version: u64) -> ContextSample {
         ContextSample {
-            suggestion: Some(true),
+            suggestion: ModeSuggestion::English,
             focus_tid,
             caret_pos: pos,
             version,

@@ -290,27 +290,36 @@ impl InputScheme for ShuangpinScheme {
             }
             "Space" => {
                 let candidates = self.current_candidates();
-                let text = if let Some(text) =
+                let (text, temporary_english) = if let Some(text) =
                     scheme_helpers::pick_candidate_text(&candidates, self.selected_index)
                 {
                     self.record_user_commit(&text);
-                    text
+                    (text, false)
                 } else {
-                    format!("{} ", self.codec.code())
+                    // 无候选时原样上屏编码：这是键盘输入的英文串（方案编码仅
+                    // 由 ASCII 字母构成），上屏后语境必为英文。与 Enter 一样
+                    // 视为临时英文结束上屏，让平台层以英文为基线锁定自动切换，
+                    // 避免紧随其后的中→英自动切换把用户拉入全英文模式。
+                    // 空编码上屏（仅尾部空格）不锁定。
+                    let code = self.codec.code().to_string();
+                    (format!("{} ", code), !code.is_empty())
                 };
                 self.reset_codec_state();
                 self.last_query = None;
                 return SchemeResult::Committed {
                     text,
-                    temporary_english: false,
+                    temporary_english,
                 };
             }
             "Enter" => {
-                let text = self.codec.code().to_string();
+                // Enter 原样上屏编码：同无候选 Space，视为临时英文结束上屏，
+                // 让平台层以英文为基线锁定自动切换。空编码不锁定。
+                let code = self.codec.code().to_string();
+                let temporary_english = !code.is_empty();
                 self.reset_codec_state();
                 return SchemeResult::Committed {
-                    text,
-                    temporary_english: false,
+                    text: code,
+                    temporary_english,
                 };
             }
             "Tab" => {
@@ -879,6 +888,44 @@ mod tests {
             let texts: Vec<&str> = candidates.iter().map(|c| c.text.as_str()).collect();
             assert_eq!(initial_texts, texts, "导航 {} 后候选顺序发生变动", key);
         }
+    }
+
+    #[test]
+    fn test_raw_code_commit_flags_as_temporary_english() {
+        // 空词典：任何编码都无候选
+        let dict = build_dict(&[]);
+        let mut scheme = ShuangpinScheme::with_dictionary(Box::new(dict));
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 无候选 Space：原样上屏编码，视为临时英文性质上屏
+        for ch in ["u", "u"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let r = scheme.handle_key(&key_event("Space"), &ctx);
+        assert!(
+            matches!(r, SchemeResult::Committed { ref text, temporary_english: true } if text == "uu "),
+            "无候选 Space 原样上屏编码应标记 temporary_english=true，实际: {:?}",
+            r
+        );
+
+        // Enter：原样上屏编码，同样视为临时英文性质上屏
+        for ch in ["a", "a"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let r = scheme.handle_key(&key_event("Enter"), &ctx);
+        assert!(
+            matches!(r, SchemeResult::Committed { ref text, temporary_english: true } if text == "aa"),
+            "Enter 原样上屏编码应标记 temporary_english=true，实际: {:?}",
+            r
+        );
+
+        // 空编码按 Space：仅上屏空格，不视为临时英文
+        let r = scheme.handle_key(&key_event("Space"), &ctx);
+        assert!(
+            matches!(r, SchemeResult::Committed { ref text, temporary_english: false } if text == " "),
+            "空编码 Space 上屏不应标记 temporary_english，实际: {:?}",
+            r
+        );
     }
 
     #[test]

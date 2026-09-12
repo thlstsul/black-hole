@@ -9,7 +9,7 @@ use super::hook::{
 use super::key_event::{KeyHandlerEditSession, virtual_key_to_key_event};
 use super::langbar::BlackHoleLangBarItem;
 use super::{ServiceInner, ensure_ipc_connection, send_ui_command_inner};
-use black_hole_shared::{KeyEvent, KeyState, UiCommand};
+use black_hole_shared::{KeyEvent, KeyState, ModeSuggestion, UiCommand};
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -284,17 +284,19 @@ impl BlackHoleTextService {
 
     /// 采样当前语境建议：手动 Ctrl 切换时作为自动切换状态机的锁定基线。
     /// 通过同步只读编辑会话读取光标周围文本（TSF 文本存储取不到时按无信号
-    /// 处理，UIA 回退已移除），读取失败或无信号返回 None（None 基线下任一
-    /// 有效建议即视为语境变化，自动解锁恢复自动切换，不会困住手动选择）。
-    fn sample_current_suggestion(&self) -> Option<bool> {
+    /// 处理，UIA 回退已移除），读取失败或无信号返回 Neutral（Neutral 基线下
+    /// 任一有效建议即视为语境变化，自动解锁恢复自动切换，不会困住手动选择）。
+    fn sample_current_suggestion(&self) -> ModeSuggestion {
         let (ctx, client_id) = {
             let inner = self.inner.lock().unwrap();
             // remote/锁屏等场景下 GetFocus 为 null、context 未设置：无信号
-            let ctx = inner.context.clone()?;
-            (ctx, inner.client_id)
+            match inner.context.clone() {
+                Some(ctx) => (ctx, inner.client_id),
+                None => return ModeSuggestion::Neutral,
+            }
         };
 
-        let suggestion = Arc::new(Mutex::new(None));
+        let suggestion = Arc::new(Mutex::new(ModeSuggestion::Neutral));
         let session = SuggestionReadSession {
             inner_arc: self.inner.clone(),
             suggestion: suggestion.clone(),
@@ -305,7 +307,7 @@ impl BlackHoleTextService {
             unsafe { ctx.RequestEditSession(client_id, &edit_session, TF_ES_SYNC | TF_ES_READ) };
         if let Err(e) = hr {
             debug!("suggestion-read edit session request failed: {}", e);
-            return None;
+            return ModeSuggestion::Neutral;
         }
         *suggestion.lock().unwrap()
     }
