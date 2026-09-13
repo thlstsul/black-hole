@@ -33,6 +33,11 @@ pub enum PlatformError {
 /// 开机自启动管理（平台相关）
 pub mod auto_start;
 
+/// 系统明暗主题探测（UI 解析 `Theme::System` 与语言栏按钮共用）
+pub mod system_theme;
+
+pub use system_theme::system_uses_dark_mode;
+
 #[cfg(target_os = "windows")]
 pub mod ipc;
 

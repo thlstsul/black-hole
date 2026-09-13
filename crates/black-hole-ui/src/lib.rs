@@ -7,7 +7,7 @@ pub use candidate_window::run_candidate_window;
 use eframe::egui::Frame as EguiFrame;
 use eframe::egui::{
     Align, Color32, Context, CornerRadius, FontData, FontDefinitions, FontFamily, Label, Layout,
-    Margin, Pos2, Rect, RichText, ScrollArea, Ui, Vec2, ViewportBuilder, ViewportCommand, Visuals,
+    Margin, Pos2, Rect, RichText, ScrollArea, Ui, Vec2, ViewportBuilder, ViewportCommand,
 };
 use eframe::egui_wgpu::{WgpuSetup, WgpuSetupCreateNew};
 use eframe::run_native;
@@ -45,13 +45,7 @@ use winit::window::Window;
 mod candidate_window;
 pub mod settings_manager;
 pub mod settings_panel;
-
-pub fn theme_visuals(theme: Theme) -> Visuals {
-    match theme {
-        Theme::Dark | Theme::System => Visuals::dark(),
-        _ => Visuals::light(),
-    }
-}
+pub mod theme;
 
 /// 配置 egui 中文字体（加载系统字体作为 fallback）
 pub fn configure_fonts(ctx: &Context) {

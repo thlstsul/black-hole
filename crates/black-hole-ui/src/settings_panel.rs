@@ -3,10 +3,12 @@ use black_hole_shared::{KeyBindings, SchemeId, Settings, Theme};
 
 use crate::configure_fonts;
 use crate::settings_manager::SettingsManager;
-use crate::theme_visuals;
+use crate::theme;
 use crate::wgpu_configuration;
 use eframe::egui::emath::Numeric;
-use eframe::egui::{Context, DragValue, Margin, ScrollArea, Ui, ViewportBuilder, ViewportCommand};
+use eframe::egui::{
+    Context, DragValue, Margin, RichText, ScrollArea, Ui, ViewportBuilder, ViewportCommand, Visuals,
+};
 use eframe::{App, EventLoopBuilder, EventLoopBuilderHook, Frame, NativeOptions, run_native};
 #[cfg(target_os = "windows")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -26,8 +28,10 @@ use winit::platform::windows::EventLoopBuilderExtWindows;
 
 pub struct SettingsPanelApp {
     settings_mgr: SettingsManager,
-    last_theme: Theme,
-    feedback: Option<String>,
+    /// 已应用全局样式的主题（含 `System` 解析后的明暗）
+    applied_theme: Option<(Theme, bool)>,
+    /// 反馈文字与是否成功（成功用调色板的 success，失败用 error）
+    feedback: Option<(String, bool)>,
     feedback_timer: f64,
     /// 打开面板后强制窗口前台聚焦（Windows 前台锁需逐帧重试）
     focus_retries: u32,
@@ -35,10 +39,9 @@ pub struct SettingsPanelApp {
 
 impl SettingsPanelApp {
     pub fn new(settings_mgr: SettingsManager) -> Self {
-        let last_theme = settings_mgr.settings().theme;
         Self {
             settings_mgr,
-            last_theme,
+            applied_theme: None,
             feedback: None,
             feedback_timer: 0.0,
             focus_retries: 0,
@@ -51,7 +54,7 @@ impl SettingsPanelApp {
 
     fn show_feedback(&mut self, msg: impl Into<String>, ok: bool) {
         let icon = if ok { "✓" } else { "✗" };
-        self.feedback = Some(format!("{} {}", icon, msg.into()));
+        self.feedback = Some((format!("{} {}", icon, msg.into()), ok));
         self.feedback_timer = 3.0; // 显示 3 秒
     }
 
@@ -172,10 +175,7 @@ impl App for SettingsPanelApp {
         }
 
         let current_theme = self.settings_mgr.settings().theme;
-        if current_theme != self.last_theme {
-            ctx.set_visuals(theme_visuals(current_theme));
-            self.last_theme = current_theme;
-        }
+        theme::sync_visuals(&ctx, current_theme, &mut self.applied_theme);
 
         // 内容区：窗口固定大小，内容超出时可滚动；content_margin 提供四周内边距
         ScrollArea::vertical()
@@ -213,9 +213,15 @@ impl App for SettingsPanelApp {
                 });
 
                 // 显示反馈信息（3 秒自动消失）
-                if let Some(msg) = &self.feedback {
+                if let Some((msg, ok)) = &self.feedback {
                     ui.add_space(8.0);
-                    ui.label(msg);
+                    let palette = theme::palette(current_theme);
+                    let color = if *ok {
+                        palette.success_text
+                    } else {
+                        palette.error_text
+                    };
+                    ui.label(RichText::new(msg).color(color));
                     // egui 的 RequestRepaint 确保动画持续刷新
                     ctx.request_repaint();
                 }
@@ -227,6 +233,16 @@ impl App for SettingsPanelApp {
         }
 
         self.handle_close(&ctx);
+    }
+
+    /// 根 Ui 自身没有背景色，窗口底色完全由清屏色决定。
+    /// 取全局样式里的浮层底色（调色板的 base-100）；若沿用 eframe 的默认清屏色
+    /// （透明），在非透明视口上会被合成为黑色，浅色主题下正文几乎不可读。
+    ///
+    /// 返回值需为 gamma 空间的 0-1 值（egui 对 `App::clear_color` 的要求）。
+    /// 候选窗不能照搬，它靠透明清屏色呈现圆角，见 `candidate_window`。
+    fn clear_color(&self, visuals: &Visuals) -> [f32; 4] {
+        visuals.window_fill.to_normalized_gamma_f32()
     }
 }
 
@@ -420,8 +436,9 @@ pub fn run_settings_panel(settings_mgr: SettingsManager) {
         options,
         Box::new(|cc| {
             configure_fonts(&cc.egui_ctx);
-            cc.egui_ctx
-                .set_visuals(theme_visuals(settings_mgr.settings().theme));
+            cc.egui_ctx.set_visuals(theme::visuals(theme::palette(
+                settings_mgr.settings().theme,
+            )));
             Ok(Box::new(SettingsPanelApp::new(settings_mgr)))
         }),
     ) {

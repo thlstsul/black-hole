@@ -8,6 +8,7 @@
 use super::service::apply_input_mode_toggle;
 use super::{CLSID_BLACKHOLE_TIP, ServiceInner, send_ui_command_inner};
 use crate::auto_start::is_auto_start;
+use crate::system_theme::system_uses_dark_mode;
 use black_hole_shared::{SchemeId, Theme, UiCommand};
 use std::ffi::c_void;
 use std::mem;
@@ -25,10 +26,6 @@ use windows::Win32::Graphics::Gdi::{
     SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows::Win32::System::Registry::{
-    HKEY_CURRENT_USER, KEY_READ, REG_DWORD, REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW,
-    RegQueryValueExW,
-};
 use windows::Win32::UI::TextServices::{
     GUID_LBI_INPUTMODE, ITfLangBarItem, ITfLangBarItem_Impl, ITfLangBarItemButton,
     ITfLangBarItemButton_Impl, ITfLangBarItemSink, ITfMenu, ITfSource, ITfSource_Impl,
@@ -122,47 +119,6 @@ fn preferred_app_mode_for_theme(theme: Theme) -> i32 {
                 PREFERRED_APP_MODE_FORCE_LIGHT
             }
         }
-    }
-}
-
-/// 读取注册表判断系统是否处于暗色模式。
-fn system_uses_dark_mode() -> bool {
-    unsafe {
-        let path: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"
-            .encode_utf16()
-            .chain(Some(0))
-            .collect();
-        let value: Vec<u16> = "AppsUseLightTheme".encode_utf16().chain(Some(0)).collect();
-        let mut hkey = mem::zeroed();
-        if RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR(path.as_ptr()),
-            Some(0),
-            KEY_READ,
-            &mut hkey,
-        )
-        .is_err()
-        {
-            return false;
-        }
-
-        let mut data: u32 = 0;
-        let mut size = mem::size_of::<u32>() as u32;
-        let mut ty = REG_VALUE_TYPE(0);
-        let is_dark = RegQueryValueExW(
-            hkey,
-            PCWSTR(value.as_ptr()),
-            None,
-            Some(&mut ty),
-            Some(&mut data as *mut _ as *mut u8),
-            Some(&mut size),
-        )
-        .is_ok()
-            && ty == REG_DWORD
-            && data == 0;
-
-        let _ = RegCloseKey(hkey);
-        is_dark
     }
 }
 

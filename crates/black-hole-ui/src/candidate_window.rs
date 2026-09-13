@@ -57,37 +57,12 @@ impl Default for AppState {
     }
 }
 
-struct ThemeColors {
-    text_color: Color32,
-    bg_color: Color32,
-    highlight_color: Color32,
-    label_color: Color32,
-}
-
-fn theme_colors(theme: Theme) -> ThemeColors {
-    let (text_color, bg_color, label_color) = match theme {
-        Theme::Dark | Theme::System => (
-            Color32::from_rgb(240, 240, 240),
-            Color32::from_rgb(40, 40, 40),
-            Color32::from_rgb(160, 160, 160),
-        ),
-        _ => (
-            Color32::from_rgb(26, 26, 26),
-            Color32::from_rgb(245, 245, 245),
-            Color32::from_rgb(120, 120, 120),
-        ),
-    };
-    ThemeColors {
-        text_color,
-        bg_color,
-        highlight_color: Color32::from_rgb(0, 120, 215),
-        label_color,
-    }
-}
-
 pub struct ImeUiApp {
     state: Arc<Mutex<AppState>>,
     win_style_applied: bool,
+    /// 已应用全局样式的主题（含 `System` 解析后的明暗），仅在变化时重设：
+    /// 候选窗每次按键都会重绘，逐帧 `set_visuals` 会白白丢弃样式缓存。
+    applied_theme: Option<(Theme, bool)>,
 }
 
 impl ImeUiApp {
@@ -95,6 +70,7 @@ impl ImeUiApp {
         Self {
             state,
             win_style_applied: false,
+            applied_theme: None,
         }
     }
 }
@@ -129,11 +105,11 @@ impl App for ImeUiApp {
         let (desired_width, desired_height) = estimate_window_size(&state);
         position_window(&ctx, &state, frame, desired_width, desired_height);
 
-        let colors = theme_colors(state.theme);
-        ctx.set_visuals(theme_visuals(state.theme));
+        let colors = theme::palette(state.theme);
+        theme::sync_visuals(&ctx, state.theme, &mut self.applied_theme);
 
         EguiFrame::new()
-            .fill(colors.bg_color)
+            .fill(colors.base_100)
             .corner_radius(CornerRadius::same(10))
             .inner_margin(Margin::same(10))
             .show(ui, |ui| {
@@ -393,6 +369,9 @@ fn run_candidate_window_inner(
     #[cfg(not(target_os = "windows"))]
     let event_loop_builder: Option<EventLoopBuilderHook> = None;
 
+    // 注意：候选窗不要实现 `App::clear_color`（保持默认的透明），最终画面
+    // 靠应用透明视口 + `EguiFrame::corner_radius` 得到真正的圆角窗口；
+    // 一旦把清屏色改成不透明底色，圆角外区域会被填成方块。
     let options = NativeOptions {
         viewport: ViewportBuilder::default()
             .with_decorations(false)
@@ -526,7 +505,7 @@ fn render_first_row(
     state: &AppState,
     win: &[Candidate],
     win_selected: usize,
-    colors: &ThemeColors,
+    colors: &theme::Palette,
 ) {
     if win.is_empty() {
         return;
@@ -550,12 +529,12 @@ fn render_selected_block(
     selected: &Candidate,
     selected_font: f32,
     is_first: bool,
-    colors: &ThemeColors,
+    colors: &theme::Palette,
 ) {
     let (fill, text_color) = if is_first {
-        (colors.highlight_color, Color32::WHITE)
+        (colors.primary, colors.primary_content)
     } else {
-        (colors.bg_color, colors.text_color)
+        (colors.base_100, colors.base_content)
     };
     EguiFrame::new()
         .fill(fill)
@@ -575,7 +554,7 @@ fn render_selected_block(
 
 /// LLM 补全：仅当与当前编码及当前选中项一致时展示，避免异步错位；
 /// 始终以普通灰色显示（不在高亮块内）。
-fn render_completion(ui: &mut Ui, state: &AppState, selected_font: f32, colors: &ThemeColors) {
+fn render_completion(ui: &mut Ui, state: &AppState, selected_font: f32, colors: &theme::Palette) {
     if state.completion_code != state.code
         || state.completion_index != state.selected_index
         || state.completion.is_none()
@@ -587,7 +566,8 @@ fn render_completion(ui: &mut Ui, state: &AppState, selected_font: f32, colors: 
         Label::new(
             RichText::new(completion)
                 .size(selected_font)
-                .color(colors.text_color.gamma_multiply(0.45)),
+                // 比序号色（base_content_weak，0.6）更淡一档，避免补全文字被误读为候选
+                .color(colors.base_content.gamma_multiply(0.45)),
         )
         .selectable(false)
         .truncate(),
@@ -596,7 +576,7 @@ fn render_completion(ui: &mut Ui, state: &AppState, selected_font: f32, colors: 
         Label::new(
             RichText::new(&state.commit_sentence)
                 .size(11.0)
-                .color(colors.label_color),
+                .color(colors.base_content_weak),
         )
         .selectable(false),
     );
@@ -609,7 +589,7 @@ fn render_candidate_rows(
     state: &AppState,
     win: &[Candidate],
     win_selected: usize,
-    colors: &ThemeColors,
+    colors: &theme::Palette,
 ) {
     if win.len() <= 1 {
         return;
@@ -624,11 +604,15 @@ fn render_candidate_rows(
 }
 
 /// 一条候选项的高亮/普通配色：(文字色, 序号色, 背景色)
-fn item_colors(is_selected: bool, colors: &ThemeColors) -> (Color32, Color32, Option<Color32>) {
+fn item_colors(is_selected: bool, colors: &theme::Palette) -> (Color32, Color32, Option<Color32>) {
     if is_selected {
-        (Color32::WHITE, Color32::WHITE, Some(colors.highlight_color))
+        (
+            colors.primary_content,
+            colors.primary_content,
+            Some(colors.primary),
+        )
     } else {
-        (colors.text_color, colors.label_color, None)
+        (colors.base_content, colors.base_content_weak, None)
     }
 }
 
@@ -638,7 +622,7 @@ fn render_expanded_rows(
     win: &[Candidate],
     win_selected: usize,
     font_size: u32,
-    colors: &ThemeColors,
+    colors: &theme::Palette,
 ) {
     ScrollArea::vertical()
         .max_height(SCROLL_AREA_MAX_HEIGHT)
@@ -656,7 +640,7 @@ fn render_expanded_row(
     win: &[Candidate],
     win_selected: usize,
     font_size: u32,
-    colors: &ThemeColors,
+    colors: &theme::Palette,
 ) {
     let is_selected_row = row.contains(&win_selected);
     ui.horizontal(|ui| {
@@ -688,10 +672,10 @@ fn render_candidate_cell(
     is_selected: bool,
     show_label: bool,
     font_size: u32,
-    colors: &ThemeColors,
+    colors: &theme::Palette,
 ) -> eframe::egui::InnerResponse<()> {
     let (tc, lc, bg) = item_colors(is_selected, colors);
-    candidate_item_frame(ui, bg.unwrap_or(colors.bg_color), |ui| {
+    candidate_item_frame(ui, bg.unwrap_or(colors.base_100), |ui| {
         render_candidate_item(ui, col + 1, candidate, tc, lc, show_label, font_size);
     })
 }
@@ -701,7 +685,7 @@ fn render_collapsed_row(
     row: &[usize],
     win: &[Candidate],
     win_selected: usize,
-    colors: &ThemeColors,
+    colors: &theme::Palette,
     font_size: u32,
 ) {
     ui.horizontal(|ui| {
