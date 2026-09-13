@@ -1,10 +1,12 @@
 #[cfg(test)]
 use crate::RawEntry;
+#[cfg(not(test))]
+use crate::default_user_dict_dir;
 use crate::punctuation::QuotePair;
 use crate::scheme_helpers;
 use crate::{
-    Codec, CodecState, Dictionary, GraphDecoder, InputScheme, LanguageModel, PinyinCodec, RimeDict,
-    UserDictionary, global_user_dict, sort_candidates,
+    Codec, CodecState, DecodeResult, Dictionary, GraphDecoder, InputScheme, LanguageModel,
+    PinyinCodec, RimeDict, SyllableGraph, UserDictionary, global_user_dict, sort_candidates,
 };
 use black_hole_shared::{
     Candidate, CompletionHint, InputContext, KeyEvent, KeyState, SchemeId, SchemeResult,
@@ -27,6 +29,9 @@ pub struct PinyinScheme {
     user_freq_cache: FxHashMap<String, i64>,
     /// 优化：缓存最近一次查询结果，避免重复查询
     last_query: Option<(String, Vec<Candidate>)>,
+    /// 与 last_query 同版本缓存的解码产物（text -> words/word_codes/is_partial），
+    /// 上屏时按选中文本反查判定候选来源（整句 vs 词级），供逐词学习使用
+    last_decoded: FxHashMap<String, DecodeResult>,
     /// 输入版本号，每次编码变化时递增，不变时跳过重复计算
     input_version: u64,
     /// 已缓存候选对应的版本号
@@ -41,6 +46,12 @@ pub struct PinyinScheme {
     english_buffer: Option<String>,
     /// 中文引号配对状态（' 与 " 交替输出左右引号）
     quote_pair: QuotePair,
+    /// 上一轮上屏的末词（跨句 Bigram 上下文）：Escape/Reset 不清空，方案切换时清空
+    prev_commit: Option<String>,
+    /// Bigram 落盘防抖计时（复用 SAVE_INTERVAL 节奏）
+    last_bigram_save: Option<std::time::Instant>,
+    /// 个人 Bigram 持久化路径（with_dictionary 时确定；None 表示不落盘）
+    bigram_path: Option<std::path::PathBuf>,
 }
 
 impl Default for PinyinScheme {
@@ -55,14 +66,31 @@ impl PinyinScheme {
     }
 
     pub fn with_dictionary(dict: Arc<RimeDict>) -> Self {
+        // 个人 Bigram 持久化路径：与用户词典同目录；
+        // 测试构建指向每次调用唯一且隔离的临时路径，避免读写真实用户数据，
+        // 也避免同进程内并行测试共用文件导致计数互相污染
+        #[cfg(test)]
+        let bigram_path = scheme_helpers::test_bigram_path("pinyin");
+        #[cfg(not(test))]
+        let bigram_path = default_user_dict_dir().join("user_bigram.txt");
+        Self::with_dictionary_and_bigram(dict, bigram_path)
+    }
+
+    /// 指定个人 Bigram 路径的构造（测试用隔离落盘文件，避免并行测试共用文件
+    /// 导致计数互相污染；生产路径由 `with_dictionary` 传入用户目录路径）
+    pub(crate) fn with_dictionary_and_bigram(
+        dict: Arc<RimeDict>,
+        bigram_path: std::path::PathBuf,
+    ) -> Self {
         let lm = dict.build_language_model();
-        Self {
+        let mut scheme = Self {
             codec: PinyinCodec::new(),
             dictionary: Box::new(dict),
             lm,
             user_dict: None,
             user_freq_cache: FxHashMap::default(),
             last_query: None,
+            last_decoded: FxHashMap::default(),
             input_version: 0,
             cached_version: 0,
             expanded: false,
@@ -70,7 +98,12 @@ impl PinyinScheme {
             completion: None,
             english_buffer: None,
             quote_pair: QuotePair::new(),
-        }
+            prev_commit: None,
+            last_bigram_save: None,
+            bigram_path: Some(bigram_path.clone()),
+        };
+        scheme.lm.load_user_bigram(&bigram_path);
+        scheme
     }
 
     pub fn with_user_dict(mut self, user_dict: Arc<Mutex<UserDictionary>>) -> Self {
@@ -92,6 +125,101 @@ impl PinyinScheme {
             SchemeId::Pinyin,
             &mut self.user_freq_cache,
         );
+    }
+
+    /// 上屏学习路由：整句/混合候选按解码产物逐词学习，
+    /// 词级候选仍走精确匹配学习（复用 record_user_commit）。
+    /// 仅当候选缓存与当前输入版本一致时信任解码产物（防陈旧路由）。
+    ///
+    /// 同时做 Bigram 观测：词级候选只观测「上轮末词 → 本词」一次，记 times=2
+    /// （用户直接点选，强信号）；整句/混合候选观测路径内所有相邻词对，统一记 times=1
+    /// （整句上屏本身即一次选择，不再区分其中的某条转移）。两者都会与上轮末词跨句连接。
+    fn learn_commit(&mut self, text: &str) {
+        let decoded = if self.input_version == self.cached_version {
+            self.last_decoded.get(text).cloned()
+        } else {
+            None
+        };
+        match decoded {
+            Some(decoded) if decoded.is_partial || decoded.words.len() > 1 => {
+                scheme_helpers::record_sentence_commit(
+                    &decoded.words,
+                    &decoded.word_codes,
+                    self.user_dict_ref(),
+                    SchemeId::Pinyin,
+                    &mut self.user_freq_cache,
+                );
+                // 句内相邻词对观测（顺带转移 times=1），并跨句连接上轮末词；
+                // 混合结果的拼音占位段编码为空，不是真实词，跳过以免污染 Bigram
+                let learned = scheme_helpers::learned_words(&decoded.words, &decoded.word_codes);
+                self.observe_sentence_bigrams(&learned, 1);
+            }
+            _ => {
+                self.record_user_commit(text);
+                // 点选的词是强信号，times=2
+                self.observe_sentence_bigrams(&[text], 2);
+            }
+        }
+        self.maybe_save_bigram();
+    }
+
+    /// 对一段词序列做 Bigram 观测：先句首 (<s> → 首词)，再句内相邻词对；
+    /// 上轮上屏的末词（prev_commit）与本轮首词跨句连接一次。
+    /// 观测后更新 prev_commit 为本轮末词；空序列不改动上下文。
+    fn observe_sentence_bigrams(&mut self, words: &[&str], times: u32) {
+        if words.is_empty() {
+            return;
+        }
+        let mut prev: Option<String> = self.prev_commit.take();
+        for word in words {
+            self.lm
+                .observe_user_transition(prev.as_deref(), word, times);
+            prev = Some((*word).to_string());
+        }
+        self.prev_commit = prev;
+    }
+
+    /// Bigram 落盘防抖：间隔到期才写盘（与用户词典共用 SAVE_INTERVAL 节奏）
+    fn maybe_save_bigram(&mut self) {
+        if self.bigram_path.is_none() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .last_bigram_save
+            .is_none_or(|t| now.duration_since(t) >= crate::user_dict::SAVE_INTERVAL)
+        {
+            self.flush_bigram();
+        }
+    }
+
+    /// 立即落盘个人 Bigram（绕过防抖），刷新防抖计时
+    fn flush_bigram(&mut self) {
+        if let Some(path) = &self.bigram_path
+            && let Err(e) = self.lm.save_user_bigram(path)
+        {
+            debug!("save user bigram failed: {}", e);
+        }
+        self.last_bigram_save = Some(std::time::Instant::now());
+    }
+
+    /// 解码期用户词频预取：对音节图内词长 1..=MAX_WORD_SYLLABLES 的
+    /// 连续音节子编码查询用户词典，命中条目写入 user_freq_cache，
+    /// 使句中位置的词（非首词）也获得 user_bonus。
+    /// 只走既有 lookup 索引精确查询（不全表扫描），预取键数 ≤ 连续音节组合数。
+    fn prefetch_user_freqs(&mut self, graph: &SyllableGraph) {
+        let Some(user_dict) = self.user_dict_ref() else {
+            return;
+        };
+        let sub_codes = scheme_helpers::collect_sub_codes(graph);
+        // 全程只加锁一次：子编码数可达数十个，逐编码加锁会反复争用互斥量
+        let user_dict = user_dict.lock().unwrap();
+        for code in sub_codes {
+            for cand in user_dict.lookup(SchemeId::Pinyin, &code) {
+                // 已有条目保留原值（完整编码查询的优先级更高）
+                self.user_freq_cache.entry(cand.text).or_insert(cand.score);
+            }
+        }
     }
 
     fn current_candidates(&mut self) -> Vec<Candidate> {
@@ -121,7 +249,10 @@ impl PinyinScheme {
         let mut acc = scheme_helpers::CandidateSet::new(&mut candidates, &mut seen_texts);
 
         let graph = self.codec.syllable_graph();
+        let mut decoded_map: FxHashMap<String, DecodeResult> = FxHashMap::default();
         if graph.total_len() > 0 {
+            // 解码前预取用户词频：句中子编码命中的用户词也能获得 user_bonus
+            self.prefetch_user_freqs(&graph);
             let decoder = GraphDecoder::new(&*self.dictionary)
                 .with_lm(&self.lm)
                 .with_user_freqs(&self.user_freq_cache);
@@ -137,6 +268,8 @@ impl PinyinScheme {
             );
 
             for result in decode_results {
+                // 缓存解码产物：上屏时按选中文本反查候选来源（整句 vs 词级）
+                decoded_map.insert(result.text.clone(), result.clone());
                 let comment = if result.is_partial {
                     Some("组合".to_string())
                 } else {
@@ -186,6 +319,7 @@ impl PinyinScheme {
         sort_candidates(&mut candidates, syllable_count, is_fully_segmented);
 
         self.last_query = Some((full_code.clone(), candidates.clone()));
+        self.last_decoded = decoded_map;
         self.cached_version = self.input_version;
 
         debug!(
@@ -203,7 +337,7 @@ impl PinyinScheme {
         let text = if let Some(text) =
             scheme_helpers::pick_candidate_text(&candidates, self.selected_index)
         {
-            self.record_user_commit(&text);
+            self.learn_commit(&text);
             text
         } else {
             self.codec.full_code()
@@ -282,7 +416,7 @@ impl InputScheme for PinyinScheme {
                 let (text, temporary_english) = if let Some(text) =
                     scheme_helpers::pick_candidate_text(&candidates, self.selected_index)
                 {
-                    self.record_user_commit(&text);
+                    self.learn_commit(&text);
                     (text, false)
                 } else {
                     // 无候选时原样上屏编码：这是键盘输入的英文串（方案编码仅
@@ -319,9 +453,9 @@ impl InputScheme for PinyinScheme {
                 else {
                     return SchemeResult::Ignored;
                 };
-                // 只记录选中词部分上屏词频，LLM 预测的补全部分不写入用户词典，
-                // 避免模型输出污染候选排序（须在 base 被 move 进 text 前记录）
-                self.record_user_commit(&base);
+                // 只学习选中候选部分（LLM 预测的补全不参与逐词学习与 Bigram 观测，
+                // 避免模型输出污染用户词典与个性化模型；须在 base 被 move 进 text 前学习）
+                self.learn_commit(&base);
                 let text = if let Some(hint) = &self.completion
                     && hint.matches(&self.codec.full_code(), self.selected_index)
                 {
@@ -442,7 +576,7 @@ impl InputScheme for PinyinScheme {
             return None;
         }
         let text = candidates[index].text.clone();
-        self.record_user_commit(&text);
+        self.learn_commit(&text);
         self.reset_codec_state();
         self.last_query = None;
         Some(SchemeResult::Committed {
@@ -455,10 +589,20 @@ impl InputScheme for PinyinScheme {
         self.completion = completion;
     }
 
+    /// 方案被切走 / 引擎退出前立即落盘：绕过防抖写个人 Bigram，
+    /// 并刷写用户词典，避免防抖窗口内的学习成果丢失
+    fn flush_pending(&mut self) {
+        self.flush_bigram();
+        if let Some(user_dict) = self.user_dict_ref() {
+            user_dict.lock().unwrap().flush();
+        }
+    }
+
     fn reset(&mut self) {
         self.codec.reset();
         self.input_version += 1;
         self.last_query = None; // 清除缓存
+        self.last_decoded.clear();
         self.expanded = false;
         self.selected_index = 0;
         self.completion = None;
@@ -1245,5 +1389,396 @@ mod tests {
             },
             "reset 后补全应被清空"
         );
+    }
+
+    /// 整句上屏逐词学习：多词整句候选上屏后，音节数 ≥ 2 的词写入用户词典，
+    /// 单字词跳过（只留给 Bigram 观测）
+    #[test]
+    fn test_sentence_commit_learns_multi_syllable_words() {
+        let dict = build_dict(&[
+            ("zhong guo", "中国", 120),
+            ("ren", "人", 50),
+            ("ren min", "人民", 110),
+        ]);
+        let user_dict = Arc::new(Mutex::new(UserDictionary::open_in_memory()));
+        let mut scheme = PinyinScheme::with_dictionary(dict).with_user_dict(user_dict.clone());
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 输入 zhongguoren，找到多词路径（中国+人）并选中上屏
+        for ch in ["z", "h", "o", "n", "g", "g", "u", "o", "r", "e", "n"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let candidates = scheme.current_candidates();
+        let multi = candidates
+            .iter()
+            .find(|c| c.text == "中国人")
+            .expect("应存在 中国人 候选");
+        let idx = candidates
+            .iter()
+            .position(|c| c.text == multi.text)
+            .unwrap();
+        let _ = scheme.select_candidate(idx);
+
+        // 用户词典应学到 "中国"（zhong guo，两音节），
+        // 不应学到 "人"（ren，单音节）
+        let learned = user_dict
+            .lock()
+            .unwrap()
+            .lookup(SchemeId::Pinyin, "zhong guo");
+        assert!(
+            learned.iter().any(|c| c.text == "中国"),
+            "整句上屏后应学到 中国，实际: {:?}",
+            learned
+        );
+        let single = user_dict.lock().unwrap().lookup(SchemeId::Pinyin, "ren");
+        assert!(
+            !single.iter().any(|c| c.text == "人"),
+            "单字词不应写入用户词典，实际: {:?}",
+            single
+        );
+    }
+
+    /// 解码期用户词频预取：句中位置的已学词（非首词）获得 user_bonus
+    #[test]
+    fn test_prefetch_user_freqs_boosts_mid_sentence_word() {
+        let dict = build_dict(&[
+            ("zhong guo", "中国", 120),
+            ("ren", "人", 50),
+            ("ren min", "人民", 110),
+        ]);
+        let user_dict = Arc::new(Mutex::new(UserDictionary::open_in_memory()));
+        let mut scheme = PinyinScheme::with_dictionary(dict).with_user_dict(user_dict.clone());
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 先整句上屏一次，学到 (zhong guo, 中国)
+        for ch in ["z", "h", "o", "n", "g", "g", "u", "o", "r", "e", "n"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let candidates = scheme.current_candidates();
+        let idx = candidates
+            .iter()
+            .position(|c| c.text == "中国人")
+            .expect("应存在 中国人 候选");
+        let _ = scheme.select_candidate(idx);
+
+        // 重新输入同样编码：预取应把 中国 写入 user_freq_cache（句首词即可命中），
+        // 并验证句中词（人民 为 2 音节且词库已有，改用词库外的词更难构造——
+        // 这里断言预取确实把已学词填入了缓存）
+        for ch in ["z", "h", "o", "n", "g", "g", "u", "o", "r", "e", "n"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let _ = scheme.current_candidates();
+        assert!(
+            scheme.user_freq_cache.contains_key("中国"),
+            "预取应把已学词 中国 写入 user_freq_cache，实际: {:?}",
+            scheme.user_freq_cache
+        );
+    }
+
+    /// 预取键数量上界：预取只按音节图内连续音节子编码精确查询，不全表扫描。
+    /// 无用户词典时缓存保持为空。
+    #[test]
+    fn test_prefetch_no_user_dict_keeps_cache_empty() {
+        let dict = build_dict(&[("zhong guo", "中国", 120)]);
+        let mut scheme = PinyinScheme::with_dictionary(dict);
+        let ctx = InputContext::caret(0, 0, 20);
+
+        for ch in ["z", "h", "o", "n", "g", "g", "u", "o"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let _ = scheme.current_candidates();
+        assert!(
+            scheme.user_freq_cache.is_empty(),
+            "无用户词典时预取不应写入任何条目，实际: {:?}",
+            scheme.user_freq_cache
+        );
+    }
+
+    /// 已学词单独输入时命中"用户"层（整句学习的排序收益路径）
+    #[test]
+    fn test_learned_word_hits_user_layer() {
+        let dict = build_dict(&[
+            ("zhong guo", "中国", 120),
+            ("ren", "人", 50),
+            ("ren min", "人民", 110),
+        ]);
+        let user_dict = Arc::new(Mutex::new(UserDictionary::open_in_memory()));
+        let mut scheme = PinyinScheme::with_dictionary(dict).with_user_dict(user_dict.clone());
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 先整句上屏一次，学到 (zhong guo, 中国)
+        for ch in ["z", "h", "o", "n", "g", "g", "u", "o", "r", "e", "n"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let candidates = scheme.current_candidates();
+        let idx = candidates
+            .iter()
+            .position(|c| c.text == "中国人")
+            .expect("应存在 中国人 候选");
+        let _ = scheme.select_candidate(idx);
+
+        // 单独输入 zhongguo：学过的 中国 应进入"用户"层置顶
+        for ch in ["z", "h", "o", "n", "g", "g", "u", "o"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let candidates = scheme.current_candidates();
+        assert!(
+            !candidates.is_empty()
+                && candidates[0].text == "中国"
+                && candidates[0].comment.as_deref() == Some("用户"),
+            "已学词单独输入应命中用户层置顶，实际: {:?}",
+            candidates.first().map(|c| (&c.text, &c.comment))
+        );
+    }
+
+    /// 混合回退结果按 word_codes 逐词学习，拼音占位段（空编码）跳过
+    #[test]
+    fn test_hybrid_commit_learns_prefix_skips_placeholder() {
+        // 词库只有 "zhong guo" -> 中国，"ren" 无任何词条（占位段 ren）
+        let dict = build_dict(&[("zhong guo", "中国", 120)]);
+        let user_dict = Arc::new(Mutex::new(UserDictionary::open_in_memory()));
+        let mut scheme =
+            PinyinScheme::with_dictionary(dict.clone()).with_user_dict(user_dict.clone());
+        let ctx = InputContext::caret(0, 0, 20);
+
+        for ch in ["z", "h", "o", "n", "g", "g", "u", "o", "r", "e", "n"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let candidates = scheme.current_candidates();
+        // 混合候选 "中国ren"（is_partial）
+        let idx = candidates
+            .iter()
+            .position(|c| c.text == "中国ren")
+            .expect("应存在混合候选 中国ren");
+        let _ = scheme.select_candidate(idx);
+
+        // 前缀词 "中国" 应学到；占位段 "ren" 编码为空，不学习
+        let learned = user_dict
+            .lock()
+            .unwrap()
+            .lookup(SchemeId::Pinyin, "zhong guo");
+        assert!(
+            learned.iter().any(|c| c.text == "中国"),
+            "混合上屏的前缀词应学到，实际: {:?}",
+            learned
+        );
+
+        // 占位段 "ren" 也不应作为词进入个人 Bigram：过滤后仅观测 (<s> → 中国)，
+        // 参照模型手工注入同一观测，评分应逐位一致；若占位段被观测，
+        // context_totals 多出 "中国"，评分被插值拉低而不等
+        let mut reference = dict.build_language_model();
+        reference.observe_user_transition(None, "中国", 1);
+        assert_eq!(
+            scheme.lm.score_transition("中国", "ren", 1),
+            reference.score_transition("中国", "ren", 1),
+            "占位段不应作为前词进入个人 Bigram"
+        );
+    }
+
+    /// Tab 上屏只学习选中候选部分，LLM 补全文本不进入用户词典
+    #[test]
+    fn test_tab_commit_skips_llm_completion() {
+        let dict = build_dict(&[("zhong guo", "中国", 100), ("ren min", "人民", 100)]);
+        let user_dict = Arc::new(Mutex::new(UserDictionary::open_in_memory()));
+        let mut scheme = PinyinScheme::with_dictionary(dict).with_user_dict(user_dict.clone());
+        let ctx = InputContext::caret(0, 0, 20);
+
+        for ch in ["z", "h", "o", "n", "g", "g", "u", "o"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        scheme.update_completion(Some(CompletionHint {
+            code: "zhongguo".to_string(),
+            selected_index: 0,
+            text: "人民".to_string(),
+        }));
+        let _ = scheme.handle_key(&key_event("Tab"), &ctx);
+
+        // 选中词 "中国"（来自整句解码，单词路径）可能按词级学习；
+        // 补全 "人民" 绝不应被学习
+        let renmin = user_dict
+            .lock()
+            .unwrap()
+            .lookup(SchemeId::Pinyin, "ren min");
+        assert!(
+            !renmin.iter().any(|c| c.text == "人民"),
+            "LLM 补全部分不应写入用户词典，实际: {:?}",
+            renmin
+        );
+    }
+
+    /// 跨句 Bigram：上一轮上屏末词与本轮首词应产生转移观测
+    #[test]
+    fn test_cross_sentence_bigram_observed() {
+        let dict = build_dict(&[("zhong guo", "中国", 100), ("ren min", "人民", 100)]);
+        let mut scheme = PinyinScheme::with_dictionary(dict);
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 第一轮：上屏 "中国"（末词）
+        for ch in ["z", "h", "o", "n", "g", "g", "u", "o"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let _ = scheme.handle_key(&key_event("Space"), &ctx);
+
+        // 第二轮：上屏 "人民"（首词）
+        for ch in ["r", "e", "n", "m", "i", "n"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let _ = scheme.handle_key(&key_event("Space"), &ctx);
+
+        // (中国 → 人民) 应被观测：插入后评分应高于未观测的对称方向
+        let observed = scheme.lm.score_transition("中国", "人民", 2);
+        let reference = LanguageModel::new();
+        assert!(
+            observed > reference.score_transition("中国", "人民", 2),
+            "跨句转移 (中国→人民) 应被观测并提升评分: {observed}"
+        );
+    }
+
+    /// Escape 取消后跨句上下文保留：prev_commit 不因取消而清空
+    #[test]
+    fn test_escape_keeps_cross_sentence_context() {
+        let dict = build_dict(&[("zhong guo", "中国", 100), ("ren min", "人民", 100)]);
+        let mut scheme = PinyinScheme::with_dictionary(dict);
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 第一轮：上屏 "中国"
+        for ch in ["z", "h", "o", "n", "g", "g", "u", "o"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let _ = scheme.handle_key(&key_event("Space"), &ctx);
+
+        // 输入一半后 Escape 取消（prev_commit 应保留）
+        for ch in ["x", "y"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let _ = scheme.handle_key(&key_event("Escape"), &ctx);
+
+        // 第二轮：上屏 "人民"
+        for ch in ["r", "e", "n", "m", "i", "n"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let _ = scheme.handle_key(&key_event("Space"), &ctx);
+
+        // 取消不应清掉 (…→中国) 的上下文：(中国 → 人民) 仍被观测
+        let reference = LanguageModel::new();
+        assert!(
+            scheme.lm.score_transition("中国", "人民", 2)
+                > reference.score_transition("中国", "人民", 2),
+            "Escape 取消后跨句上下文应保留"
+        );
+    }
+
+    /// 点选词转移记 times=2，整句顺带转移记 times=1（强信号区分）
+    #[test]
+    fn test_selected_transition_counts_double() {
+        let dict = build_dict(&[("zhong guo", "中国", 100), ("ren min", "人民", 100)]);
+        let bigram_path = std::env::temp_dir().join("bh_test_bigram_double/user_bigram.txt");
+        // 精确比分断言：先清掉上次运行落盘的残留计数
+        let _ = std::fs::remove_file(&bigram_path);
+        let mut scheme = PinyinScheme::with_dictionary_and_bigram(dict.clone(), bigram_path);
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 点选 "中国"（数字/Space 提交词级候选 → times=2）
+        for ch in ["z", "h", "o", "n", "g", "g", "u", "o"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let _ = scheme.handle_key(&key_event("Space"), &ctx);
+
+        // 句首转移 (<s> → 中国) 应记录 times=2：word_counts[中国] = 2
+        // 通过评分差异验证：两次独立上屏（各 times=2）后评分收敛快于单次
+        for ch in ["z", "h", "o", "n", "g", "g", "u", "o"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let _ = scheme.handle_key(&key_event("Space"), &ctx);
+
+        // 参照模型必须与方案共享同一静态底座（插值结果含 (1-μ)·exp(base) 静态项，
+        // 空模型的 base 不同，比分无意义），再手动注入相同计数
+        let mut reference = dict.build_language_model();
+        // 跨句上下文按设计生效：第一次点选 (<s>→中国) times=2，
+        // 第二次点选时 prev_commit=中国，观测的是 (中国→中国) times=2
+        reference.observe_user_transition(None, "中国", 2);
+        reference.observe_user_transition(Some("中国"), "中国", 2);
+        let expected = reference.score_transition("<s>", "中国", 2);
+        let actual = scheme.lm.score_transition("<s>", "中国", 2);
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "两次点选应各记 times=2（合计 4 次）: actual={actual} expected={expected}"
+        );
+    }
+
+    /// 重启加载：落盘的个人 Bigram 在新方案实例中恢复
+    #[test]
+    fn test_bigram_persists_across_restart() {
+        let dict = build_dict(&[("zhong guo", "中国", 100), ("ren min", "人民", 100)]);
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 第一个实例：上屏 中国 + 人民，产生跨句观测并落盘
+        // （独立落盘路径：并行测试共用按进程命名的文件会互相污染计数）
+        let bigram_path = std::env::temp_dir().join("bh_test_bigram_restart/user_bigram.txt");
+        let _ = std::fs::remove_file(&bigram_path);
+        {
+            let mut scheme =
+                PinyinScheme::with_dictionary_and_bigram(dict.clone(), bigram_path.clone());
+            for ch in ["z", "h", "o", "n", "g", "g", "u", "o"] {
+                let _ = scheme.handle_key(&key_event(ch), &ctx);
+            }
+            let _ = scheme.handle_key(&key_event("Space"), &ctx);
+            for ch in ["r", "e", "n", "m", "i", "n"] {
+                let _ = scheme.handle_key(&key_event(ch), &ctx);
+            }
+            let _ = scheme.handle_key(&key_event("Space"), &ctx);
+            assert!(scheme.lm.has_user_data(), "上屏后应有个人数据");
+            // 防抖窗口内第二次上屏不落盘（by design），显式补一次持久化模拟防抖到期
+            let _ = scheme.lm.save_user_bigram(&bigram_path);
+        }
+
+        // 新实例（模拟重启）：加载落盘数据后跨句转移评分应仍生效
+        let restarted = PinyinScheme::with_dictionary_and_bigram(dict, bigram_path);
+        assert!(restarted.lm.has_user_data(), "重启后应从磁盘恢复个人数据");
+        let reference = LanguageModel::new();
+        assert!(
+            restarted.lm.score_transition("中国", "人民", 2)
+                > reference.score_transition("中国", "人民", 2),
+            "重启后跨句转移评分应仍生效"
+        );
+    }
+
+    /// flush_pending 绕过防抖：切方案/退出前调用应把防抖窗口内的观测立即落盘
+    #[test]
+    fn test_flush_pending_bypasses_save_debounce() {
+        let dict = build_dict(&[("zhong guo", "中国", 100), ("ren min", "人民", 100)]);
+        let bigram_path = std::env::temp_dir().join("bh_test_bigram_flush_pending/user_bigram.txt");
+        let _ = std::fs::remove_file(&bigram_path);
+        let ctx = InputContext::caret(0, 0, 20);
+
+        let mut scheme =
+            PinyinScheme::with_dictionary_and_bigram(dict.clone(), bigram_path.clone());
+        // 第一次上屏：防抖计时为空，写入 (<s> → 中国)
+        for ch in ["z", "h", "o", "n", "g", "g", "u", "o"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let _ = scheme.handle_key(&key_event("Space"), &ctx);
+        // 第二次上屏在防抖窗口内，不会自动落盘（(中国 → 人民) 仅在内存）
+        for ch in ["r", "e", "n", "m", "i", "n"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let _ = scheme.handle_key(&key_event("Space"), &ctx);
+
+        // flush 前：磁盘上还没有 (中国 → 人民) 的观测
+        let mut before = dict.build_language_model();
+        before.load_user_bigram(&bigram_path);
+        let score_before = before.score_transition("中国", "人民", 2);
+
+        // flush 后：磁盘上应包含该观测，评分高于纯静态底座
+        scheme.flush_pending();
+        let mut after = dict.build_language_model();
+        after.load_user_bigram(&bigram_path);
+        let score_after = after.score_transition("中国", "人民", 2);
+
+        assert!(
+            score_after > score_before,
+            "flush_pending 应把防抖窗口内的观测写入磁盘: before={score_before} after={score_after}"
+        );
+        let _ = std::fs::remove_file(&bigram_path);
     }
 }

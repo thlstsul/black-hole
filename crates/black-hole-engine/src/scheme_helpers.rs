@@ -1,4 +1,5 @@
 use crate::punctuation::{QuotePair, convert_punctuation};
+use crate::syllable_graph::SyllableGraph;
 use crate::{Dictionary, UserDictionary};
 use black_hole_shared::candidate_layout::{
     EXPANDED_AVAILABLE_WIDTH, GridDirection, digit_to_candidate_index_excluding,
@@ -85,6 +86,61 @@ pub(super) fn convert_to_cn_punct(
     } else {
         convert_punctuation(ch)
     }
+}
+
+/// 从解码结果的 (词, 词编码) 对中筛出可学习的真实词。
+/// 混合结果的拼音占位段（无单字候选时保留的原始拼音）编码为空，并非真实词，
+/// 跳过以免污染个人 Bigram。
+///
+/// `words` 与 `word_codes` 由解码器保证一一对应；长度不一致时按较短者截断。
+pub(super) fn learned_words<'a>(words: &'a [String], word_codes: &'a [String]) -> Vec<&'a str> {
+    words
+        .iter()
+        .zip(word_codes)
+        .filter(|(_, code)| !code.is_empty())
+        .map(|(word, _)| word.as_str())
+        .collect()
+}
+
+/// 测试用个人 Bigram 落盘路径：每次调用生成唯一子目录，
+/// 避免同一进程内并行测试共用文件导致计数互相污染。
+/// 生产路径由方案的 `with_dictionary` 指向用户目录，不经此函数。
+#[cfg(test)]
+pub(super) fn test_bigram_path(prefix: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "bh_test_bigram_{prefix}_{}_{seq}/user_bigram.txt",
+        std::process::id()
+    ))
+}
+
+/// 收集音节图内词长 1..=MAX_WORD_SYLLABLES 的连续音节子编码（空格分隔、去重），
+/// 供解码前用户词频预取使用。
+///
+/// 对每个起点都展开（与解码器词图建边一致，共用
+/// `graph_decoder::for_each_syllable_prefix`），因此句中位置（非首词）
+/// 的子编码也能被收集到。
+pub(super) fn collect_sub_codes(graph: &SyllableGraph) -> Vec<String> {
+    let n = graph.total_len();
+    let mut seen = FxHashSet::default();
+    let mut codes = Vec::new();
+    for start in 0..=n {
+        crate::graph_decoder::for_each_syllable_prefix(
+            graph,
+            start,
+            crate::graph_decoder::MAX_WORD_SYLLABLES,
+            |_, code, _| {
+                // 先按 &str 查重：重复项（单音节子编码在各起点反复出现）零分配
+                if !seen.contains(code) {
+                    seen.insert(code.to_string());
+                    codes.push(code.to_string());
+                }
+            },
+        );
+    }
+    codes
 }
 
 /// 方向键导航（Left/Right/Up/Down）的共享逻辑。
@@ -294,5 +350,53 @@ pub(super) fn record_user_commit(
     if let Some(ud) = user_dict {
         ud.lock().unwrap().record_commit(scheme_id, code, text);
         user_freq_cache.remove(text);
+    }
+}
+
+/// 整句上屏逐词学习：音节数 ≥ 2 的词写入用户词典，单字词跳过
+/// （单字只留给 Bigram 观测，避免"用户"层 boost 污染单字候选排序）。
+/// 跳过空编码/空文本对——混合结果的拼音占位段编码为空，不学习。
+pub(super) fn record_sentence_commit(
+    words: &[String],
+    word_codes: &[String],
+    user_dict: Option<Arc<Mutex<UserDictionary>>>,
+    scheme_id: SchemeId,
+    user_freq_cache: &mut FxHashMap<String, i64>,
+) {
+    let Some(ud) = user_dict else {
+        return;
+    };
+    let mut ud = ud.lock().unwrap();
+    for (text, code) in words.iter().zip(word_codes.iter()) {
+        if text.is_empty() || code.is_empty() || code.split_whitespace().count() < 2 {
+            continue;
+        }
+        ud.record_commit(scheme_id, code, text);
+        user_freq_cache.remove(text);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::learned_words;
+
+    /// 占位段（编码为空）不是真实词，不进 Bigram 观测
+    #[test]
+    fn learned_words_skip_empty_code_placeholders() {
+        let words = vec!["中国".to_string(), "ren".to_string(), "人民".to_string()];
+        let codes = vec![
+            "zhong guo".to_string(),
+            String::new(),
+            "ren min".to_string(),
+        ];
+        assert_eq!(learned_words(&words, &codes), vec!["中国", "人民"]);
+    }
+
+    /// 长度不一致时按较短者截断（解码器保证一一对应，此处仅防御性验证）
+    #[test]
+    fn learned_words_truncates_to_shorter_side() {
+        let words = vec!["a".to_string(), "b".to_string()];
+        let codes = vec!["a".to_string()];
+        assert_eq!(learned_words(&words, &codes), vec!["a"]);
     }
 }

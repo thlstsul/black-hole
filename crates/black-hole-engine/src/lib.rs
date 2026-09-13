@@ -46,6 +46,8 @@ pub trait InputScheme: Send {
     fn reset(&mut self);
     /// 接收 LLM 整句补全结果（异步到达），供 Tab 上屏时校验后拼入
     fn update_completion(&mut self, _completion: Option<CompletionHint>) {}
+    /// 方案被切走或引擎退出前调用：立即落盘待写数据（绕过防抖）
+    fn flush_pending(&mut self) {}
 }
 
 /// 编解码器：将原始按键序列转换为方案内部编码
@@ -77,6 +79,10 @@ pub trait Dictionary: Send {
     fn fuzzy_match(&self, _pattern: &str) -> Vec<Candidate> {
         // 默认实现：返回空，子类可覆盖
         Vec::new()
+    }
+    /// 从词典构建语言模型（整句解码评分用；默认返回空模型）
+    fn build_language_model(&self) -> LanguageModel {
+        LanguageModel::new()
     }
 }
 
@@ -162,6 +168,8 @@ impl Engine {
                 SchemeResult::Ignored
             }
             EngineCommand::SwitchScheme(id) => {
+                // 切走前落盘学习成果（绕过防抖），避免旧方案未写盘的观测丢失
+                self.scheme.flush_pending();
                 self.scheme = self.registry.create_scheme(*id);
                 SchemeResult::Ignored
             }
@@ -218,7 +226,14 @@ impl Engine {
     }
 
     pub fn switch_scheme(&mut self, scheme: Box<dyn InputScheme>) {
+        // 与 SwitchScheme 命令一致：替换前先落盘旧方案的学习成果
+        self.scheme.flush_pending();
         self.scheme = scheme;
+    }
+
+    /// 引擎退出前调用：落盘当前方案的待写数据（个人 Bigram、用户词典）
+    pub fn flush(&mut self) {
+        self.scheme.flush_pending();
     }
 
     pub fn current_scheme_name(&self) -> &str {

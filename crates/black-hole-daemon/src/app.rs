@@ -435,6 +435,10 @@ impl App {
 
                 debug!("engine_thread end");
             }
+
+            // 线程退出前落盘：绕过防抖写个人 Bigram 与用户词典，
+            // 避免最后一次上屏的学习成果随进程退出丢失
+            engine.lock().unwrap().flush();
         }));
 
         if let Err(e) = result {

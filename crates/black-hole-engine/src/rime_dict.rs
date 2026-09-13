@@ -576,6 +576,11 @@ impl RimeDict {
 }
 
 impl Dictionary for RimeDict {
+    fn build_language_model(&self) -> LanguageModel {
+        // 显式调用固有方法（同名时方法调用语法会优先解析到固有实现）
+        RimeDict::build_language_model(self)
+    }
+
     fn lookup(&self, code: &str) -> Vec<Candidate> {
         // 精确查询结果只取决于编码与只读词典，按编码字符串缓存；
         // 输入逐键增长时共享前缀命中率高，避免重复查表。

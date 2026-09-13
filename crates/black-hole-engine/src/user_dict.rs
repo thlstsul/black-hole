@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 /// 上屏落盘的防抖间隔：间隔内多次上屏只合并写一次全量文件，
-/// 避免每次上屏在 UI 线程同步写盘（写盘前可调用 `flush` 强制落盘）
-const SAVE_INTERVAL: Duration = Duration::from_secs(2);
+/// 避免每次上屏在 UI 线程同步写盘（写盘前可调用 `flush` 强制落盘）。
+/// 个人 Bigram 落盘（maybe_save_bigram）复用同一节奏。
+pub(crate) const SAVE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// 全局用户词典实例
 static GLOBAL_USER_DICT: OnceLock<Arc<Mutex<UserDictionary>>> = OnceLock::new();

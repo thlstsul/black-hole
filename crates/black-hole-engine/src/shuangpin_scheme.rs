@@ -1,10 +1,13 @@
 #[cfg(test)]
 use crate::RawEntry;
+#[cfg(not(test))]
+use crate::default_user_dict_dir;
 use crate::punctuation::QuotePair;
 use crate::scheme_helpers;
 use crate::{
-    CandidateRanker, Codec, CodecState, Dictionary, GraphDecoder, InputScheme, RimeDict,
-    ShuangpinCodec, SimpleRanker, UserDictionary, global_user_dict, sort_candidates,
+    CandidateRanker, Codec, CodecState, DecodeResult, Dictionary, GraphDecoder, InputScheme,
+    LanguageModel, RimeDict, ShuangpinCodec, SimpleRanker, SyllableGraph, UserDictionary,
+    global_user_dict, sort_candidates,
 };
 use black_hole_shared::{
     Candidate, CompletionHint, InputContext, KeyEvent, KeyState, SchemeId, SchemeResult,
@@ -23,11 +26,26 @@ pub struct ShuangpinScheme {
     codec: ShuangpinCodec,
     dictionary: Box<dyn Dictionary>,
     ranker: Box<dyn CandidateRanker>,
+    /// 语言模型（从词典构建；音节图为全拼，与拼音方案共用同一 LM 评分逻辑）
+    lm: LanguageModel,
     user_dict: Option<Arc<Mutex<UserDictionary>>>,
     /// 缓存用户词频（避免每次查询 SQLite）
     user_freq_cache: FxHashMap<String, i64>,
     /// 缓存最近一次查询结果（导航期间复用，保证候选顺序稳定）
     last_query: Option<(String, Vec<Candidate>)>,
+    /// 与 last_query 同步缓存的解码产物（text -> words/word_codes/is_partial），
+    /// 上屏时按选中文本反查候选来源（整句 vs 词级），供逐词学习使用
+    last_decoded: FxHashMap<String, DecodeResult>,
+    /// 输入状态版本号：编码变化/重置时递增，用于识别 last_decoded 是否陈旧
+    input_version: u64,
+    /// last_decoded 写入时的版本号（与 input_version 一致才可信任）
+    cached_version: u64,
+    /// 上一轮上屏的末词（跨句 Bigram 上下文）：Escape/Reset 不清空，方案切换时清空
+    prev_commit: Option<String>,
+    /// Bigram 落盘防抖计时
+    last_bigram_save: Option<std::time::Instant>,
+    /// 个人 Bigram 持久化路径（None 表示不落盘）
+    bigram_path: Option<std::path::PathBuf>,
     expanded: bool,
     selected_index: usize,
     /// LLM 整句补全结果（异步到达，Tab 提交时校验后拼入上屏文本）
@@ -46,35 +64,51 @@ impl Default for ShuangpinScheme {
 
 impl ShuangpinScheme {
     pub fn new() -> Self {
-        Self {
-            codec: ShuangpinCodec::new(),
-            dictionary: Box::new(RimeDict::from_builtin()),
-            ranker: Box::new(SimpleRanker::new()),
-            user_dict: None,
-            user_freq_cache: FxHashMap::default(),
-            last_query: None,
-            expanded: false,
-            selected_index: 0,
-            completion: None,
-            english_buffer: None,
-            quote_pair: QuotePair::new(),
-        }
+        // 与拼音方案保持一致：构建语言模型并接入个人 Bigram（含落盘）
+        Self::with_dictionary(Box::new(RimeDict::from_builtin()))
     }
 
     pub fn with_dictionary(dictionary: Box<dyn Dictionary>) -> Self {
-        Self {
+        // 个人 Bigram 持久化路径：与拼音方案共用用户目录下的同一文件
+        // （音节图均为全拼，词对语义一致，两方案共享学习成果）；
+        // 测试构建指向每次调用唯一且隔离的临时路径，避免读写真实用户数据，
+        // 也避免同进程内并行测试共用文件导致计数互相污染
+        #[cfg(test)]
+        let bigram_path = scheme_helpers::test_bigram_path("shuangpin");
+        #[cfg(not(test))]
+        let bigram_path = default_user_dict_dir().join("user_bigram.txt");
+        Self::with_dictionary_and_bigram(dictionary, bigram_path)
+    }
+
+    /// 指定个人 Bigram 路径的构造（测试用隔离落盘文件，避免并行测试共用文件
+    /// 导致计数互相污染；生产路径由 `with_dictionary` 传入用户目录路径）
+    pub(crate) fn with_dictionary_and_bigram(
+        dictionary: Box<dyn Dictionary>,
+        bigram_path: std::path::PathBuf,
+    ) -> Self {
+        let lm = dictionary.build_language_model();
+        let mut scheme = Self {
             codec: ShuangpinCodec::new(),
+            lm,
             dictionary,
             ranker: Box::new(SimpleRanker::new()),
             user_dict: None,
             user_freq_cache: FxHashMap::default(),
             last_query: None,
+            last_decoded: FxHashMap::default(),
+            input_version: 0,
+            cached_version: 0,
+            prev_commit: None,
+            last_bigram_save: None,
+            bigram_path: Some(bigram_path.clone()),
             expanded: false,
             selected_index: 0,
             completion: None,
             english_buffer: None,
             quote_pair: QuotePair::new(),
-        }
+        };
+        scheme.lm.load_user_bigram(&bigram_path);
+        scheme
     }
 
     pub fn with_user_dict(mut self, user_dict: Arc<Mutex<UserDictionary>>) -> Self {
@@ -98,6 +132,96 @@ impl ShuangpinScheme {
         );
     }
 
+    /// 上屏学习路由（与拼音方案同构）：整句/混合候选按解码产物逐词学习，
+    /// 词级候选仍走精确匹配学习。仅当候选缓存与当前输入一致时信任解码产物。
+    ///
+    /// Bigram 观测：词级候选只观测「上轮末词 → 本词」一次，记 times=2（直接点选，强信号）；
+    /// 整句/混合候选观测路径内所有相邻词对，统一记 times=1（整句上屏本身即一次选择）。
+    /// 音节图已全拼，word_codes 可直接学习，无须反查。
+    fn learn_commit(&mut self, text: &str) {
+        let decoded = if self.input_version == self.cached_version {
+            self.last_decoded.get(text).cloned()
+        } else {
+            None
+        };
+        match decoded {
+            Some(decoded) if decoded.is_partial || decoded.words.len() > 1 => {
+                scheme_helpers::record_sentence_commit(
+                    &decoded.words,
+                    &decoded.word_codes,
+                    self.user_dict_ref(),
+                    SchemeId::Shuangpin,
+                    &mut self.user_freq_cache,
+                );
+                // 句内相邻词对观测（顺带转移 times=1），并跨句连接上轮末词；
+                // 混合结果的拼音占位段编码为空，不是真实词，跳过以免污染 Bigram
+                let learned = scheme_helpers::learned_words(&decoded.words, &decoded.word_codes);
+                self.observe_sentence_bigrams(&learned, 1);
+            }
+            _ => {
+                self.record_user_commit(text);
+                self.observe_sentence_bigrams(&[text], 2);
+            }
+        }
+        self.maybe_save_bigram();
+    }
+
+    /// 对一段词序列做 Bigram 观测：先句首 (<s> → 首词)，再句内相邻词对；
+    /// 上轮上屏的末词（prev_commit）与本轮首词跨句连接一次。
+    /// 观测后更新 prev_commit 为本轮末词；空序列不改动上下文。
+    fn observe_sentence_bigrams(&mut self, words: &[&str], times: u32) {
+        if words.is_empty() {
+            return;
+        }
+        let mut prev: Option<String> = self.prev_commit.take();
+        for word in words {
+            self.lm
+                .observe_user_transition(prev.as_deref(), word, times);
+            prev = Some((*word).to_string());
+        }
+        self.prev_commit = prev;
+    }
+
+    /// Bigram 落盘防抖：间隔到期才写盘（与用户词典共用 SAVE_INTERVAL 节奏）
+    fn maybe_save_bigram(&mut self) {
+        if self.bigram_path.is_none() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .last_bigram_save
+            .is_none_or(|t| now.duration_since(t) >= crate::user_dict::SAVE_INTERVAL)
+        {
+            self.flush_bigram();
+        }
+    }
+
+    /// 立即落盘个人 Bigram（绕过防抖），刷新防抖计时
+    fn flush_bigram(&mut self) {
+        if let Some(path) = &self.bigram_path
+            && let Err(e) = self.lm.save_user_bigram(path)
+        {
+            debug!("save user bigram failed: {}", e);
+        }
+        self.last_bigram_save = Some(std::time::Instant::now());
+    }
+
+    /// 解码期用户词频预取：对音节图内词长 1..=MAX_WORD_SYLLABLES 的连续音节子编码
+    /// 查询用户词典，使句中位置的词（非首词）也获得 user_bonus（与拼音方案同构）
+    fn prefetch_user_freqs(&mut self, graph: &SyllableGraph) {
+        let Some(user_dict) = self.user_dict_ref() else {
+            return;
+        };
+        let sub_codes = scheme_helpers::collect_sub_codes(graph);
+        // 全程只加锁一次：子编码数可达数十个，逐编码加锁会反复争用互斥量
+        let user_dict = user_dict.lock().unwrap();
+        for code in sub_codes {
+            for cand in user_dict.lookup(SchemeId::Shuangpin, &code) {
+                self.user_freq_cache.entry(cand.text).or_insert(cand.score);
+            }
+        }
+    }
+
     fn current_candidates(&mut self) -> Vec<Candidate> {
         let started = Instant::now();
         let full_code = self.codec.full_code();
@@ -116,11 +240,17 @@ impl ShuangpinScheme {
         let mut acc = scheme_helpers::CandidateSet::new(&mut candidates, &mut seen_texts);
 
         let graph = self.codec.syllable_graph();
+        let mut decoded_map: FxHashMap<String, DecodeResult> = FxHashMap::default();
         if graph.total_len() > 0 {
-            let decoder =
-                GraphDecoder::new(&*self.dictionary).with_user_freqs(&self.user_freq_cache);
+            // 解码前预取用户词频：句中子编码命中的用户词也能获得 user_bonus
+            self.prefetch_user_freqs(&graph);
+            let decoder = GraphDecoder::new(&*self.dictionary)
+                .with_lm(&self.lm)
+                .with_user_freqs(&self.user_freq_cache);
             let decode_results = decoder.decode(&graph);
             for result in decode_results {
+                // 缓存解码产物：上屏时按选中文本反查候选来源（整句 vs 词级）
+                decoded_map.insert(result.text.clone(), result.clone());
                 let is_partial = result.is_partial || has_pending;
                 let comment = if is_partial {
                     Some("组合".to_string())
@@ -211,6 +341,8 @@ impl ShuangpinScheme {
         );
 
         self.last_query = Some((input_code, candidates.clone()));
+        self.last_decoded = decoded_map;
+        self.cached_version = self.input_version;
         candidates
     }
 
@@ -220,7 +352,7 @@ impl ShuangpinScheme {
         let text = if let Some(text) =
             scheme_helpers::pick_candidate_text(&candidates, self.selected_index)
         {
-            self.record_user_commit(&text);
+            self.learn_commit(&text);
             text
         } else {
             self.codec.code().to_string()
@@ -235,6 +367,7 @@ impl ShuangpinScheme {
         self.codec.reset();
         self.expanded = false;
         self.selected_index = 0;
+        self.last_decoded.clear();
     }
 }
 
@@ -262,6 +395,7 @@ impl InputScheme for ShuangpinScheme {
         match key.key.as_str() {
             "Backspace" => {
                 if self.codec.pop() {
+                    self.input_version += 1;
                     let code = self.codec.code().to_string();
                     let candidates = self.current_candidates();
                     self.selected_index = 0;
@@ -293,7 +427,7 @@ impl InputScheme for ShuangpinScheme {
                 let (text, temporary_english) = if let Some(text) =
                     scheme_helpers::pick_candidate_text(&candidates, self.selected_index)
                 {
-                    self.record_user_commit(&text);
+                    self.learn_commit(&text);
                     (text, false)
                 } else {
                     // 无候选时原样上屏编码：这是键盘输入的英文串（方案编码仅
@@ -332,7 +466,7 @@ impl InputScheme for ShuangpinScheme {
                 };
                 // 只记录选中词部分上屏词频，LLM 预测的补全部分不写入用户词典，
                 // 避免模型输出污染候选排序（须在 base 被 move 进 text 前记录）
-                self.record_user_commit(&base);
+                self.learn_commit(&base);
                 let text = if let Some(hint) = &self.completion
                     && hint.matches(self.codec.code(), self.selected_index)
                 {
@@ -410,6 +544,7 @@ impl InputScheme for ShuangpinScheme {
         }
         match self.codec.push(ch) {
             CodecState::Accepted | CodecState::Complete => {
+                self.input_version += 1;
                 let code = self.codec.code().to_string();
                 let candidates = self.current_candidates();
                 self.selected_index = 0;
@@ -450,7 +585,7 @@ impl InputScheme for ShuangpinScheme {
             return None;
         }
         let text = candidates[index].text.clone();
-        self.record_user_commit(&text);
+        self.learn_commit(&text);
         self.reset_codec_state();
         self.last_query = None;
         Some(SchemeResult::Committed {
@@ -463,9 +598,20 @@ impl InputScheme for ShuangpinScheme {
         self.completion = completion;
     }
 
+    /// 方案被切走 / 引擎退出前立即落盘：绕过防抖写个人 Bigram，
+    /// 并刷写用户词典，避免防抖窗口内的学习成果丢失
+    fn flush_pending(&mut self) {
+        self.flush_bigram();
+        if let Some(user_dict) = self.user_dict_ref() {
+            user_dict.lock().unwrap().flush();
+        }
+    }
+
     fn reset(&mut self) {
         self.codec.reset();
+        self.input_version += 1;
         self.last_query = None;
+        self.last_decoded.clear();
         self.expanded = false;
         self.selected_index = 0;
         self.completion = None;
@@ -972,6 +1118,202 @@ mod tests {
                 temporary_english: false,
             },
             "编码匹配时 Tab 应将选中词与补全拼为整句上屏"
+        );
+    }
+
+    /// 双拼整句解码评分生效：LM 接线后整句路径可用（输入 ul go → yu gou 之类
+    /// 全拼音节图可解码），且 last_decoded 缓存路由学习
+    #[test]
+    fn test_shuangpin_lm_decode_and_sentence_learn() {
+        // 全拼词条：shu(书/输) fa(法/发) -> shufa 组合候选
+        let dict = build_dict(&[("shu fa", "书法", 120), ("shu", "书", 80), ("fa", "法", 60)]);
+        let user_dict = Arc::new(Mutex::new(UserDictionary::open_in_memory()));
+        let mut scheme =
+            ShuangpinScheme::with_dictionary(Box::new(dict)).with_user_dict(user_dict.clone());
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 小鹤双拼 "uu" = shu，"fa" = 声母 f + 韵母 a 键
+        for ch in ["u", "u", "f", "a"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let candidates = scheme.current_candidates();
+        let idx = candidates
+            .iter()
+            .position(|c| c.text == "书法")
+            .expect("双拼整句解码应产出 书法 候选");
+        let _ = scheme.select_candidate(idx);
+
+        // 整句词（两音节）应写入用户词典
+        let learned = user_dict
+            .lock()
+            .unwrap()
+            .lookup(SchemeId::Shuangpin, "shu fa");
+        assert!(
+            learned.iter().any(|c| c.text == "书法"),
+            "双拼整句上屏应学到 书法，实际: {:?}",
+            learned
+        );
+    }
+
+    /// 双拼跨句 Bigram：两轮上屏产生 (前句末词 → 后句首词) 观测
+    #[test]
+    fn test_shuangpin_cross_sentence_bigram() {
+        let dict = build_dict(&[("shu", "书", 80), ("fa", "法", 60)]);
+        let mut scheme = ShuangpinScheme::with_dictionary(Box::new(dict));
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 第一轮上屏 "书"（uu = shu）
+        for ch in ["u", "u"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let _ = scheme.handle_key(&key_event("Space"), &ctx);
+
+        // 第二轮上屏 "法"（ff = fa）
+        for ch in ["f", "f"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let _ = scheme.handle_key(&key_event("Space"), &ctx);
+
+        // (书 → 法) 应被观测：对比未观测的空参照模型
+        let reference = LanguageModel::new();
+        assert!(
+            scheme.lm.score_transition("书", "法", 1) > reference.score_transition("书", "法", 1),
+            "双拼跨句转移 (书→法) 应被观测并提升评分"
+        );
+    }
+
+    /// 双拼已学词命中"用户"层：整句学习后单独输入该编码置顶
+    #[test]
+    fn test_shuangpin_learned_word_hits_user_layer() {
+        let dict = build_dict(&[("shu fa", "书法", 120), ("shu", "书", 80), ("fa", "法", 60)]);
+        let user_dict = Arc::new(Mutex::new(UserDictionary::open_in_memory()));
+        let mut scheme =
+            ShuangpinScheme::with_dictionary(Box::new(dict)).with_user_dict(user_dict.clone());
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 先整句上屏 书法
+        for ch in ["u", "u", "f", "a"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let candidates = scheme.current_candidates();
+        let idx = candidates
+            .iter()
+            .position(|c| c.text == "书法")
+            .expect("应存在 书法 候选");
+        let _ = scheme.select_candidate(idx);
+
+        // 重新输入 uuff：学过的 书法 应命中"用户"层置顶
+        for ch in ["u", "u", "f", "a"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let candidates = scheme.current_candidates();
+        assert!(
+            !candidates.is_empty()
+                && candidates[0].text == "书法"
+                && candidates[0].comment.as_deref() == Some("用户"),
+            "双拼已学词应命中用户层置顶，实际: {:?}",
+            candidates.first().map(|c| (&c.text, &c.comment))
+        );
+    }
+
+    /// 双拼 Escape 取消后跨句上下文保留
+    #[test]
+    fn test_shuangpin_escape_keeps_cross_sentence_context() {
+        let dict = build_dict(&[("shu", "书", 80), ("fa", "法", 60)]);
+        let mut scheme = ShuangpinScheme::with_dictionary(Box::new(dict));
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 第一轮上屏 "书"
+        for ch in ["u", "u"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let _ = scheme.handle_key(&key_event("Space"), &ctx);
+
+        // 输入一半后 Escape 取消（prev_commit 应保留）
+        for ch in ["a", "a"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let _ = scheme.handle_key(&key_event("Escape"), &ctx);
+
+        // 第二轮上屏 "法"
+        for ch in ["f", "f"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let _ = scheme.handle_key(&key_event("Space"), &ctx);
+
+        let reference = LanguageModel::new();
+        assert!(
+            scheme.lm.score_transition("书", "法", 1) > reference.score_transition("书", "法", 1),
+            "Escape 取消后双拼跨句上下文应保留"
+        );
+    }
+
+    /// 双拼预取：已学词在重新输入时进入 user_freq_cache（解码期加成）
+    #[test]
+    fn test_shuangpin_prefetch_user_freqs() {
+        let dict = build_dict(&[("shu fa", "书法", 120), ("shu", "书", 80), ("fa", "法", 60)]);
+        let user_dict = Arc::new(Mutex::new(UserDictionary::open_in_memory()));
+        let mut scheme =
+            ShuangpinScheme::with_dictionary(Box::new(dict)).with_user_dict(user_dict.clone());
+        let ctx = InputContext::caret(0, 0, 20);
+
+        // 整句上屏一次，学到 (shu fa, 书法)
+        for ch in ["u", "u", "f", "a"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let candidates = scheme.current_candidates();
+        let idx = candidates
+            .iter()
+            .position(|c| c.text == "书法")
+            .expect("应存在 书法 候选");
+        let _ = scheme.select_candidate(idx);
+
+        // 重新输入：预取应把 书法 填入 user_freq_cache
+        for ch in ["u", "u", "f", "a"] {
+            let _ = scheme.handle_key(&key_event(ch), &ctx);
+        }
+        let _ = scheme.current_candidates();
+        assert!(
+            scheme.user_freq_cache.contains_key("书法"),
+            "双拼预取应把已学词写入 user_freq_cache，实际: {:?}",
+            scheme.user_freq_cache
+        );
+    }
+
+    /// 双拼 Bigram 持久化：落盘后新实例恢复（发现 1 回归测试）
+    #[test]
+    fn test_shuangpin_bigram_persists_across_restart() {
+        let dict = build_dict(&[("shu", "书", 80), ("fa", "法", 60)]);
+        let bigram_path = std::env::temp_dir().join("bh_test_bigram_sp_restart/user_bigram.txt");
+        let _ = std::fs::remove_file(&bigram_path);
+
+        // 第一个实例：上屏 书 + 法，产生跨句观测并显式落盘（防抖窗口内不自动写）
+        {
+            let mut scheme = ShuangpinScheme::with_dictionary_and_bigram(
+                Box::new(build_dict(&[("shu", "书", 80), ("fa", "法", 60)])),
+                bigram_path.clone(),
+            );
+            let ctx = InputContext::caret(0, 0, 20);
+            for ch in ["u", "u"] {
+                let _ = scheme.handle_key(&key_event(ch), &ctx);
+            }
+            let _ = scheme.handle_key(&key_event("Space"), &ctx);
+            for ch in ["f", "a"] {
+                let _ = scheme.handle_key(&key_event(ch), &ctx);
+            }
+            let _ = scheme.handle_key(&key_event("Space"), &ctx);
+            assert!(scheme.lm.has_user_data(), "上屏后应有个人数据");
+            let _ = scheme.lm.save_user_bigram(&bigram_path);
+        }
+
+        // 新实例（模拟重启）：加载落盘数据后跨句转移评分应仍生效
+        let restarted = ShuangpinScheme::with_dictionary_and_bigram(Box::new(dict), bigram_path);
+        assert!(restarted.lm.has_user_data(), "重启后应从磁盘恢复个人数据");
+        let reference = LanguageModel::new();
+        assert!(
+            restarted.lm.score_transition("书", "法", 1)
+                > reference.score_transition("书", "法", 1),
+            "重启后双拼跨句转移评分应仍生效"
         );
     }
 }

@@ -12,6 +12,11 @@ pub struct DecodeResult {
     pub score: f64,
     /// 分词结果（每个词的汉字）
     pub words: Vec<String>,
+    /// 每个词的拼音编码（空格分隔音节）。
+    ///
+    /// 与 [`Self::words`] **严格一一对应**（下标相同即为同一个词），
+    /// 供整句逐词学习使用；混合结果的拼音占位段编码为空串。
+    pub word_codes: Vec<String>,
     /// 是否为部分覆盖的混合结果（前缀词 + 单字/拼音后缀）
     pub is_partial: bool,
 }
@@ -21,6 +26,8 @@ pub struct DecodeResult {
 struct WordEdge {
     end_pos: usize,
     text: Arc<str>,
+    /// 该词匹配的拼音编码（空格分隔音节），供整句逐词学习使用
+    code: Arc<str>,
     base_score: f64,
     syllable_count: usize,
 }
@@ -36,6 +43,8 @@ struct ViterbiState {
     prev: Option<(usize, usize)>,
     /// 到达本状态所用的词（即词边文本），回溯重建整句时使用
     last_word: Arc<str>,
+    /// 到达本状态所用词的拼音编码，与 last_word 一一对应
+    last_code: Arc<str>,
 }
 
 /// 评分配置参数
@@ -124,6 +133,41 @@ impl ScoringConfig {
     }
 }
 
+/// 词图与预取共用的词长上限（音节数，过大徒增词图边数与预取查询数）
+pub const MAX_WORD_SYLLABLES: usize = 8;
+
+/// 从 `start` 出发深度优先遍历音节图，枚举长度不超过 `max_syllables` 的连续音节子编码，
+/// 对每个可达前缀调用 `visit(end_pos, spaced_code, syllable_count)`
+/// （`spaced_code` 为空格分隔音节，如 `"zhong guo"`）。
+///
+/// 词图建边（[`GraphDecoder::build_word_edges`]）与解码前用户词频预取
+/// （`scheme_helpers::collect_sub_codes`）共用本函数，保证两者覆盖的音节组合范围一致。
+pub fn for_each_syllable_prefix(
+    graph: &SyllableGraph,
+    start: usize,
+    max_syllables: usize,
+    mut visit: impl FnMut(usize, &str, usize),
+) {
+    let n = graph.total_len();
+    let mut stack: Vec<(usize, String, usize)> = Vec::new();
+    for (end, syllable) in graph.edges_from(start) {
+        stack.push((*end, syllable.clone(), 1));
+    }
+    while let Some((pos, spaced_code, syllable_count)) = stack.pop() {
+        visit(pos, &spaced_code, syllable_count);
+        // 继续延伸：音节数未超限且还有后续边
+        if syllable_count < max_syllables && pos < n {
+            for (next_end, next_syllable) in graph.edges_from(pos) {
+                let mut prefix = String::with_capacity(spaced_code.len() + 1 + next_syllable.len());
+                prefix.push_str(&spaced_code);
+                prefix.push(' ');
+                prefix.push_str(next_syllable);
+                stack.push((*next_end, prefix, syllable_count + 1));
+            }
+        }
+    }
+}
+
 /// 词图构建器与维特比解码器
 pub struct GraphDecoder<'a> {
     dict: &'a dyn Dictionary,
@@ -141,7 +185,7 @@ impl<'a> GraphDecoder<'a> {
             lm: None,
             user_freqs: None,
             beam_width: 10,
-            max_word_syllables: 4,
+            max_word_syllables: MAX_WORD_SYLLABLES,
             config: ScoringConfig::default(),
         }
     }
@@ -195,6 +239,7 @@ impl<'a> GraphDecoder<'a> {
             score: 0.0,
             prev: None,
             last_word: Arc::from("<s>"),
+            last_code: Arc::from(""),
         });
 
         for i in 0..=n {
@@ -217,6 +262,7 @@ impl<'a> GraphDecoder<'a> {
                         score: new_score,
                         prev: Some((i, state_idx)),
                         last_word: Arc::clone(&edge.text),
+                        last_code: Arc::clone(&edge.code),
                     });
                 }
             }
@@ -256,18 +302,20 @@ impl<'a> GraphDecoder<'a> {
         state.score + lm_score + base_score + word_preference + coverage_bonus + user_bonus
     }
 
-    /// 沿回溯指针重建 (完整文本, 分词列表)，words[0] 为 <s> 哨兵。
+    /// 沿回溯指针重建 (完整文本, 分词列表, 分词编码列表)，words[0] 为 <s> 哨兵。
     fn rebuild_path(
         &self,
         dp: &[Vec<ViterbiState>],
         pos: usize,
         idx: usize,
-    ) -> (String, Vec<String>) {
+    ) -> (String, Vec<String>, Vec<String>) {
         let mut words_rev = Vec::new();
+        let mut codes_rev = Vec::new();
         let (mut pos, mut idx) = (pos, idx);
         loop {
             let st = &dp[pos][idx];
             words_rev.push(st.last_word.to_string());
+            codes_rev.push(st.last_code.to_string());
             match st.prev {
                 Some((p, k)) => {
                     pos = p;
@@ -277,10 +325,12 @@ impl<'a> GraphDecoder<'a> {
             }
         }
         words_rev.reverse();
+        codes_rev.reverse();
         // split_off(1) 一次切片移除 <s> 哨兵，避免 [1..] 两次独立切片分配
         let words = words_rev.split_off(1);
+        let codes = codes_rev.split_off(1);
         let text = words.concat();
-        (text, words)
+        (text, words, codes)
     }
 
     /// 收集完整覆盖到音节末尾的结果。
@@ -292,11 +342,12 @@ impl<'a> GraphDecoder<'a> {
         let mut results = Vec::new();
         if let Some(final_states) = dp.get(n) {
             for (idx, state) in final_states.iter().enumerate() {
-                let (text, words) = self.rebuild_path(dp, n, idx);
+                let (text, words, word_codes) = self.rebuild_path(dp, n, idx);
                 results.push(DecodeResult {
                     text,
                     score: state.score,
                     words,
+                    word_codes,
                     is_partial: false,
                 });
             }
@@ -333,15 +384,22 @@ impl<'a> GraphDecoder<'a> {
             let mut hybrid_results = Vec::new();
 
             for (state_idx, state) in states.iter().enumerate().take(self.beam_width) {
-                let state_text = self.rebuild_path(dp, end, state_idx).0;
-                for (suffix_text, suffix_score) in &fallback_suffixes {
-                    let text = state_text.clone() + suffix_text;
+                let (state_text, state_words, state_codes) = self.rebuild_path(dp, end, state_idx);
+                for (suffix_segments, suffix_codes, suffix_score) in &fallback_suffixes {
+                    let text = state_text.clone() + &suffix_segments.join("");
+                    // 混合结果：前缀沿用回溯链的词级编码，后缀逐音节成词；
+                    // 占位段（无单字候选）编码为空串，学习侧跳过空编码对
+                    let mut words = state_words.clone();
+                    let mut codes = state_codes.clone();
+                    words.extend(suffix_segments.iter().cloned());
+                    codes.extend(suffix_codes.iter().cloned());
                     let score =
                         state.score + suffix_score - self.config.hybrid_penalty - uncovered_penalty;
                     hybrid_results.push(DecodeResult {
                         text,
                         score,
-                        words: Vec::new(),
+                        words,
+                        word_codes: codes,
                         is_partial: true,
                     });
                 }
@@ -366,11 +424,12 @@ impl<'a> GraphDecoder<'a> {
             if let Some(states) = dp.get(end)
                 && let Some(best) = states.first()
             {
-                let (text, words) = self.rebuild_path(dp, end, 0);
+                let (text, words, word_codes) = self.rebuild_path(dp, end, 0);
                 return vec![DecodeResult {
                     text,
                     score: best.score - self.config.final_fallback_penalty,
                     words,
+                    word_codes,
                     is_partial: true,
                 }];
             }
@@ -406,39 +465,19 @@ impl<'a> GraphDecoder<'a> {
         let n = graph.total_len();
         let mut word_edges: Vec<Vec<WordEdge>> = vec![Vec::new(); n + 1];
 
-        for (start, edges) in word_edges.iter_mut().enumerate().take(n + 1) {
-            // 从 start 出发，沿着音节图做深度优先搜索，
-            // 收集所有长度不超过 max_word_syllables 的音节串前缀
-            let mut stack: Vec<(usize, String, usize)> = Vec::new();
-
-            for (end, syllable) in graph.edges_from(start) {
-                stack.push((*end, syllable.clone(), 1));
-            }
-
-            while let Some((pos, spaced_prefix, syllable_count)) = stack.pop() {
-                // 实时查询词典
-                let candidates = self.dict.lookup(&spaced_prefix);
-                for cand in &candidates {
+        for (start, edges) in word_edges.iter_mut().enumerate() {
+            // 实时查询词典，枚举从 start 出发的所有合法词
+            for_each_syllable_prefix(graph, start, self.max_word_syllables, |pos, code, count| {
+                for cand in self.dict.lookup(code) {
                     edges.push(WordEdge {
                         end_pos: pos,
                         text: Arc::from(cand.text.as_str()),
+                        code: Arc::from(code),
                         base_score: cand.score as f64,
-                        syllable_count,
+                        syllable_count: count,
                     });
                 }
-
-                // 继续延伸，如果音节数未超限且还有后续边
-                if syllable_count < self.max_word_syllables && pos < n {
-                    for (next_end, next_syllable) in graph.edges_from(pos) {
-                        let mut new_prefix =
-                            String::with_capacity(spaced_prefix.len() + 1 + next_syllable.len());
-                        new_prefix.push_str(&spaced_prefix);
-                        new_prefix.push(' ');
-                        new_prefix.push_str(next_syllable);
-                        stack.push((*next_end, new_prefix, syllable_count + 1));
-                    }
-                }
-            }
+            });
         }
 
         word_edges
@@ -453,22 +492,23 @@ impl<'a> GraphDecoder<'a> {
     }
 
     /// 对给定字节范围 [start, end) 内的每个音节查询单字候选，
-    /// 返回拼接后的文本和分数列表（top-k 组合）。
+    /// 返回拼接后的 (逐音节文本段, 逐音节编码列表, 分数) 列表（top-k 组合）。
+    /// 文本段与编码一一对应，供混合结果的词级学习使用；文本 = 段拼接。
     ///
-    /// 如果某个音节无单字候选，保留原拼音字母作为占位并施加惩罚。
+    /// 如果某个音节无单字候选，保留原拼音字母作为占位并施加惩罚，编码为空串。
     fn fallback_for_range(
         &self,
         graph: &SyllableGraph,
         start: usize,
         end: usize,
-    ) -> Vec<(String, f64)> {
+    ) -> Vec<(Vec<String>, Vec<String>, f64)> {
         debug!("fallback_for_range: start={}, end={}", start, end);
         let Some(syllables) = graph.find_path_from(start) else {
             debug!("fallback_for_range: no path from start={}", start);
             return Vec::new();
         };
 
-        let mut results = vec![(String::new(), 0.0)];
+        let mut results = vec![(Vec::<String>::new(), Vec::<String>::new(), 0.0)];
         let mut pos = start;
 
         for syllable in &syllables {
@@ -481,25 +521,29 @@ impl<'a> GraphDecoder<'a> {
             let mut new_results = Vec::new();
 
             if candidates.is_empty() {
-                // 无单字匹配，用拼音占位并惩罚
-                for (text, score) in results {
-                    let mut t = text;
-                    t.push_str(syllable);
-                    new_results.push((t, score - 5.0));
+                // 无单字匹配，用拼音占位并惩罚；编码留空（学习侧跳过）
+                for (segments, codes, score) in results {
+                    let mut s = segments;
+                    s.push(syllable.clone());
+                    let mut c = codes;
+                    c.push(String::new());
+                    new_results.push((s, c, score - 5.0));
                 }
             } else {
-                for (text, score) in results {
+                for (segments, codes, score) in results {
                     for cand in &candidates {
-                        let mut t = text.clone();
-                        t.push_str(&cand.text);
-                        let s = score + (cand.score as f64 + 1.0).ln();
-                        new_results.push((t, s));
+                        let mut s = segments.clone();
+                        s.push(cand.text.clone());
+                        let mut c = codes.clone();
+                        c.push(syllable.clone());
+                        let sc = score + (cand.score as f64 + 1.0).ln();
+                        new_results.push((s, c, sc));
                     }
                 }
             }
 
             results = new_results;
-            results.sort_by(|a, b| b.1.total_cmp(&a.1));
+            results.sort_by(|a, b| b.2.total_cmp(&a.2));
             results.truncate(5);
             pos = next_pos;
 
@@ -593,6 +637,9 @@ mod tests {
 
         // 最高分应该是 "中国"（长词偏好 + 高频）
         assert_eq!(results[0].text, "中国");
+        // 词级编码与分词一一对应
+        assert_eq!(results[0].words, vec!["中国".to_string()]);
+        assert_eq!(results[0].word_codes, vec!["zhong guo".to_string()]);
     }
 
     #[test]
@@ -612,6 +659,37 @@ mod tests {
 
         // 应该优先 "中国人" 而非 "中国"+"人"
         assert_eq!(results[0].text, "中国人");
+        assert_eq!(results[0].words, vec!["中国人".to_string()]);
+        assert_eq!(results[0].word_codes, vec!["zhong guo ren".to_string()]);
+    }
+
+    /// 分词编码：多词路径下 word_codes 与 words 一一对应（整句逐词学习的输入）
+    #[test]
+    fn test_decode_word_codes_match_words() {
+        // 词库没有 "zhong guo ren" 整句词，强制走 "中国"+"人" 两词路径
+        let dict = build_dict(&[
+            ("zhong guo", "中国", 120),
+            ("ren", "人", 50),
+            ("ren min", "人民", 110),
+        ]);
+        let decoder = GraphDecoder::new(&dict);
+        let graph = SyllableGraph::from_single_segmentation(&[
+            "zhong".to_string(),
+            "guo".to_string(),
+            "ren".to_string(),
+        ]);
+
+        let results = decoder.decode(&graph);
+        let multi = results
+            .iter()
+            .find(|r| r.words.len() > 1)
+            .expect("应存在多词路径结果");
+        assert_eq!(multi.words.len(), multi.word_codes.len());
+        assert_eq!(multi.words, vec!["中国".to_string(), "人".to_string()]);
+        assert_eq!(
+            multi.word_codes,
+            vec!["zhong guo".to_string(), "ren".to_string()]
+        );
     }
 
     #[test]
