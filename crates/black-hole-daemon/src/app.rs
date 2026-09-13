@@ -8,7 +8,9 @@ use black_hole_platform::linux_ibus::auto_register::{
     is_registered as is_registered_linux, register_ime as register_ime_linux,
 };
 #[cfg(target_os = "windows")]
-use black_hole_platform::windows_tsf::auto_register::{is_registered, register_ime};
+use black_hole_platform::windows_tsf::auto_register::{
+    enable_keyboard, is_profile_enabled, is_registered, register_ime,
+};
 #[cfg(target_os = "linux")]
 use black_hole_platform::{LinuxIbusIme, PlatformError as LinuxPlatformError};
 #[cfg(target_os = "windows")]
@@ -319,31 +321,44 @@ impl App {
 
     #[cfg(target_os = "windows")]
     fn ensure_ime_registered() {
-        if is_registered() {
-            info!("IME already registered");
-            return;
-        }
+        if !is_registered() {
+            let dll_path = match env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("black_hole_platform.dll")))
+            {
+                Some(p) => p,
+                None => {
+                    warn!("Could not determine DLL path for auto-registration");
+                    return;
+                }
+            };
 
-        let dll_path = match env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("black_hole_platform.dll")))
-        {
-            Some(p) => p,
-            None => {
-                warn!("Could not determine DLL path for auto-registration");
+            if !dll_path.exists() {
+                warn!("Platform DLL not found at: {}", dll_path.display());
                 return;
             }
-        };
 
-        if !dll_path.exists() {
-            warn!("Platform DLL not found at: {}", dll_path.display());
+            info!("IME not registered, attempting auto-registration...");
+            if let Err(e) = register_ime(&dll_path) {
+                warn!("Auto-registration failed: {}", e);
+                return;
+            }
+            info!("Auto-registration succeeded");
+        } else {
+            info!("IME already registered");
+        }
+
+        // 已注册但未启用（未添加到输入法列表）时自动启用，等效于设置中"添加键盘"。
+        // 用户在设置中手动移除键盘后，此调用会重新启用；注册后首次运行也会走到这里。
+        if is_profile_enabled() {
+            info!("IME keyboard already enabled");
             return;
         }
 
-        info!("IME not registered, attempting auto-registration...");
-        match register_ime(&dll_path) {
-            Ok(()) => info!("Auto-registration succeeded"),
-            Err(e) => warn!("Auto-registration failed: {}", e),
+        info!("IME keyboard not enabled, attempting to add to input method list...");
+        match enable_keyboard() {
+            Ok(()) => info!("Keyboard enabled successfully"),
+            Err(e) => warn!("Failed to enable keyboard: {}", e),
         }
     }
 

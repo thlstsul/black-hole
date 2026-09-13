@@ -2,13 +2,27 @@ use std::io::{self, ErrorKind};
 use std::mem;
 use std::path::Path;
 use std::ptr;
+use tracing::debug;
 use windows::Win32::Foundation::{CloseHandle, HWND, WAIT_OBJECT_0};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+    CoUninitialize,
+};
 use windows::Win32::System::Registry::{HKEY_CLASSES_ROOT, KEY_READ, RegCloseKey, RegOpenKeyExW};
 use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+use windows::Win32::UI::Input::KeyboardAndMouse::HKL;
 use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
-use windows_core::PCWSTR;
+use windows::Win32::UI::TextServices::{
+    CLSID_TF_InputProcessorProfiles, ITfInputProcessorProfileMgr, ITfInputProcessorProfiles,
+    TF_IPP_FLAG_ENABLED, TF_PROFILETYPE_INPUTPROCESSOR,
+};
+use windows_core::{IUnknown, PCWSTR};
 
-use super::CLSID_BLACKHOLE_TIP;
+use super::registry::DEFAULT_LANGID;
+use super::{CLSID_BLACKHOLE_TIP, GUID_PROFILE_BLACKHOLE};
+
+/// 输入法注册的语言 ID（与 registry.rs 中 PROFILE_LANGIDS 同源）。
+const LANGID: u16 = DEFAULT_LANGID;
 
 // ---------------------------------------------------------------------------
 // Registration check
@@ -108,6 +122,90 @@ pub fn register_ime(dll_path: &Path) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Enable keyboard (add to input method list)
+// ---------------------------------------------------------------------------
+
+/// 检查输入法语言配置文件是否已启用（即已添加到输入法列表）。
+///
+/// 通过 `ITfInputProcessorProfileMgr::GetProfile` 查询：返回 `Ok` 且
+/// `dwFlags` 含 `TF_IPP_FLAG_ENABLED` 时视为已启用。仅注册（regsvr32）不会
+/// 自动启用配置文件，需要此检查判断用户是否已手动添加键盘。
+pub fn is_profile_enabled() -> bool {
+    unsafe {
+        // TSF COM 对象在未初始化 COM 的进程中也可按进程内方式创建；
+        // RPC_E_CHANGED_MODE 表示线程已用其他并发模型初始化过 COM，仍可直接使用，
+        // 但此时不能调用 CoUninitialize（本次调用未添加引用）。
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let com_initialized = hr.is_ok();
+
+        let enabled = CoCreateInstance::<Option<&IUnknown>, ITfInputProcessorProfileMgr>(
+            &CLSID_TF_InputProcessorProfiles,
+            None,
+            CLSCTX_INPROC_SERVER,
+        )
+        .map(|profile_mgr| {
+            let mut profile = mem::zeroed();
+            match profile_mgr.GetProfile(
+                TF_PROFILETYPE_INPUTPROCESSOR,
+                LANGID,
+                &CLSID_BLACKHOLE_TIP,
+                &GUID_PROFILE_BLACKHOLE,
+                HKL(ptr::null_mut()),
+                &mut profile,
+            ) {
+                Ok(()) => profile.dwFlags & TF_IPP_FLAG_ENABLED != 0,
+                Err(e) => {
+                    debug!("GetProfile failed, treating as not enabled: {}", e);
+                    false
+                }
+            }
+        })
+        .inspect_err(|e| {
+            debug!("Failed to create TSF profile manager instance: {}", e);
+        })
+        .unwrap_or(false);
+
+        if com_initialized {
+            CoUninitialize();
+        }
+        enabled
+    }
+}
+
+/// 将输入法启用到当前用户输入法列表（等效于设置中"添加键盘"）。
+///
+/// `ITfInputProcessorProfiles::EnableLanguageProfile` 是按当前用户（HKCU）
+/// 生成的启用状态写入，无需管理员权限。对已启用的配置文件重复调用是幂等的。
+///
+/// # Errors
+///
+/// - COM 初始化或接口创建失败时返回错误
+/// - TSF 拒绝启用该配置文件时返回错误
+pub fn enable_keyboard() -> io::Result<()> {
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let com_initialized = hr.is_ok();
+
+        let result = CoCreateInstance::<Option<&IUnknown>, ITfInputProcessorProfiles>(
+            &CLSID_TF_InputProcessorProfiles,
+            None,
+            CLSCTX_INPROC_SERVER,
+        )
+        .map_err(|e| io::Error::other(format!("Failed to create TSF profile instance: {}", e)))
+        .and_then(|profiles| {
+            profiles
+                .EnableLanguageProfile(&CLSID_BLACKHOLE_TIP, LANGID, &GUID_PROFILE_BLACKHOLE, true)
+                .map_err(|e| io::Error::other(format!("EnableLanguageProfile failed: {}", e)))
+        });
+
+        if com_initialized {
+            CoUninitialize();
+        }
+        result
+    }
 }
 
 // ---------------------------------------------------------------------------

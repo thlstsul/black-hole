@@ -80,7 +80,10 @@ const SUPPORT_CATEGORIES: &[GUID] = &[
 ];
 
 /// Language IDs for which we register a profile.
-const PROFILE_LANGIDS: &[(u16, &str)] = &[(0x0804, "0804")];
+const PROFILE_LANGIDS: &[(u16, &str)] = &[(DEFAULT_LANGID, "0804")];
+
+/// 输入法注册/启用的语言 ID（简体中文），是 LANGID 的单一来源。
+pub(crate) const DEFAULT_LANGID: u16 = 0x0804;
 
 // ---------------------------------------------------------------------------
 // DllRegisterServer
