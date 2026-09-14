@@ -8,6 +8,13 @@ use std::sync::{Arc, Mutex};
 
 const SCROLL_AREA_MAX_HEIGHT: f32 = 200.0;
 
+/// 隐藏态的停放位置（屏幕外）。eframe 在首帧渲染后会无条件
+/// `set_visible(true)`（见 `epi_integration::post_rendering`），而我们通过
+/// `ViewportCommand::Visible(false)` 发出的隐藏要等同一轮事件循环的
+/// `handle_viewport_output` 才生效，中间留有一帧的可见窗口期——启动时
+/// 表现为候选窗"一闪而过"。把窗口停到屏幕外后，即使被短暂强制显示也不可见。
+const OFFSCREEN_POS: Pos2 = Pos2::new(-32000.0, -32000.0);
+
 pub(crate) struct AppState {
     visible: bool,
     code: String,
@@ -91,8 +98,11 @@ impl App for ImeUiApp {
             return;
         }
 
-        // 不可见或无候选时隐藏窗口
+        // 不可见或无候选时隐藏窗口：停放到屏幕外并置不可见。
+        // 仅 Visible(false) 不够——eframe 每帧 post_rendering 都会强制
+        // set_visible(true)，故必须同时挪出屏幕兜底。
         if !(state.visible && !state.candidates.is_empty()) {
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(OFFSCREEN_POS));
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
             return;
         }
