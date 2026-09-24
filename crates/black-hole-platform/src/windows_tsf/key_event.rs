@@ -5,7 +5,7 @@ use super::caret::{
 use super::commit::apply_result;
 use super::hook::focused_thread_id;
 use super::{ServiceInner, try_reconnect_ipc};
-use crate::ipc::{IpcRequest, read_response, send_request};
+use crate::ipc::{IpcRequest, read_response, send_request_buf};
 use black_hole_shared::{
     InputContext, KeyEvent, KeyState, ModeSuggestion, Modifiers, suggest_input_mode,
 };
@@ -277,35 +277,50 @@ fn handle_key_event_internal(
 
             let conn = inner.ipc_conn.as_mut().ok_or(E_UNEXPECTED)?;
 
-            // 读取光标周围文本并同步给 daemon（供整句补全提供上下文）。
-            // SetContext 为单向请求（daemon 不写响应），随后 KeyEvent 正常请求-响应。
+            // 读取光标周围文本并随 KeyEvent 合并发送（供整句补全提供上下文），
+            // 省去独立 SetContext 的额外一轮写+解析，按键路径单请求单响应。
             // 注：TSF 文本存储不可用的应用（VSCode 虚拟化编辑器、纯 IMM32 如 Zed）
-            // 周围文本不可得，此处不发送 SetContext，整句补全按无上下文处理——与
+            // 周围文本不可得，context 为 None，整句补全按无上下文处理——与
             // 自动切换一致"宁缺毋滥"，不再走 UIA 屏幕阅读文本通道（污染不可靠，
             // 若需恢复补全上下文应走独立的干净文档文本通道）。
+            let mut merged_ctx = None;
             if let Some((preceding_text, following_text)) = &surrounding {
-                // 惰性查询光标坐标：仅 SetContext 消费方需要，且仅当布局缓存缺失时
+                // 惰性查询光标坐标：仅 context 消费方需要，且仅当布局缓存缺失时
                 // 才实时查询（or_else 惰性求值，避免每键一次 GetGUIThreadInfo）。
                 // 布局缓存 last_caret_pos（ITfContextView::GetTextExt，最可靠）优先，
                 // 实时查询基于 GetForegroundWindow，跨进程场景可能返回过期/错误窗口坐标
                 if let Some((caret_x, caret_y, caret_h)) =
                     last_caret_pos.or_else(|| get_caret_position_via_gui_thread_info().ok())
                 {
-                    let set_ctx = IpcRequest::SetContext(InputContext {
+                    merged_ctx = Some(InputContext {
                         caret_x,
                         caret_y,
                         caret_h,
                         preceding_text: preceding_text.clone(),
                         following_text: following_text.clone(),
                     });
-                    let _ = send_request(&mut conn.writer, &set_ctx);
                 }
             }
 
-            let request = IpcRequest::KeyEvent(key_event.clone());
-            send_request(&mut conn.writer, &request).map_err(|_| E_UNEXPECTED)?;
+            let request = IpcRequest::KeyEvent {
+                key: key_event.clone(),
+                context: merged_ctx,
+            };
+            // 发送/读取失败：丢弃半死连接，让下一次按键经 ensure/try_reconnect
+            // 限频重建管道（try_reconnect_ipc 仅在 ipc_conn 为 None 时重连，
+            // 不清理会导致后续所有按键都在死连接上失败）。
+            if send_request_buf(&mut conn.writer, &request, &mut conn.send_buf).is_err() {
+                inner.ipc_conn = None;
+                return Err(E_UNEXPECTED.into());
+            }
 
-            let response = read_response(&mut conn.reader).map_err(|_| E_UNEXPECTED)?;
+            let response = match read_response(&mut conn.reader, &mut conn.resp_buf) {
+                Ok(resp) => resp,
+                Err(_) => {
+                    inner.ipc_conn = None;
+                    return Err(E_UNEXPECTED.into());
+                }
+            };
 
             drop(inner);
             apply_result(service.clone(), ec, &ctx, &response.into())?;

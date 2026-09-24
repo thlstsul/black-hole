@@ -9,12 +9,13 @@
 //!
 //! Reference: Microsoft SampleIME project.
 
-use crate::ipc::{IPC_SERVER_ADDR, IpcRequest, IpcResponse, send_request};
-use serde_json::{from_str, to_string};
+use crate::ipc::{
+    IPC_PIPE_NAME, IpcListener, IpcRequest, IpcResponse, IpcStream, read_request, send_request_buf,
+    send_response_buf,
+};
 use std::ffi::c_void;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self};
 use std::mem::discriminant;
-use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -114,10 +115,13 @@ pub(crate) fn get_dll_instance() -> Option<HINSTANCE> {
 // Internal service state (shared between COM threads)
 // ---------------------------------------------------------------------------
 
-/// IPC connection wrapper to avoid creating BufReader on every key press.
+/// IPC connection wrapper to avoid allocating on every key press.
+/// `resp_buf`/`send_buf` 为帧载荷复用缓冲（读写热路径零分配）。
 pub(crate) struct IpcConnection {
-    pub(crate) writer: TcpStream,
-    pub(crate) reader: BufReader<TcpStream>,
+    pub(crate) writer: IpcStream,
+    pub(crate) reader: IpcStream,
+    pub(crate) resp_buf: Vec<u8>,
+    pub(crate) send_buf: Vec<u8>,
 }
 
 /// 最近一次语境建议采样快照。由三个 TSF 采样点（key_event.rs 的
@@ -278,8 +282,6 @@ unsafe impl Sync for ServiceInner {}
 
 /// 重连最小间隔：daemon 不可用时限制重连频率，避免不断重连、刷日志。
 const RECONNECT_MIN_INTERVAL: Duration = Duration::from_millis(1000);
-/// 单次连接尝试超时，防止 SYN 被防火墙/杀软丢弃时长时间阻塞调用线程。
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// 确保与 daemon 的 IPC 连接存在;若已断开(如 daemon 重启)则自动重连。
 /// 返回连接是否可用。供菜单命令、候选窗等非按键路径复用。
@@ -310,32 +312,22 @@ pub(crate) fn try_reconnect_ipc(inner_arc: &Arc<Mutex<ServiceInner>>) -> bool {
     // 先记录尝试时间再连接，使连续调用被限频。
     inner_arc.lock().unwrap().last_reconnect_attempt = Some(Instant::now());
 
-    let addr: SocketAddr = match IPC_SERVER_ADDR.parse() {
-        Ok(a) => a,
-        Err(_) => {
-            error!(
-                "try_reconnect_ipc: invalid IPC address: {}",
-                IPC_SERVER_ADDR
-            );
-            return false;
-        }
-    };
-
-    match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+    match IpcStream::connect(IPC_PIPE_NAME) {
         Ok(stream) => {
-            let _ = stream.set_nodelay(true);
             let reader = match stream.try_clone() {
-                Ok(r) => BufReader::new(r),
+                Ok(r) => r,
                 Err(_) => return false,
             };
             let mut inner = inner_arc.lock().unwrap();
             inner.ipc_conn = Some(IpcConnection {
                 writer: stream,
                 reader,
+                resp_buf: Vec::with_capacity(4096),
+                send_buf: Vec::with_capacity(4096),
             });
             info!(
                 "try_reconnect_ipc: connected to daemon at {}",
-                IPC_SERVER_ADDR
+                IPC_PIPE_NAME
             );
             // 释放锁后重新同步设置：daemon 可能已重启且方案/主题/中英模式/
             // 自动切换开关发生变化，避免本进程残留旧状态。连接/重连始终
@@ -367,7 +359,7 @@ pub(crate) fn send_ui_command_inner(inner_arc: &Arc<Mutex<ServiceInner>>, cmd: U
     let request = IpcRequest::UiCommand(cmd);
     let mut inner = inner_arc.lock().unwrap();
     if let Some(ref mut conn) = inner.ipc_conn
-        && let Err(e) = send_request(&mut conn.writer, &request)
+        && let Err(e) = send_request_buf(&mut conn.writer, &request, &mut conn.send_buf)
     {
         warn!("send_ui_command_inner: send failed: {}", e);
         inner.ipc_conn = None;
@@ -411,17 +403,16 @@ impl PlatformIme for WindowsTsfIme {
         platform_rx: Receiver<SchemeResult>,
         ui_tx: Sender<UiCommand>,
     ) -> Result<(), PlatformError> {
-        let listener = TcpListener::bind(IPC_SERVER_ADDR)
-            .map_err(|e| PlatformError::Other(format!("Failed to bind IPC server: {}", e)))?;
+        let listener = IpcListener::bind(IPC_PIPE_NAME)
+            .map_err(|e| PlatformError::Other(format!("Failed to bind IPC pipe: {}", e)))?;
 
-        info!("Windows TSF IPC server listening on {}", IPC_SERVER_ADDR);
+        info!("Windows TSF IPC server listening on {}", IPC_PIPE_NAME);
 
         let platform_rx = Arc::new(Mutex::new(platform_rx));
 
-        for stream in listener.incoming() {
-            match stream {
+        loop {
+            match listener.accept() {
                 Ok(stream) => {
-                    let _ = stream.set_nodelay(true);
                     info!("TSF DLL connected");
                     let engine_tx = engine_tx.clone();
                     let platform_rx = Arc::clone(&platform_rx);
@@ -436,25 +427,40 @@ impl PlatformIme for WindowsTsfIme {
                     });
                 }
                 Err(e) => {
+                    // 名称冲突等不可重试错误（ERROR_ACCESS_DENIED：另一 daemon
+                    // 已服务同名管道）：fail-fast 退出，避免无限刷错误日志。
+                    // bind 的试探实例已拦截绝大多数冲突，此处是兜底。
+                    if e.kind() == io::ErrorKind::PermissionDenied {
+                        return Err(PlatformError::Other(format!(
+                            "IPC pipe {} unavailable (another daemon running?): {}",
+                            IPC_PIPE_NAME, e
+                        )));
+                    }
                     error!("IPC accept error: {}", e);
                 }
             }
         }
-
-        Ok(())
     }
 }
 
+/// 处理单个 TSF DLL 连接：按帧协议循环读取请求并分发。
+///
+/// 并发说明：`PIPE_UNLIMITED_INSTANCES` 允许多个宿主进程中的 TSF DLL 同时
+/// 连接，但所有连接共享同一个 `platform_rx`（Mutex<Receiver>）——
+/// 引擎是单实例，多客户端的按键请求在 `send_engine` 的锁上自然串行化，
+/// 这是当前设计的有意取舍（引擎状态本身不并发）。若未来出现引擎响应
+/// 阻塞，会放大为所有客户端按键延迟，届时应改为按连接分队列。
 fn handle_ipc_client(
-    stream: TcpStream,
+    stream: IpcStream,
     engine_tx: Sender<EngineCommand>,
     platform_rx: Arc<Mutex<Receiver<SchemeResult>>>,
     ui_tx: Sender<UiCommand>,
     current: Arc<Mutex<RuntimeSettings>>,
 ) -> io::Result<()> {
-    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut reader = stream.try_clone()?;
     let mut writer = stream;
-    let mut line = String::new();
+    // 帧载荷缓冲：循环外分配一次，循环内复用（热路径零分配）
+    let mut buf = Vec::with_capacity(4096);
 
     let send_engine = |cmd: EngineCommand| -> io::Result<SchemeResult> {
         let rx = platform_rx.lock().unwrap();
@@ -465,26 +471,44 @@ fn handle_ipc_client(
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))
     };
 
-    let write_response = |writer: &mut TcpStream, result: SchemeResult| -> io::Result<()> {
-        let response: IpcResponse = result.into();
-        let json =
-            to_string(&response).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        writeln!(writer, "{}", json)?;
-        writer.flush()
-    };
+    let write_response =
+        |writer: &mut IpcStream, buf: &mut Vec<u8>, result: SchemeResult| -> io::Result<()> {
+            let response: IpcResponse = result.into();
+            send_response_buf(writer, &response, buf)
+        };
 
-    while reader.read_line(&mut line)? > 0 {
-        let request: IpcRequest =
-            from_str(line.trim()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    loop {
+        let request = match read_request(&mut reader, &mut buf) {
+            Ok(req) => req,
+            // 客户端正常断开：命名管道上干净关闭表现为 BrokenPipe
+            // （ReadFile 失败于 ERROR_BROKEN_PIPE/ERROR_NO_DATA），
+            // UnexpectedEof 覆盖长度前缀读到 0 字节、ConnectionReset 覆盖帧中断开
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
 
         debug!("handle_ipc_client start: req={:?}", discriminant(&request));
         match request {
-            IpcRequest::KeyEvent(key) => {
+            IpcRequest::KeyEvent { key, context } => {
+                // 合并请求：先应用按键附带的上下文（整句补全），再处理按键，
+                // 单次往返完成原先 SetContext + KeyEvent 两次写。
+                if let Some(ctx) = context {
+                    let _ = engine_tx.send(EngineCommand::SetContext(ctx));
+                }
                 let result = send_engine(EngineCommand::Key(key))?;
                 if let SchemeResult::Committed { ref text, .. } = result {
                     let _ = ui_tx.send(UiCommand::CommitText(text.clone()));
                 }
-                write_response(&mut writer, result)?;
+                write_response(&mut writer, &mut buf, result)?;
             }
             IpcRequest::SetContext(new_ctx) => {
                 let _ = engine_tx.send(EngineCommand::SetContext(new_ctx));
@@ -492,7 +516,7 @@ fn handle_ipc_client(
             IpcRequest::Reset => {
                 let result = send_engine(EngineCommand::Reset)?;
                 let _ = ui_tx.send(UiCommand::HideCandidates);
-                write_response(&mut writer, result)?;
+                write_response(&mut writer, &mut buf, result)?;
             }
             IpcRequest::UiCommand(ui_cmd) => {
                 let _ = ui_tx.send(ui_cmd);
@@ -505,16 +529,9 @@ fn handle_ipc_client(
                     english: settings.english,
                     auto_switch: settings.auto_switch,
                 };
-                let json = to_string(&response)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                writeln!(writer, "{}", json)?;
-                writer.flush()?;
+                send_response_buf(&mut writer, &response, &mut buf)?;
             }
         }
         debug!("handle_ipc_client end");
-
-        line.clear();
     }
-
-    Ok(())
 }

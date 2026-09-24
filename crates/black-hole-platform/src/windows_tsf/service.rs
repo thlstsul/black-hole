@@ -1,4 +1,4 @@
-use super::super::ipc::{IpcRequest, IpcResponse, read_response, send_request};
+use super::super::ipc::{IpcRequest, IpcResponse, read_response, send_request_buf};
 use super::auto_switch::{AutoSwitchEditSession, SuggestionReadSession, apply_auto_mode_toggle};
 use super::caret::LayoutChangeEditSession;
 use super::commit::{CancelCompositionEditSession, CommitCompositionEditSession};
@@ -182,8 +182,8 @@ impl BlackHoleTextService {
             let mut inner = self.inner.lock().unwrap();
             if let Some(ref mut conn) = inner.ipc_conn {
                 let request = IpcRequest::Reset;
-                let _ = send_request(&mut conn.writer, &request);
-                let _ = read_response(&mut conn.reader);
+                let _ = send_request_buf(&mut conn.writer, &request, &mut conn.send_buf);
+                let _ = read_response(&mut conn.reader, &mut conn.resp_buf);
             }
             (inner.context.clone(), inner.client_id)
         };
@@ -382,7 +382,7 @@ pub(crate) fn sync_settings_from_daemon_inner(inner_arc: &Arc<Mutex<ServiceInner
             return;
         };
         let request = IpcRequest::GetSettings;
-        if send_request(&mut conn.writer, &request).is_err() {
+        if send_request_buf(&mut conn.writer, &request, &mut conn.send_buf).is_err() {
             return;
         }
         let Ok(IpcResponse::Settings {
@@ -390,7 +390,7 @@ pub(crate) fn sync_settings_from_daemon_inner(inner_arc: &Arc<Mutex<ServiceInner
             theme,
             english,
             auto_switch,
-        }) = read_response(&mut conn.reader)
+        }) = read_response(&mut conn.reader, &mut conn.resp_buf)
         else {
             return;
         };
@@ -933,50 +933,64 @@ impl ITfThreadMgrEventSink_Impl for BlackHoleTextService_Impl {
 mod tests {
     use super::super::IpcConnection;
     use super::*;
+    use crate::ipc::{IpcListener, IpcStream, read_request, send_response_buf};
     use black_hole_shared::{SchemeId, Theme};
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::thread;
 
-    /// 启动一个 mock daemon：接受连接后循环响应请求。
+    /// 每个测试用独立管道名（Named Pipe 无法匿名绑定，需唯一名称避免并行测试冲突）。
+    fn unique_pipe_name() -> String {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        format!(
+            r"\\.\pipe\black-hole-ime-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// 启动一个 mock daemon：循环接受连接并按帧协议响应请求。
     /// GetSettings 固定返回 english=true 的 Settings，其余请求返回 Ignored。
-    fn spawn_mock_daemon() -> std::net::SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
+    fn spawn_mock_daemon() -> String {
+        let pipe_name = unique_pipe_name();
+        let listener = IpcListener::bind(&pipe_name).unwrap();
         thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut line = String::new();
+            while let Ok(mut stream) = listener.accept() {
+                let mut reader = stream.try_clone().unwrap();
+                let mut buf = Vec::with_capacity(4096);
                 loop {
-                    line.clear();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                        break;
+                    buf.clear();
+                    match read_request(&mut reader, &mut buf) {
+                        Ok(req) => {
+                            let resp = match req {
+                                IpcRequest::GetSettings => IpcResponse::Settings {
+                                    scheme_id: SchemeId::Pinyin,
+                                    theme: Theme::Light,
+                                    english: true,
+                                    auto_switch: false,
+                                },
+                                _ => IpcResponse::Ignored,
+                            };
+                            if send_response_buf(&mut stream, &resp, &mut buf).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
                     }
-                    let resp = match serde_json::from_str::<IpcRequest>(line.trim()) {
-                        Ok(IpcRequest::GetSettings) => IpcResponse::Settings {
-                            scheme_id: SchemeId::Pinyin,
-                            theme: Theme::Light,
-                            english: true,
-                            auto_switch: false,
-                        },
-                        _ => IpcResponse::Ignored,
-                    };
-                    let json = serde_json::to_string(&resp).unwrap();
-                    writeln!(stream, "{}", json).unwrap();
-                    stream.flush().unwrap();
                 }
             }
         });
-        addr
+        pipe_name
     }
 
     /// 构造连接到 mock daemon 的 ServiceInner（模拟"连接已建立"状态）。
-    fn connect_to_mock(addr: std::net::SocketAddr) -> Arc<Mutex<ServiceInner>> {
-        let stream = TcpStream::connect(addr).unwrap();
+    fn connect_to_mock(pipe_name: &str) -> Arc<Mutex<ServiceInner>> {
+        let stream = IpcStream::connect(pipe_name).unwrap();
         let mut inner = ServiceInner::new();
         inner.ipc_conn = Some(IpcConnection {
             writer: stream.try_clone().unwrap(),
-            reader: BufReader::new(stream),
+            reader: stream,
+            resp_buf: Vec::with_capacity(4096),
+            send_buf: Vec::with_capacity(4096),
         });
         Arc::new(Mutex::new(inner))
     }
@@ -984,12 +998,14 @@ mod tests {
     /// 模拟 try_reconnect_ipc 建立连接：仅写入 ipc_conn。
     /// 连接/重连后由调用方执行 sync_settings_from_daemon_inner——
     /// 该函数始终应用 daemon 当前中英模式，无门控。
-    fn establish_connection(inner_arc: &Arc<Mutex<ServiceInner>>, addr: std::net::SocketAddr) {
-        let stream = TcpStream::connect(addr).unwrap();
+    fn establish_connection(inner_arc: &Arc<Mutex<ServiceInner>>, pipe_name: &str) {
+        let stream = IpcStream::connect(pipe_name).unwrap();
         let mut inner = inner_arc.lock().unwrap();
         inner.ipc_conn = Some(IpcConnection {
             writer: stream.try_clone().unwrap(),
-            reader: BufReader::new(stream),
+            reader: stream,
+            resp_buf: Vec::with_capacity(4096),
+            send_buf: Vec::with_capacity(4096),
         });
     }
 
@@ -997,7 +1013,7 @@ mod tests {
     fn sync_settings_applies_daemon_english() {
         // 同步始终应用 daemon 当前模式：mock 返回 english=true → 本地英文
         let addr = spawn_mock_daemon();
-        let inner_arc = connect_to_mock(addr);
+        let inner_arc = connect_to_mock(&addr);
         sync_settings_from_daemon_inner(&inner_arc);
         assert!(inner_arc.lock().unwrap().mode_switch.is_english());
     }
@@ -1009,7 +1025,7 @@ mod tests {
         // 后正常触发，连接时处于英文模式也能自动切回中文。
         let addr = spawn_mock_daemon();
         let inner_arc = Arc::new(Mutex::new(ServiceInner::new()));
-        establish_connection(&inner_arc, addr);
+        establish_connection(&inner_arc, &addr);
         sync_settings_from_daemon_inner(&inner_arc);
         assert!(inner_arc.lock().unwrap().mode_switch.is_english());
     }
@@ -1018,7 +1034,7 @@ mod tests {
     fn reconnect_applies_daemon_current_mode() {
         // 会话中重连同样应用 daemon 当前模式（含英文），跨进程保持一致
         let addr = spawn_mock_daemon();
-        let inner_arc = connect_to_mock(addr);
+        let inner_arc = connect_to_mock(&addr);
         sync_settings_from_daemon_inner(&inner_arc);
         assert!(inner_arc.lock().unwrap().mode_switch.is_english());
     }
@@ -1035,7 +1051,7 @@ mod tests {
         assert!(inner_arc.lock().unwrap().ipc_conn.is_none());
 
         // 按键路径 try_reconnect_ipc 重连成功：建立连接
-        establish_connection(&inner_arc, addr);
+        establish_connection(&inner_arc, &addr);
         sync_settings_from_daemon_inner(&inner_arc);
         assert!(inner_arc.lock().unwrap().mode_switch.is_english());
     }
