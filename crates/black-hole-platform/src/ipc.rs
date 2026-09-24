@@ -155,27 +155,6 @@ pub(crate) const MAX_FRAME_SIZE: u32 = 64 * 1024;
 // 帧协议：4 字节小端长度前缀 + MessagePack 载荷
 // ---------------------------------------------------------------------------
 
-/// 编码一帧：4 字节小端长度前缀 + MessagePack 载荷拼入同一缓冲，
-/// 写入方单次 write_all（rmp-serde 1.3 未导出 to_writer，故先 to_vec 再拼接）。
-fn encode_frame<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, io::Error> {
-    let payload =
-        rmp_serde::to_vec(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let len = u32::try_from(payload.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame too large"))?;
-    let mut frame = Vec::with_capacity(4 + payload.len());
-    frame.extend_from_slice(&len.to_le_bytes());
-    frame.extend_from_slice(&payload);
-    Ok(frame)
-}
-
-/// 写入一帧：4 字节小端长度 + 载荷，单次 write_all。
-fn write_frame<W: Write>(writer: &mut W, value: &impl serde::Serialize) -> Result<(), io::Error> {
-    let frame = encode_frame(value)?;
-    writer.write_all(&frame)?;
-    writer.flush()?;
-    Ok(())
-}
-
 /// 读取一帧。`buf` 由调用方复用（热路径避免每键重新分配），
 /// 返回的切片在下次调用前有效。
 fn read_frame<'a, R: Read>(reader: &mut R, buf: &'a mut Vec<u8>) -> Result<&'a [u8], io::Error> {
@@ -194,13 +173,8 @@ fn read_frame<'a, R: Read>(reader: &mut R, buf: &'a mut Vec<u8>) -> Result<&'a [
     Ok(buf.as_slice())
 }
 
-/// IPC 通信辅助函数：发送请求（帧协议，MessagePack 载荷）
-pub fn send_request<W: Write>(writer: &mut W, request: &IpcRequest) -> Result<(), io::Error> {
-    write_frame(writer, request)
-}
-
 /// 编码一帧到调用方复用的缓冲（热路径零分配：clear + 复用容量），
-/// 再单次 write_all。语义与 [`write_frame`] 一致。
+/// 再单次 write_all。
 fn write_frame_buf<W: Write>(
     writer: &mut W,
     value: &impl serde::Serialize,
@@ -220,7 +194,7 @@ fn write_frame_buf<W: Write>(
     Ok(())
 }
 
-/// 发送请求到复用缓冲版 [`send_request`]：编码走调用方提供的 `buf`，
+/// 发送请求（复用缓冲版）：编码走调用方提供的 `buf`，
 /// 按键热路径不再每帧分配。`buf` 内容在调用间被覆盖复用。
 pub fn send_request_buf<W: Write>(
     writer: &mut W,
@@ -237,11 +211,6 @@ pub fn send_response_buf<W: Write>(
     buf: &mut Vec<u8>,
 ) -> Result<(), io::Error> {
     write_frame_buf(writer, response, buf)
-}
-
-/// IPC 通信辅助函数：发送响应（daemon 端用；与 send_request 同一帧格式）
-pub fn send_response<W: Write>(writer: &mut W, response: &IpcResponse) -> Result<(), io::Error> {
-    write_frame(writer, response)
 }
 
 /// IPC 通信辅助函数：读取请求（daemon 端用）。`buf` 复用避免每请求分配。
@@ -649,7 +618,7 @@ mod tests {
             context: None,
         };
         let mut wire = Vec::new();
-        send_request(&mut wire, &request).unwrap();
+        send_request_buf(&mut wire, &request, &mut Vec::new()).unwrap();
         let mut buf = Vec::new();
         let decoded = read_request(&mut wire.as_slice(), &mut buf).unwrap();
         assert_eq!(request, decoded);
@@ -672,7 +641,7 @@ mod tests {
             expanded: false,
         };
         let mut wire = Vec::new();
-        send_response(&mut wire, &response).unwrap();
+        send_response_buf(&mut wire, &response, &mut Vec::new()).unwrap();
         let mut buf = Vec::new();
         let decoded = read_response(&mut wire.as_slice(), &mut buf).unwrap();
         assert_eq!(response, decoded);

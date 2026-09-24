@@ -85,6 +85,7 @@ impl UserDictionary {
     }
 
     /// 创建内存用户词典（用于测试，不读写磁盘）
+    #[cfg(test)]
     pub fn open_in_memory() -> Self {
         Self {
             pinyin: UserDb::new(),

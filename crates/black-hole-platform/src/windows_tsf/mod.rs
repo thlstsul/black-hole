@@ -381,16 +381,6 @@ impl WindowsTsfIme {
         Self { current }
     }
 
-    /// 创建时指定初始值（内部创建共享状态）。
-    pub fn new_with_values(default_scheme: SchemeId, default_theme: Theme) -> Self {
-        Self {
-            current: Arc::new(Mutex::new(RuntimeSettings::new(
-                default_scheme,
-                default_theme,
-            ))),
-        }
-    }
-
     pub fn current(&self) -> &Arc<Mutex<RuntimeSettings>> {
         &self.current
     }

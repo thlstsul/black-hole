@@ -274,48 +274,14 @@ impl LanguageModel {
         Self::from_text_scores(total, text_scores)
     }
 
-    /// 加载预计算的 Bigram 概率对
-    ///
-    /// pairs: (prev_word, curr_word, log_probability)
+    /// 加载预计算的 Bigram 概率对（仅测试用）
+    #[cfg(test)]
     pub fn load_bigram_pairs(&mut self, pairs: &[(String, String, f64)]) {
         for (prev, curr, log_prob) in pairs {
             self.bigram
                 .entry(prev.clone())
                 .or_default()
                 .insert(curr.clone(), *log_prob);
-        }
-    }
-
-    /// 从用户上屏记录中简单学习 Bigram
-    ///
-    /// 将相邻的上屏文本视为 bigram 共现，统计频率后转为 log 概率。
-    /// 适用于用户个性化调频。
-    pub fn learn_from_commits(&mut self, commits: &[(String, String)]) {
-        // commits: (text, code)
-        let mut bigram_counts: FxHashMap<(String, String), u64> = FxHashMap::default();
-        let mut unigram_counts: FxHashMap<String, u64> = FxHashMap::default();
-
-        for i in 1..commits.len() {
-            let prev = &commits[i - 1].0;
-            let curr = &commits[i].0;
-            *bigram_counts
-                .entry((prev.clone(), curr.clone()))
-                .or_insert(0) += 1;
-            *unigram_counts.entry(prev.clone()).or_insert(0) += 1;
-        }
-
-        // 最后一个词也要计入 unigram
-        if let Some(last) = commits.last() {
-            *unigram_counts.entry(last.0.clone()).or_insert(0) += 1;
-        }
-
-        for ((prev, curr), count) in bigram_counts {
-            if let Some(&prev_count) = unigram_counts.get(&prev)
-                && prev_count > 0
-            {
-                let prob = count as f64 / prev_count as f64;
-                self.bigram.entry(prev).or_default().insert(curr, prob.ln());
-            }
         }
     }
 
@@ -359,22 +325,13 @@ impl LanguageModel {
         (base / char_count as f64).ln()
     }
 
-    /// 设置长词偏好奖励系数
-    pub fn set_long_word_bonus(&mut self, bonus: f64) {
-        self.long_word_bonus = bonus;
-    }
-
-    /// 设置 Bigram 回退权重
-    pub fn set_backoff_weight(&mut self, weight: f64) {
-        self.backoff_weight = weight;
-    }
-
     /// 个人 Bigram 观测入口：记录一次上屏转移（句首前词传 `None`）
     pub fn observe_user_transition(&mut self, prev: Option<&str>, curr: &str, times: u32) {
         self.user.observe(prev, curr, times);
     }
 
-    /// 个人 Bigram 是否有数据
+    /// 个人 Bigram 是否有数据（仅测试用）
+    #[cfg(test)]
     pub fn has_user_data(&self) -> bool {
         !self.user.is_empty()
     }
@@ -458,24 +415,6 @@ mod tests {
         let score_long = lm.score_transition("<s>", "中国人", 3);
 
         assert!(score_long > score_short);
-    }
-
-    #[test]
-    fn test_learn_from_commits() {
-        let mut lm = LanguageModel::new();
-        // 模拟用户连续上屏
-        let commits = vec![
-            ("中国".to_string(), "zhong guo".to_string()),
-            ("人民".to_string(), "ren min".to_string()),
-            ("中国".to_string(), "zhong guo".to_string()),
-            ("人民".to_string(), "ren min".to_string()),
-        ];
-        lm.learn_from_commits(&commits);
-
-        // "中国" -> "人民" 的 bigram 应该被学习到
-        let score = lm.score_bigram("中国", "人民");
-        assert!(score.is_some());
-        assert!(score.unwrap() <= 0.0); // log 概率为非正数
     }
 
     /// 无个人数据时，插值不改静态评分（逐位一致）

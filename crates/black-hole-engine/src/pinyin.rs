@@ -54,13 +54,6 @@ impl PinyinCodec {
         self.syllables_resegmented().join(" ")
     }
 
-    pub fn all_spaced_codes(&self) -> Vec<String> {
-        self.all_segmentations
-            .iter()
-            .map(|seg| seg.join(" "))
-            .collect()
-    }
-
     pub fn syllable_graph(&self) -> SyllableGraph {
         SyllableGraph::from_segmentations(&self.all_segmentations)
     }
@@ -360,17 +353,10 @@ mod tests {
             codec.push(ch);
         }
 
-        let all_codes = codec.all_spaced_codes();
-        // 应该至少包含一种切分结果
-        assert!(!all_codes.is_empty(), "应该有至少一种切分结果");
-        // 检查是否包含 "zhong wen" 或其他合理切分
-        let has_valid_segmentation = all_codes
-            .iter()
-            .any(|s| s.contains("zhong") && s.contains("wen"));
+        let spaced = codec.spaced_code();
         assert!(
-            has_valid_segmentation,
-            "应该包含有效的切分结果，实际: {:?}",
-            all_codes
+            spaced.contains("zhong") && spaced.contains("wen"),
+            "应包含有效切分，实际: {spaced}"
         );
     }
 
@@ -395,10 +381,6 @@ mod tests {
         let syllables = codec.syllables();
         // 应该是 ["xiang", "an"] 或类似的合理切分
         assert!(!syllables.is_empty(), "应该有切分结果");
-
-        let all_codes = codec.all_spaced_codes();
-        // 应该至少有一种切分
-        assert!(!all_codes.is_empty(), "应该有至少一种切分结果");
     }
 
     #[test]
@@ -411,9 +393,5 @@ mod tests {
         // 完整输入时，应该能切分出音节
         let syllables = codec.syllables();
         assert!(syllables.contains(&"zhong".to_string()));
-
-        // 所有切分结果应该有
-        let all_codes = codec.all_spaced_codes();
-        assert!(!all_codes.is_empty(), "应该有切分结果");
     }
 }

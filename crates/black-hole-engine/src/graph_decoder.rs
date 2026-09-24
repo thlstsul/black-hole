@@ -200,16 +200,6 @@ impl<'a> GraphDecoder<'a> {
         self
     }
 
-    pub fn with_beam_width(mut self, width: usize) -> Self {
-        self.beam_width = width;
-        self
-    }
-
-    pub fn with_scoring_config(mut self, config: ScoringConfig) -> Self {
-        self.config = config;
-        self
-    }
-
     /// 对音节图执行维特比解码，返回候选整句列表
     pub fn decode(&self, graph: &SyllableGraph) -> Vec<DecodeResult> {
         let word_edges = self.build_word_edges(graph);

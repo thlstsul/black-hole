@@ -50,14 +50,6 @@ impl SchemeRegistry {
         }
     }
 
-    /// 获取所有可用方案的列表
-    pub fn list_schemes(&self) -> Vec<(SchemeId, &'static str)> {
-        vec![
-            (SchemeId::Pinyin, "拼音"),
-            (SchemeId::Shuangpin, "小鹤双拼"),
-        ]
-    }
-
     /// 加载全局共享的 rime-dict 词典（同一词库路径进程内只编译/加载一次）
     fn load_dictionary(&self) -> Option<Arc<RimeDict>> {
         let path = self.dict_path.as_ref()?;

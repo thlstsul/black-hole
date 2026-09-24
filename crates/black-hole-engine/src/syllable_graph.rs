@@ -64,56 +64,6 @@ impl SyllableGraph {
         self.total_len
     }
 
-    /// 枚举所有从起点到终点的完整切分路径
-    ///
-    /// 使用 DFS 回溯，适用于路径数量可控的场景。
-    pub fn all_paths(&self) -> Vec<Vec<String>> {
-        if self.total_len == 0 {
-            return Vec::new();
-        }
-        let mut results = Vec::new();
-        let mut current = Vec::new();
-        self.dfs(0, &mut current, &mut results);
-        results
-    }
-
-    fn dfs(&self, pos: usize, current: &mut Vec<String>, results: &mut Vec<Vec<String>>) {
-        if pos >= self.total_len {
-            if pos == self.total_len {
-                results.push(current.clone());
-            }
-            return;
-        }
-
-        for (end, syllable) in &self.edges[pos] {
-            current.push(syllable.clone());
-            self.dfs(*end, current, results);
-            current.pop();
-        }
-    }
-
-    /// 获取所有可达的终点位置（从起点出发）
-    pub fn reachable_ends(&self) -> Vec<usize> {
-        let mut reachable = FxHashSet::default();
-        reachable.insert(0usize);
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for pos in 0..=self.total_len {
-                if reachable.contains(&pos) {
-                    for (end, _) in &self.edges[pos] {
-                        if reachable.insert(*end) {
-                            changed = true;
-                        }
-                    }
-                }
-            }
-        }
-        let mut ends: Vec<usize> = reachable.into_iter().collect();
-        ends.sort();
-        ends
-    }
-
     /// 查找从指定位置到总终点的第一条有效路径上的音节列表
     ///
     /// 使用 DFS 快速返回第一条能到达 `total_len` 的路径。
@@ -162,10 +112,6 @@ mod tests {
         assert_eq!(graph.edges_from(0), &[(5, "zhong".to_string())]);
         assert_eq!(graph.edges_from(5), &[(8, "guo".to_string())]);
         assert_eq!(graph.edges_from(8), &[(11, "ren".to_string())]);
-
-        let paths = graph.all_paths();
-        assert_eq!(paths.len(), 1);
-        assert_eq!(paths[0], vec!["zhong", "guo", "ren"]);
     }
 
     #[test]
@@ -193,25 +139,12 @@ mod tests {
         // 位置 5 应该有 "guo" 和 "gu"
         let edges_5 = graph.edges_from(5);
         assert_eq!(edges_5.len(), 2);
-
-        // 应该能枚举出 2 条路径
-        let paths = graph.all_paths();
-        assert_eq!(paths.len(), 2);
-    }
-
-    #[test]
-    fn test_reachable_ends() {
-        let seg = vec!["zhong".to_string(), "guo".to_string(), "ren".to_string()];
-        let graph = SyllableGraph::from_single_segmentation(&seg);
-        let ends = graph.reachable_ends();
-        assert_eq!(ends, vec![0, 5, 8, 11]);
     }
 
     #[test]
     fn test_empty_segmentations() {
         let graph = SyllableGraph::from_segmentations(&[]);
         assert_eq!(graph.total_len(), 0);
-        assert!(graph.all_paths().is_empty());
     }
 
     #[test]
