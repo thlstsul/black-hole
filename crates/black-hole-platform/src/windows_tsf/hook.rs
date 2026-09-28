@@ -27,7 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::send_ui_command_inner;
 use super::service::apply_input_mode_toggle;
-use super::{ContextSample, ServiceInner};
+use super::{ContextSample, ServiceInner, locked};
 use black_hole_shared::UiCommand;
 use tracing::{debug, warn};
 
@@ -105,7 +105,7 @@ pub(crate) fn register_service(thread_id: u32, inner: Arc<Mutex<ServiceInner>>) 
 /// 注销服务实例（Deactivate 时调用）；若无剩余实例则卸载钩子。
 pub(crate) fn unregister_service(thread_id: u32) {
     let empty = {
-        let mut guard = ACTIVE_SERVICES.lock().unwrap();
+        let mut guard = locked(&ACTIVE_SERVICES);
         if let Some(map) = guard.as_mut() {
             map.remove(&thread_id);
             map.is_empty()
@@ -177,7 +177,7 @@ unsafe extern "system" fn keyboard_hook_proc(
 
         if is_ctrl_vk(vk) && (event == WM_KEYDOWN || event == WM_KEYUP) {
             let down = event == WM_KEYDOWN;
-            let mut ctrl_down = CTRL_DOWN.lock().unwrap();
+            let mut ctrl_down = locked(&CTRL_DOWN);
             if down && !*ctrl_down {
                 // 首次按下（自动重复的按下不再重复标记候选）。
                 *ctrl_down = true;

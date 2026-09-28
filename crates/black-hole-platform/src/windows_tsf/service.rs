@@ -8,7 +8,9 @@ use super::hook::{
 };
 use super::key_event::{KeyHandlerEditSession, virtual_key_to_key_event};
 use super::langbar::BlackHoleLangBarItem;
-use super::{ServiceInner, ensure_ipc_connection, send_ui_command_inner};
+use super::{
+    ServiceInner, ensure_ipc_connection, lock_service, locked, safe_com, send_ui_command_inner,
+};
 use black_hole_shared::{KeyEvent, KeyState, ModeSuggestion, UiCommand};
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -163,7 +165,7 @@ impl BlackHoleTextService {
 
     /// Disconnect from the daemon IPC server and clean up state.
     fn disconnect_ipc(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock_service(&self.inner);
         inner.ipc_conn = None;
         inner.composition = None;
         inner.context_version += 1;
@@ -179,7 +181,7 @@ impl BlackHoleTextService {
     /// `preserve_input` 为 true 时保留输入框中的文本（相当于上屏），否则清空取消。
     fn send_reset(&self, preserve_input: bool) {
         let (ctx_opt, client_id) = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = lock_service(&self.inner);
             if let Some(ref mut conn) = inner.ipc_conn {
                 let request = IpcRequest::Reset;
                 let _ = send_request_buf(&mut conn.writer, &request, &mut conn.send_buf);
@@ -210,7 +212,7 @@ impl BlackHoleTextService {
 
     /// Check whether an active composition exists.
     fn is_composing(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = lock_service(&self.inner);
         inner
             .composition
             .as_ref()
@@ -223,7 +225,7 @@ impl BlackHoleTextService {
     /// 返回 true 表示已切换到中文，本次按键应按中文模式继续走原有消费逻辑。
     fn try_auto_switch_to_chinese(&self) -> bool {
         let (ctx, client_id) = {
-            let inner = self.inner.lock().unwrap();
+            let inner = lock_service(&self.inner);
             // remote/锁屏等场景下 GetFocus 为 null、context 未设置：跳过评估。
             let Some(ctx) = inner.context.clone() else {
                 return false;
@@ -245,7 +247,7 @@ impl BlackHoleTextService {
             return false;
         }
 
-        let switched = *result.lock().unwrap();
+        let switched = *locked(&result);
         switched.is_some_and(|target| {
             apply_auto_mode_toggle(&self.inner, target);
             // 此场景 target 必为 false（英文→中文）；!target 即"已切回中文"
@@ -263,7 +265,7 @@ impl BlackHoleTextService {
         vk: VIRTUAL_KEY,
         already_evaluated: bool,
     ) -> EnglishEvalDecision {
-        let inner = self.inner.lock().unwrap();
+        let inner = lock_service(&self.inner);
         let pic_present = (*pic).to_owned().is_some();
         let is_input_key = virtual_key_to_key_event(vk, wparam, lparam, KeyState::Press)
             .is_some_and(|evt| is_input_char_event(&evt));
@@ -277,7 +279,7 @@ impl BlackHoleTextService {
         );
         drop(inner);
         if decision.refresh_context {
-            self.inner.lock().unwrap().context = (*pic).to_owned();
+            lock_service(&self.inner).context = (*pic).to_owned();
         }
         decision
     }
@@ -288,7 +290,7 @@ impl BlackHoleTextService {
     /// 任一有效建议即视为语境变化，自动解锁恢复自动切换，不会困住手动选择）。
     fn sample_current_suggestion(&self) -> ModeSuggestion {
         let (ctx, client_id) = {
-            let inner = self.inner.lock().unwrap();
+            let inner = lock_service(&self.inner);
             // remote/锁屏等场景下 GetFocus 为 null、context 未设置：无信号
             match inner.context.clone() {
                 Some(ctx) => (ctx, inner.client_id),
@@ -309,7 +311,7 @@ impl BlackHoleTextService {
             debug!("suggestion-read edit session request failed: {}", e);
             return ModeSuggestion::Neutral;
         }
-        *suggestion.lock().unwrap()
+        *locked(&suggestion)
     }
 
     /// 中英文模式切换后的收尾工作：结束进行中的 composition、
@@ -325,7 +327,7 @@ impl BlackHoleTextService {
         // 写入系统键盘 compartment，供其它应用感知当前输入法状态。
         self.sync_input_mode_compartments(english);
         let sink = {
-            let inner = self.inner.lock().unwrap();
+            let inner = lock_service(&self.inner);
             inner.langbar_item_sink.clone()
         };
         if let Some(sink) = sink {
@@ -342,7 +344,7 @@ impl BlackHoleTextService {
     /// compartment 按线程管理器独立维护，与 `mode_switch` 的线程级语义一致。
     fn sync_input_mode_compartments(&self, english: bool) {
         let (thread_mgr, client_id) = {
-            let inner = self.inner.lock().unwrap();
+            let inner = lock_service(&self.inner);
             (inner.thread_mgr.clone(), inner.client_id)
         };
         let Some(tm) = thread_mgr else { return };
@@ -377,7 +379,7 @@ impl BlackHoleTextService {
 /// 实例上下文的路径复用（语义与该方法一致）。始终应用 daemon 当前中英模式。
 pub(crate) fn sync_settings_from_daemon_inner(inner_arc: &Arc<Mutex<ServiceInner>>) {
     let settings = {
-        let mut inner = inner_arc.lock().unwrap();
+        let mut inner = lock_service(inner_arc);
         let Some(ref mut conn) = inner.ipc_conn else {
             return;
         };
@@ -405,7 +407,7 @@ pub(crate) fn sync_settings_from_daemon_inner(inner_arc: &Arc<Mutex<ServiceInner
     };
     // 先释放 inner 锁再应用模式切换：apply_input_mode_toggle 内部会重新加锁。
     let changed = {
-        let mut inner = inner_arc.lock().unwrap();
+        let mut inner = lock_service(inner_arc);
         inner.mode_switch.set_english(settings).is_some()
     };
     if changed {
@@ -450,8 +452,18 @@ fn is_ctrl_key(vk: VIRTUAL_KEY) -> bool {
 
 impl ITfTextInputProcessor_Impl for BlackHoleTextService_Impl {
     fn Activate(&self, ptim: Ref<'_, ITfThreadMgr>, tid: u32) -> Result<()> {
+        safe_com(|| self.activate_body(ptim, tid))
+    }
+
+    fn Deactivate(&self) -> Result<()> {
+        safe_com(|| self.deactivate_body())
+    }
+}
+
+impl BlackHoleTextService_Impl {
+    fn activate_body(&self, ptim: Ref<'_, ITfThreadMgr>, tid: u32) -> Result<()> {
         info!("BlackHoleTextService::Activate called tid={}", tid);
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock_service(&self.inner);
         inner.thread_mgr = ptim.to_owned();
         inner.client_id = tid;
         inner.active = true;
@@ -470,7 +482,7 @@ impl ITfTextInputProcessor_Impl for BlackHoleTextService_Impl {
             if let Ok(cookie) = unsafe {
                 source.AdviseSink(&<ITfThreadMgrEventSink as Interface>::IID, &sink_iface)
             } {
-                let mut inner = self.inner.lock().unwrap();
+                let mut inner = lock_service(&self.inner);
                 inner.thread_mgr_event_sink_cookie = Some(cookie);
             }
         }
@@ -482,7 +494,7 @@ impl ITfTextInputProcessor_Impl for BlackHoleTextService_Impl {
                 let item_iface: ITfLangBarItem = item.into();
                 match unsafe { langbar_mgr.AddItem(&item_iface) } {
                     Ok(()) => {
-                        let mut inner = self.inner.lock().unwrap();
+                        let mut inner = lock_service(&self.inner);
                         inner.langbar_item = Some(item_iface);
                         info!("Language bar item registered");
                     }
@@ -507,18 +519,20 @@ impl ITfTextInputProcessor_Impl for BlackHoleTextService_Impl {
         // 不再以"连接默认中文"兜底：英文模式下自动切换已由 OnTestKeyDown
         // 补设 context 后正常触发，连接时即使处于英文模式也能自动切回中文。
         self.sync_settings_from_daemon();
-        let english = self.inner.lock().unwrap().mode_switch.is_english();
+        let english = lock_service(&self.inner).mode_switch.is_english();
         self.sync_input_mode_compartments(english);
 
         Ok(())
     }
+}
 
-    fn Deactivate(&self) -> Result<()> {
+impl BlackHoleTextService_Impl {
+    fn deactivate_body(&self) -> Result<()> {
         // 先取出需要注销所需的数据，避免在持有 inner 锁时调用 COM 方法。
         // COM 方法可能回调到同一线程的其它接口方法（如 UnadviseSink），
         // 导致 std::sync::Mutex 重入死锁。
         let (thread_mgr, client_id, thread_mgr_event_cookie, langbar_item) = {
-            let inner = self.inner.lock().unwrap();
+            let inner = lock_service(&self.inner);
             (
                 inner.thread_mgr.clone(),
                 inner.client_id,
@@ -549,7 +563,7 @@ impl ITfTextInputProcessor_Impl for BlackHoleTextService_Impl {
         self.send_reset(false);
         self.disconnect_ipc();
         unregister_service(unsafe { GetCurrentThreadId() });
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock_service(&self.inner);
         inner.context = None;
         inner.thread_mgr = None;
         inner.client_id = 0;
@@ -567,8 +581,44 @@ impl ITfTextInputProcessor_Impl for BlackHoleTextService_Impl {
 
 impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
     fn OnSetFocus(&self, fforeground: BOOL) -> Result<()> {
+        safe_com(|| self.on_set_focus_body(fforeground))
+    }
+
+    fn OnTestKeyDown(
+        &self,
+        pic: Ref<'_, ITfContext>,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Result<BOOL> {
+        safe_com(|| self.on_test_key_down_body(pic, wparam, lparam))
+    }
+
+    fn OnTestKeyUp(
+        &self,
+        _pic: Ref<'_, ITfContext>,
+        wparam: WPARAM,
+        _lparam: LPARAM,
+    ) -> Result<BOOL> {
+        safe_com(|| self.on_test_key_up_body(wparam))
+    }
+
+    fn OnKeyDown(&self, pic: Ref<'_, ITfContext>, wparam: WPARAM, lparam: LPARAM) -> Result<BOOL> {
+        safe_com(|| self.on_key_down_body(pic, wparam, lparam))
+    }
+
+    fn OnKeyUp(&self, _pic: Ref<'_, ITfContext>, _wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
+        safe_com(|| Ok(BOOL(0)))
+    }
+
+    fn OnPreservedKey(&self, _pic: Ref<'_, ITfContext>, _rguid: *const GUID) -> Result<BOOL> {
+        safe_com(|| Ok(BOOL(0)))
+    }
+}
+
+impl BlackHoleTextService_Impl {
+    fn on_set_focus_body(&self, fforeground: BOOL) -> Result<()> {
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = lock_service(&self.inner);
             inner.last_caret_pos = None;
             inner.context_version += 1;
         }
@@ -589,8 +639,10 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         }
         Ok(())
     }
+}
 
-    fn OnTestKeyDown(
+impl BlackHoleTextService_Impl {
+    fn on_test_key_down_body(
         &self,
         pic: Ref<'_, ITfContext>,
         wparam: WPARAM,
@@ -607,7 +659,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         // 防双切由 OnTestKeyUp 中的 hook_toggled 标志协调）。
         // 永远不拦截 Ctrl 本身，保证 Ctrl+C 等组合键正常工作。
         if is_ctrl_key(vk) {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = lock_service(&self.inner);
             // 新一轮 Ctrl 按下：重置抑制标志，避免上次残留（如钩子切换后
             // 本路径从未收到 keyup）抑制本次合法切换。
             inner.hook_toggled = false;
@@ -618,7 +670,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
 
         // 按住 Ctrl 期间按下其他键（如 Ctrl+C、Ctrl+Shift），取消切换候选。
         if unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0 {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = lock_service(&self.inner);
             inner.mode_switch.other_key_pressed(true);
         }
 
@@ -626,7 +678,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         // 先评估一次：命中中文语境则切回中文，本次按键继续走下方原有中文模式
         // 的消费逻辑（与 Linux 侧 maybe_auto_switch_mode 后再判英文的语义一致）。
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = lock_service(&self.inner);
             if inner.mode_switch.is_english() {
                 inner.last_key_event = None;
                 drop(inner);
@@ -636,7 +688,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
                 }
                 // 记录本次评估的按键与时间，供 OnKeyDown 去重：
                 // 部分应用对同一按键两个回调都会调用，避免同一按键双重评估
-                self.inner.lock().unwrap().last_eng_eval_key = Some((wparam.0, Instant::now()));
+                lock_service(&self.inner).last_eng_eval_key = Some((wparam.0, Instant::now()));
                 if !self.try_auto_switch_to_chinese() {
                     return Ok(BOOL(0));
                 }
@@ -666,22 +718,19 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
             };
 
             if intercept {
-                let mut inner = self.inner.lock().unwrap();
+                let mut inner = lock_service(&self.inner);
                 inner.last_key_event = Some((wparam, lparam, evt));
                 return Ok(BOOL(1));
             }
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = lock_service(&self.inner);
         inner.last_key_event = None;
         Ok(BOOL(0))
     }
+}
 
-    fn OnTestKeyUp(
-        &self,
-        _pic: Ref<'_, ITfContext>,
-        wparam: WPARAM,
-        _lparam: LPARAM,
-    ) -> Result<BOOL> {
+impl BlackHoleTextService_Impl {
+    fn on_test_key_up_body(&self, wparam: WPARAM) -> Result<BOOL> {
         let vk = VIRTUAL_KEY(wparam.0 as u16);
         debug!(
             "OnTestKeyUp: vk=0x{:04X} ctrl_held={}",
@@ -695,7 +744,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         // - 设置面板等钩子回调不可靠（安装线程无消息循环）的应用走本路径。
         if is_ctrl_key(vk) {
             let toggled = {
-                let mut inner = self.inner.lock().unwrap();
+                let mut inner = lock_service(&self.inner);
                 if inner.hook_toggled {
                     inner.hook_toggled = false;
                     None
@@ -708,7 +757,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
                 // 同语境的自动建议不再撤销本次选择（陈旧基线会导致
                 // 下个按键即被自动切换撤销，故必须即时采样）
                 let suggestion = self.sample_current_suggestion();
-                self.inner.lock().unwrap().auto_mode.lock_manual(suggestion);
+                lock_service(&self.inner).auto_mode.lock_manual(suggestion);
                 self.on_input_mode_toggled(english);
                 // 上报 daemon 持久化并更新全局状态，供其它进程同步
                 self.send_ui_command(UiCommand::SetInputMode(english));
@@ -716,14 +765,21 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         }
         Ok(BOOL(0))
     }
+}
 
-    fn OnKeyDown(&self, pic: Ref<'_, ITfContext>, wparam: WPARAM, lparam: LPARAM) -> Result<BOOL> {
+impl BlackHoleTextService_Impl {
+    fn on_key_down_body(
+        &self,
+        pic: Ref<'_, ITfContext>,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Result<BOOL> {
         // 英文模式下不处理任何按键；若开启自动切换，先评估一次英→中。
         // 部分应用（如 WebView2）不调用 OnTestKeyDown 而直接调用 OnKeyDown，
         // 评估必须在此补做，否则该类应用中英→中永远不触发；命中切回中文后
         // 继续走下方中文模式流程，消费本次按键（与 OnTestKeyDown 路径语义一致）。
         {
-            let inner = self.inner.lock().unwrap();
+            let inner = lock_service(&self.inner);
             if inner.mode_switch.is_english() {
                 // 同一按键已在 OnTestKeyDown 评估过（时间窗内同键视为同一次按下），
                 // 直接放行：部分应用对同一按键两个回调都会调用，避免双重评估
@@ -746,7 +802,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         }
 
         let cached_event = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = lock_service(&self.inner);
             inner.last_key_event.take().and_then(|(cw, cl, evt)| {
                 if cw.0 == wparam.0 && cl.0 == lparam.0 {
                     Some(evt)
@@ -777,7 +833,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         }
 
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = lock_service(&self.inner);
             // 无条件保持 context 最新：TSF 不保证跨按键返回同一接口指针，
             // 以指针比较门控刷新会在指针不稳定时保留过期 context（导致提交/
             // 插入作用到错误上下文）。
@@ -793,7 +849,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
         };
         let edit_session: ITfEditSession = session.into();
 
-        let inner = self.inner.lock().unwrap();
+        let inner = lock_service(&self.inner);
         let client_id = inner.client_id;
         drop(inner);
 
@@ -810,14 +866,6 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
 
         if hr.is_ok() { Ok(BOOL(1)) } else { Ok(BOOL(0)) }
     }
-
-    fn OnKeyUp(&self, _pic: Ref<'_, ITfContext>, _wparam: WPARAM, _lparam: LPARAM) -> Result<BOOL> {
-        Ok(BOOL(0))
-    }
-
-    fn OnPreservedKey(&self, _pic: Ref<'_, ITfContext>, _rguid: *const GUID) -> Result<BOOL> {
-        Ok(BOOL(0))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -830,7 +878,13 @@ impl ITfCompositionSink_Impl for BlackHoleTextService_Impl {
         _ecwrite: u32,
         _pcomposition: Ref<'_, ITfComposition>,
     ) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
+        safe_com(|| self.on_composition_terminated_body())
+    }
+}
+
+impl BlackHoleTextService_Impl {
+    fn on_composition_terminated_body(&self) -> Result<()> {
+        let mut inner = lock_service(&self.inner);
         inner.composition = None;
         // 应用主动终止合成（Esc/点击等绕过 Commit/Cancel 编辑会话）：
         // 与 commit.rs 的合成结束路径保持一致，同步清空光标位置并作废缓存
@@ -857,12 +911,18 @@ impl ITfTextLayoutSink_Impl for BlackHoleTextService_Impl {
         lcode: TfLayoutCode,
         _pview: Ref<'_, ITfContextView>,
     ) -> Result<()> {
+        safe_com(|| self.on_layout_change_body(pic, lcode))
+    }
+}
+
+impl BlackHoleTextService_Impl {
+    fn on_layout_change_body(&self, pic: Ref<'_, ITfContext>, lcode: TfLayoutCode) -> Result<()> {
         if lcode != TF_LC_CHANGE {
             return Ok(());
         }
 
         {
-            let inner = self.inner.lock().unwrap();
+            let inner = lock_service(&self.inner);
             let current_ctx = match &inner.context {
                 Some(c) => c,
                 None => return Ok(()),
@@ -881,7 +941,7 @@ impl ITfTextLayoutSink_Impl for BlackHoleTextService_Impl {
         };
         let edit_session: ITfEditSession = session.into();
 
-        let inner = self.inner.lock().unwrap();
+        let inner = lock_service(&self.inner);
         let client_id = inner.client_id;
         drop(inner);
 
@@ -899,11 +959,11 @@ impl ITfTextLayoutSink_Impl for BlackHoleTextService_Impl {
 
 impl ITfThreadMgrEventSink_Impl for BlackHoleTextService_Impl {
     fn OnInitDocumentMgr(&self, _pdocmgr: Ref<'_, ITfDocumentMgr>) -> Result<()> {
-        Ok(())
+        safe_com(|| Ok(()))
     }
 
     fn OnUninitDocumentMgr(&self, _pdocmgr: Ref<'_, ITfDocumentMgr>) -> Result<()> {
-        Ok(())
+        safe_com(|| Ok(()))
     }
 
     fn OnSetFocus(
@@ -911,21 +971,23 @@ impl ITfThreadMgrEventSink_Impl for BlackHoleTextService_Impl {
         _pdocmgrfocus: Ref<'_, ITfDocumentMgr>,
         _pdocmgrprevfocus: Ref<'_, ITfDocumentMgr>,
     ) -> Result<()> {
-        {
-            let mut inner = self.inner.lock().unwrap();
-            inner.last_caret_pos = None;
-            inner.context_version += 1;
-        }
-        self.send_reset(false);
-        Ok(())
+        safe_com(|| {
+            {
+                let mut inner = lock_service(&self.inner);
+                inner.last_caret_pos = None;
+                inner.context_version += 1;
+            }
+            self.send_reset(false);
+            Ok(())
+        })
     }
 
     fn OnPushContext(&self, _pic: Ref<'_, ITfContext>) -> Result<()> {
-        Ok(())
+        safe_com(|| Ok(()))
     }
 
     fn OnPopContext(&self, _pic: Ref<'_, ITfContext>) -> Result<()> {
-        Ok(())
+        safe_com(|| Ok(()))
     }
 }
 
@@ -1015,7 +1077,7 @@ mod tests {
         let addr = spawn_mock_daemon();
         let inner_arc = connect_to_mock(&addr);
         sync_settings_from_daemon_inner(&inner_arc);
-        assert!(inner_arc.lock().unwrap().mode_switch.is_english());
+        assert!(lock_service(&inner_arc).mode_switch.is_english());
     }
 
     #[test]
@@ -1027,7 +1089,7 @@ mod tests {
         let inner_arc = Arc::new(Mutex::new(ServiceInner::new()));
         establish_connection(&inner_arc, &addr);
         sync_settings_from_daemon_inner(&inner_arc);
-        assert!(inner_arc.lock().unwrap().mode_switch.is_english());
+        assert!(lock_service(&inner_arc).mode_switch.is_english());
     }
 
     #[test]
@@ -1036,7 +1098,7 @@ mod tests {
         let addr = spawn_mock_daemon();
         let inner_arc = connect_to_mock(&addr);
         sync_settings_from_daemon_inner(&inner_arc);
-        assert!(inner_arc.lock().unwrap().mode_switch.is_english());
+        assert!(lock_service(&inner_arc).mode_switch.is_english());
     }
 
     #[test]
@@ -1048,12 +1110,12 @@ mod tests {
         let inner_arc = Arc::new(Mutex::new(ServiceInner::new()));
 
         // 首次 Activate 失败：无连接、未同步
-        assert!(inner_arc.lock().unwrap().ipc_conn.is_none());
+        assert!(lock_service(&inner_arc).ipc_conn.is_none());
 
         // 按键路径 try_reconnect_ipc 重连成功：建立连接
         establish_connection(&inner_arc, &addr);
         sync_settings_from_daemon_inner(&inner_arc);
-        assert!(inner_arc.lock().unwrap().mode_switch.is_english());
+        assert!(lock_service(&inner_arc).mode_switch.is_english());
     }
 
     #[test]

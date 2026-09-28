@@ -18,6 +18,14 @@ use super::{PlatformError, PlatformIme};
 
 pub mod auto_register;
 
+const ENGINE_PATH: &str = "/org/freedesktop/IBus/Engine/Black-Hole";
+const ENGINE_IFACE: &str = "org.freedesktop.IBus.Engine";
+
+/// Mutex poison 恢复加锁：panic 后继续使用内部值
+fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Linux IBus 输入法平台实现
 pub struct LinuxIbusIme {
     /// daemon 共享的运行时设置（方案/主题/中英模式/自动切换开关），
@@ -99,49 +107,36 @@ struct IbusEngine {
 }
 
 impl IbusEngine {
+    async fn emit_engine_signal(&self, signal: &str, body: &(impl Type + serde::Serialize)) {
+        let _ = self
+            .conn
+            .emit_signal(None::<&str>, ENGINE_PATH, ENGINE_IFACE, signal, body)
+            .await;
+    }
+
     /// 模式切换后的收尾：切英文模式时先上屏保留输入框内容，
     /// 然后重置引擎并向面板广播新的 InputMode 属性。
     async fn apply_mode_change(&self, english: bool) {
         // 切换到英文模式时，把输入框中的编码上屏，避免输入丢失。
         if english {
-            let code = self.last_code.lock().unwrap().take();
+            let code = locked(&self.last_code).take();
             if let Some(code) = code.filter(|c| !c.is_empty()) {
-                let ibus_text = (code.as_str(), Vec::<(u32, u32, u32, u32)>::new());
-                let variant = Value::from(ibus_text);
-                let _ = self
-                    .conn
-                    .emit_signal(
-                        None::<&str>,
-                        "/org/freedesktop/IBus/Engine/Black-Hole",
-                        "org.freedesktop.IBus.Engine",
-                        "CommitText",
-                        &variant,
-                    )
-                    .await;
+                let variant = Value::from((code.as_str(), Vec::<(u32, u32, u32, u32)>::new()));
+                self.emit_engine_signal("CommitText", &variant).await;
             }
         } else {
-            *self.last_code.lock().unwrap() = None;
+            *locked(&self.last_code) = None;
         }
-        // 取消未完成的输入并重置引擎（幂等）。
-        // daemon 处理 Reset 时会自行隐藏候选窗。
+        // 取消未完成的输入并重置引擎（幂等）；daemon 处理 Reset 时会自行隐藏候选窗。
         let sent = {
-            let engine_tx = self.engine_tx.lock().unwrap();
+            let engine_tx = locked(&self.engine_tx);
             engine_tx.send(EngineCommand::Reset).is_ok()
         };
         if sent {
-            let platform_rx = self.platform_rx.lock().unwrap();
-            let _ = platform_rx.recv();
+            let _ = locked(&self.platform_rx).recv();
         }
         // 更新 InputMode 属性，供面板/桌面 shell 感知中英文状态。
-        let _ = self
-            .conn
-            .emit_signal(
-                None::<&str>,
-                "/org/freedesktop/IBus/Engine/Black-Hole",
-                "org.freedesktop.IBus.Engine",
-                "UpdateProperty",
-                &input_mode_property(english),
-            )
+        self.emit_engine_signal("UpdateProperty", &input_mode_property(english))
             .await;
     }
 
@@ -151,31 +146,28 @@ impl IbusEngine {
     /// 当前非合成态（无未上屏编码）时评估；命中建议时直接设置模式并复用
     /// `apply_mode_change` 完成上屏保留/重置引擎/更新属性收尾。
     async fn maybe_auto_switch_mode(&self) {
-        if !self.current_settings.lock().unwrap().auto_switch {
+        if !locked(&self.current_settings).auto_switch {
             return;
         }
         // 合成中（输入框尚有编码）不评估，避免打断正在进行的输入
-        let composing = self
-            .last_code
-            .lock()
-            .unwrap()
+        if locked(&self.last_code)
             .as_ref()
-            .is_some_and(|c| !c.is_empty());
-        if composing {
+            .is_some_and(|c| !c.is_empty())
+        {
             return;
         }
         let (preceding, following) = {
-            let ctx = self.context.lock().unwrap();
+            let ctx = locked(&self.context);
             (ctx.preceding_text.clone(), ctx.following_text.clone())
         };
         let suggestion = suggest_input_mode(preceding.as_deref(), following.as_deref());
         let target = {
-            let current = self.mode_switch.lock().unwrap().is_english();
-            self.auto_mode.lock().unwrap().evaluate(suggestion, current)
+            let current = locked(&self.mode_switch).is_english();
+            locked(&self.auto_mode).evaluate(suggestion, current)
         };
         if let Some(english) = target {
             // evaluate 已确认目标与当前不同，set_english 必然产生切换
-            self.mode_switch.lock().unwrap().set_english(english);
+            locked(&self.mode_switch).set_english(english);
             info!(
                 "Input mode auto switched: {}",
                 if english { "英文" } else { "中文" }
@@ -186,8 +178,8 @@ impl IbusEngine {
 
     /// 以缓存的光标周围文本评估当前语境建议（手动切换时作为锁定基线，
     /// 必须即时采样：陈旧基线会导致下个按键即被自动切换撤销）
-    fn current_context_suggestion(&self) -> Option<bool> {
-        let ctx = self.context.lock().unwrap();
+    fn current_context_suggestion(&self) -> ModeSuggestion {
+        let ctx = locked(&self.context);
         suggest_input_mode(ctx.preceding_text.as_deref(), ctx.following_text.as_deref())
     }
 }
@@ -206,7 +198,7 @@ impl IbusEngine {
         // Ctrl 键：按下标记候选，松开切换中英文模式；不消费按键本身。
         if keyval == CONTROL_L || keyval == CONTROL_R {
             let toggled = {
-                let mut mode = self.mode_switch.lock().unwrap();
+                let mut mode = locked(&self.mode_switch);
                 if state & RELEASE_MASK != 0 {
                     mode.ctrl_released()
                 } else {
@@ -222,7 +214,7 @@ impl IbusEngine {
                 // 用户手动切换：以即时采样的当前语境建议为锁定基线，
                 // 同语境的自动建议不再撤销本次选择
                 let suggestion = self.current_context_suggestion();
-                self.auto_mode.lock().unwrap().lock_manual(suggestion);
+                locked(&self.auto_mode).lock_manual(suggestion);
                 self.apply_mode_change(english).await;
             }
             return false;
@@ -230,35 +222,33 @@ impl IbusEngine {
 
         // 按住 Ctrl 期间按下其他键（如 Ctrl+C），取消切换候选。
         if state & CONTROL_MASK != 0 {
-            self.mode_switch.lock().unwrap().other_key_pressed(true);
+            locked(&self.mode_switch).other_key_pressed(true);
         }
 
         // 根据光标周围文本自动切换中英模式（开关开启且非合成态时评估一次）
         self.maybe_auto_switch_mode().await;
 
         // 英文模式下不消费任何按键。
-        if self.mode_switch.lock().unwrap().is_english() {
+        if locked(&self.mode_switch).is_english() {
             return false;
         }
 
-        let key = convert_keyval(keyval, state);
-        let Some(key) = key else { return false };
+        let Some(key) = convert_keyval(keyval, state) else {
+            return false;
+        };
 
         // 发送 Key 命令到引擎线程
+        if locked(&self.engine_tx)
+            .send(EngineCommand::Key(key))
+            .is_err()
         {
-            let engine_tx = self.engine_tx.lock().unwrap();
-            if engine_tx.send(EngineCommand::Key(key)).is_err() {
-                return false;
-            }
+            return false;
         }
 
         // 从引擎线程接收处理结果
-        let result = {
-            let platform_rx = self.platform_rx.lock().unwrap();
-            match platform_rx.recv() {
-                Ok(r) => r,
-                Err(_) => return false,
-            }
+        let result = match locked(&self.platform_rx).recv() {
+            Ok(r) => r,
+            Err(_) => return false,
         };
 
         match result {
@@ -267,32 +257,17 @@ impl IbusEngine {
                 temporary_english,
             } => {
                 // 已上屏，清空记录的编码，避免切换模式时重复上屏
-                *self.last_code.lock().unwrap() = None;
+                *locked(&self.last_code) = None;
                 // 临时英文/原样上屏英文编码结束上屏后，抑制紧随其后的一次中→英
                 // 自动切换：上屏文本立即使语境变为英文，若无抑制，用户敲下的
                 // 下一个字母会在合成开始前被中→英自动切换拉进英文模式直输
                 // （与 Windows 侧一致）。用单次抑制而非持久锁定——持久锁定在
-                // 英文语境（如 IDE）持续存在时会吞掉后续所有自动切换，使功能
-                // 整体失效。仅在自动切换开启时武装：开关关闭期间 evaluate
-                // 不会被调用，武装会产生滞留状态（日后开启时误吞一次无关评估）。
-                if temporary_english && self.current_settings.lock().unwrap().auto_switch {
-                    self.auto_mode.lock().unwrap().suppress_next_zh_to_en();
+                // 英文语境（如 IDE）持续存在时会吞掉后续所有自动切换。
+                if temporary_english && locked(&self.current_settings).auto_switch {
+                    locked(&self.auto_mode).suppress_next_zh_to_en();
                 }
-                // 发送 CommitText DBus 信号
-                let ibus_text = (text.as_str(), Vec::<(u32, u32, u32, u32)>::new());
-                let variant = Value::from(ibus_text);
-
-                let _ = self
-                    .conn
-                    .emit_signal(
-                        None::<&str>,
-                        "/org/freedesktop/IBus/Engine/Black-Hole",
-                        "org.freedesktop.IBus.Engine",
-                        "CommitText",
-                        &variant,
-                    )
-                    .await;
-
+                let variant = Value::from((text.as_str(), Vec::<(u32, u32, u32, u32)>::new()));
+                self.emit_engine_signal("CommitText", &variant).await;
                 true
             }
             SchemeResult::Composing {
@@ -302,10 +277,9 @@ impl IbusEngine {
                 expanded,
             } => {
                 // 记录当前编码，供切换英文模式时上屏保留
-                *self.last_code.lock().unwrap() = Some(code.clone());
-                // 通过 channel 发送 UI 更新
-                let ui_tx = self.ui_tx.lock().unwrap();
-                let ctx = self.context.lock().unwrap().clone();
+                *locked(&self.last_code) = Some(code.clone());
+                let ui_tx = locked(&self.ui_tx);
+                let ctx = locked(&self.context).clone();
                 let _ = ui_tx.send(UiCommand::ShowCandidates {
                     code,
                     candidates,
@@ -317,10 +291,8 @@ impl IbusEngine {
             }
             SchemeResult::Cancelled => {
                 // 取消输入（Esc / cancel 绑定）：消费按键，避免 IBus 把 Esc
-                // 转发给宿主应用。引擎已重置编码，daemon 处理 Cancelled 时已发
-                // HideCandidates 隐藏候选窗（见 daemon::App::process_engine_command），
-                // 此处只需清空记录的编码。
-                *self.last_code.lock().unwrap() = None;
+                // 转发给宿主应用。daemon 处理 Cancelled 时已发 HideCandidates。
+                *locked(&self.last_code) = None;
                 true
             }
             SchemeResult::Ignored => false,
@@ -331,13 +303,12 @@ impl IbusEngine {
     async fn set_cursor_location(&self, x: i32, y: i32, _w: i32, h: i32) {
         // 合并更新：保留 set_surrounding_text 缓存的周围文本，仅刷新光标坐标；
         // 整体覆盖会清掉文本缓存，使自动切换中英模式评估失去依据
-        let mut ctx = self.context.lock().unwrap().clone();
+        let mut ctx = locked(&self.context).clone();
         ctx.caret_x = x;
         ctx.caret_y = y;
         ctx.caret_h = h;
-        *self.context.lock().unwrap() = ctx.clone();
-        let engine_tx = self.engine_tx.lock().unwrap();
-        let _ = engine_tx.send(EngineCommand::SetContext(ctx));
+        *locked(&self.context) = ctx.clone();
+        let _ = locked(&self.engine_tx).send(EngineCommand::SetContext(ctx));
     }
 
     /// 应用推送的光标周围文本（IBus SetSurroundingText，IBus 1.5+）。
@@ -384,12 +355,11 @@ impl IbusEngine {
 
         // 保留 set_cursor_location 写入的光标坐标，仅更新文本字段；
         // 同时缓存到 self.context，供自动切换中英模式评估时读取周围文本
-        let mut ctx = self.context.lock().unwrap().clone();
+        let mut ctx = locked(&self.context).clone();
         ctx.preceding_text = (!preceding.is_empty()).then_some(preceding);
         ctx.following_text = (!following.is_empty()).then_some(following);
-        *self.context.lock().unwrap() = ctx.clone();
-        let engine_tx = self.engine_tx.lock().unwrap();
-        let _ = engine_tx.send(EngineCommand::SetContext(ctx));
+        *locked(&self.context) = ctx.clone();
+        let _ = locked(&self.engine_tx).send(EngineCommand::SetContext(ctx));
     }
 
     /// 声明引擎需要周围文本（IBus 1.5.27+ 读取此属性，焦点变化时自动推送
@@ -404,43 +374,22 @@ impl IbusEngine {
 
     async fn reset(&self) {
         // 引擎已重置，清空记录的编码
-        *self.last_code.lock().unwrap() = None;
+        *locked(&self.last_code) = None;
         // 发送 Reset 命令到引擎线程并读取响应
-        {
-            let engine_tx = self.engine_tx.lock().unwrap();
-            if engine_tx.send(EngineCommand::Reset).is_err() {
-                return;
-            }
+        if locked(&self.engine_tx).send(EngineCommand::Reset).is_err() {
+            return;
         }
-        let platform_rx = self.platform_rx.lock().unwrap();
-        let _ = platform_rx.recv();
+        let _ = locked(&self.platform_rx).recv();
     }
 
     async fn enable(&self) {
         // 声明需要周围文本：IBus 1.5.27+ 的 daemon 读取 active-surrounding-text
         // 属性后，会在每次焦点切换时自动推送 SetSurroundingText。
         // 旧版 IBus 无此属性，改用 RequireSurroundingText 信号通知 daemon。
-        let _ = self
-            .conn
-            .emit_signal(
-                None::<&str>,
-                "/org/freedesktop/IBus/Engine/Black-Hole",
-                "org.freedesktop.IBus.Engine",
-                "RequireSurroundingText",
-                &(),
-            )
-            .await;
+        self.emit_engine_signal("RequireSurroundingText", &()).await;
         // 注册 InputMode 属性，使面板/桌面 shell 能显示并跟踪中英文状态。
-        let english = self.mode_switch.lock().unwrap().is_english();
-        let _ = self
-            .conn
-            .emit_signal(
-                None::<&str>,
-                "/org/freedesktop/IBus/Engine/Black-Hole",
-                "org.freedesktop.IBus.Engine",
-                "RegisterProperties",
-                &input_mode_prop_list(english),
-            )
+        let english = locked(&self.mode_switch).is_english();
+        self.emit_engine_signal("RegisterProperties", &input_mode_prop_list(english))
             .await;
     }
     async fn disable(&self) {}
@@ -462,11 +411,8 @@ impl IbusEngine {
             return;
         }
         // 面板点击 InputMode 属性：CHECKED=中文，UNCHECKED=英文
-        let toggled = self
-            .mode_switch
-            .lock()
-            .unwrap()
-            .set_english(prop_state == PROP_STATE_UNCHECKED as i32);
+        let toggled =
+            locked(&self.mode_switch).set_english(prop_state == PROP_STATE_UNCHECKED as i32);
         if let Some(english) = toggled {
             info!(
                 "Input mode toggled via property: {}",
@@ -475,7 +421,7 @@ impl IbusEngine {
             // 用户手动切换：以即时采样的当前语境建议为锁定基线，
             // 同语境的自动建议不再撤销本次选择
             let suggestion = self.current_context_suggestion();
-            self.auto_mode.lock().unwrap().lock_manual(suggestion);
+            locked(&self.auto_mode).lock_manual(suggestion);
             self.apply_mode_change(english).await;
         }
     }

@@ -15,7 +15,7 @@ use super::caret::{read_surrounding_text, truncate_for_log};
 use super::hook::focused_thread_id;
 use super::key_event::context_changed;
 use super::service::apply_input_mode_toggle;
-use super::{ServiceInner, send_ui_command_inner};
+use super::{ServiceInner, lock_service, locked, safe_com, send_ui_command_inner};
 use black_hole_shared::{ModeSuggestion, UiCommand, suggest_input_mode};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
@@ -70,8 +70,14 @@ pub(crate) struct AutoSwitchEditSession {
 
 impl ITfEditSession_Impl for AutoSwitchEditSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
+        safe_com(|| self.do_edit_session_body(ec))
+    }
+}
+
+impl AutoSwitchEditSession_Impl {
+    fn do_edit_session_body(&self, ec: u32) -> Result<()> {
         let (ctx, composition, entry_version, last_caret_pos) = {
-            let inner = self.inner_arc.lock().unwrap();
+            let inner = lock_service(&self.inner_arc);
             // 会话执行时再次确认门控（请求发出到会话执行之间状态可能已变化）：
             // 开关开启、当前英文模式、有上下文且无进行中的合成
             // （GetRange 失败视为无合成，与 service.rs is_composing 判定一致）。
@@ -112,7 +118,7 @@ impl ITfEditSession_Impl for AutoSwitchEditSession_Impl {
             return Ok(());
         }
 
-        let mut inner = self.inner_arc.lock().unwrap();
+        let mut inner = lock_service(&self.inner_arc);
         // 读取期间发生语境变更（合成/焦点等，context_version 已 bump）：
         // 本次读取的文本已过期，跳过评估（评估会话不消费按键，直接返回
         // 不会吞键，OnTestKeyDown 按未评估继续）。
@@ -138,7 +144,7 @@ impl ITfEditSession_Impl for AutoSwitchEditSession_Impl {
         if let Some(target) = inner.auto_mode.evaluate(suggestion, current) {
             // evaluate 已确认目标与当前不同，set_english 必然产生切换
             inner.mode_switch.set_english(target);
-            *self.result.lock().unwrap() = Some(target);
+            *locked(&self.result) = Some(target);
         }
         Ok(())
     }
@@ -156,8 +162,14 @@ pub(crate) struct SuggestionReadSession {
 
 impl ITfEditSession_Impl for SuggestionReadSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
+        safe_com(|| self.do_edit_session_body(ec))
+    }
+}
+
+impl SuggestionReadSession_Impl {
+    fn do_edit_session_body(&self, ec: u32) -> Result<()> {
         let (ctx, composition, entry_version, last_caret_pos) = {
-            let inner = self.inner_arc.lock().unwrap();
+            let inner = lock_service(&self.inner_arc);
             let Some(ctx) = inner.context.clone() else {
                 return Ok(());
             };
@@ -170,11 +182,11 @@ impl ITfEditSession_Impl for SuggestionReadSession_Impl {
         };
         // 读文本期间不持有 inner 锁，避免 TSF 回调重入死锁
         let (suggestion, _) = suggest_from_surrounding_text(ec, &ctx, composition.as_ref());
-        *self.suggestion.lock().unwrap() = suggestion;
+        *locked(&self.suggestion) = suggestion;
         // 缓存本次采样（含焦点线程、光标位置与语境版本）：钩子路径手动切换
         // 仅在焦点线程/位置一致且缓存未被后续合成/焦点变更作废时据此取锁定基线
         {
-            let mut inner = self.inner_arc.lock().unwrap();
+            let mut inner = lock_service(&self.inner_arc);
             inner.record_context_sample(
                 suggestion,
                 focused_thread_id(),

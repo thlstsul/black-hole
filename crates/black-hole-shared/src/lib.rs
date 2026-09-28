@@ -2,6 +2,17 @@ use serde::{Deserialize, Serialize};
 
 pub mod candidate_layout;
 
+/// 提取 panic payload 的可打印内容（供各进程 panic 防护统一使用）
+pub fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
 /// 按键事件，由平台适配层解析后发送给引擎
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyEvent {

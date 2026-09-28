@@ -1,6 +1,6 @@
 use super::caret::get_candidate_position;
 use super::service::BlackHoleTextService;
-use super::{ServiceInner, send_ui_command_inner};
+use super::{ServiceInner, lock_service, safe_com, send_ui_command_inner};
 use black_hole_shared::{InputContext, SchemeResult, UiCommand};
 use std::mem;
 use std::slice;
@@ -49,7 +49,7 @@ pub(crate) fn apply_result(
             expanded,
         } => {
             let need_start = {
-                let mut inner = inner_arc.lock().unwrap();
+                let mut inner = lock_service(&inner_arc);
                 match &inner.composition {
                     None => true,
                     Some(c) => {
@@ -64,7 +64,7 @@ pub(crate) fn apply_result(
             };
             if need_start {
                 {
-                    let mut inner = inner_arc.lock().unwrap();
+                    let mut inner = lock_service(&inner_arc);
                     // 合成开始：文本/光标状态不可靠，一并清空光标位置并作废缓存
                     inner.last_caret_pos = None;
                     inner.context_version += 1;
@@ -78,7 +78,7 @@ pub(crate) fn apply_result(
                 let comp = unsafe { ctx_comp.StartComposition(ec, &range, &sink_iface)? };
 
                 {
-                    let mut inner = inner_arc.lock().unwrap();
+                    let mut inner = lock_service(&inner_arc);
                     inner.composition = Some(comp);
                     inner.context_version += 1;
                 }
@@ -91,7 +91,7 @@ pub(crate) fn apply_result(
                             source.AdviseSink(&<ITfTextLayoutSink as Interface>::IID, &sink_iface)
                         }
                     {
-                        let mut inner = inner_arc.lock().unwrap();
+                        let mut inner = lock_service(&inner_arc);
                         inner.layout_sink_cookie = Some(cookie);
                     }
                 }
@@ -102,7 +102,7 @@ pub(crate) fn apply_result(
 
             if code.is_empty() {
                 let composition = {
-                    let mut inner = inner_arc.lock().unwrap();
+                    let mut inner = lock_service(&inner_arc);
                     // 清空合成：文本已变化，一并清空光标位置并作废缓存
                     inner.last_caret_pos = None;
                     inner.context_version += 1;
@@ -115,7 +115,7 @@ pub(crate) fn apply_result(
             }
 
             let range = {
-                let inner = inner_arc.lock().unwrap();
+                let inner = lock_service(&inner_arc);
                 inner
                     .composition
                     .as_ref()
@@ -132,7 +132,7 @@ pub(crate) fn apply_result(
             // 使窗口不随编码增长而移动；取不到时退回缓存位置
             // （get_caret_position 内部已含 GUI 线程光标兜底）。
             let (composition, cached_caret) = {
-                let inner = inner_arc.lock().unwrap();
+                let inner = lock_service(&inner_arc);
                 (inner.composition.clone(), inner.last_caret_pos)
             };
             let caret_pos = get_candidate_position(ec, ctx, composition.as_ref())
@@ -140,7 +140,7 @@ pub(crate) fn apply_result(
                 .or(cached_caret);
 
             if let Some((caret_x, caret_y, caret_h)) = caret_pos {
-                let mut inner = inner_arc.lock().unwrap();
+                let mut inner = lock_service(&inner_arc);
                 inner.last_caret_pos = Some((caret_x, caret_y, caret_h));
                 drop(inner);
                 let context = InputContext::caret(caret_x, caret_y, caret_h);
@@ -169,7 +169,7 @@ pub(crate) fn apply_result(
             // 误吞一次无关的切换评估）。
             // 与取 composition 共用一次加锁（suppress_next_zh_to_en 是纯字段写）。
             let composition = {
-                let mut inner = inner_arc.lock().unwrap();
+                let mut inner = lock_service(&inner_arc);
                 if *temporary_english && inner.auto_switch {
                     inner.auto_mode.suppress_next_zh_to_en();
                 }
@@ -188,7 +188,7 @@ pub(crate) fn apply_result(
                     Ok(())
                 })();
                 // 直插文本（无合成）：文档已变化，一并清空光标位置并作废缓存
-                let mut inner = inner_arc.lock().unwrap();
+                let mut inner = lock_service(&inner_arc);
                 inner.last_caret_pos = None;
                 inner.context_version += 1;
                 return Ok(());
@@ -203,7 +203,7 @@ pub(crate) fn apply_result(
                 Ok(())
             })();
             {
-                let mut inner = inner_arc.lock().unwrap();
+                let mut inner = lock_service(&inner_arc);
                 inner.last_caret_pos = None;
                 inner.context_version += 1;
                 if let Some(cookie) = inner.layout_sink_cookie.take()
@@ -221,7 +221,7 @@ pub(crate) fn apply_result(
             // 由于 Esc 已被 OnTestKeyDown 拦截（不透传给应用），焦点不转移，
             // 候选窗不会被系统失焦路径收起，隐藏由本分支显式发出。
             let (ctx, client_id) = {
-                let inner = inner_arc.lock().unwrap();
+                let inner = lock_service(&inner_arc);
                 (inner.context.clone(), inner.client_id)
             };
             if let Some(ctx) = ctx {
@@ -254,8 +254,14 @@ pub(crate) struct CommitCompositionEditSession {
 
 impl ITfEditSession_Impl for CommitCompositionEditSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
+        safe_com(|| self.do_edit_session_body(ec))
+    }
+}
+
+impl CommitCompositionEditSession_Impl {
+    fn do_edit_session_body(&self, ec: u32) -> Result<()> {
         let (composition, ctx, layout_cookie) = {
-            let inner = self.inner_arc.lock().unwrap();
+            let inner = lock_service(&self.inner_arc);
             let comp = inner.composition.clone();
             let ctx = inner.context.clone();
             let cookie = inner.layout_sink_cookie;
@@ -287,10 +293,7 @@ impl ITfEditSession_Impl for CommitCompositionEditSession_Impl {
                 Ok(())
             })();
 
-            self.inner_arc
-                .lock()
-                .unwrap()
-                .clear_composition(ctx.as_ref(), layout_cookie);
+            lock_service(&self.inner_arc).clear_composition(ctx.as_ref(), layout_cookie);
         }
 
         Ok(())
@@ -304,8 +307,14 @@ pub(crate) struct CancelCompositionEditSession {
 
 impl ITfEditSession_Impl for CancelCompositionEditSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
+        safe_com(|| self.do_edit_session_body(ec))
+    }
+}
+
+impl CancelCompositionEditSession_Impl {
+    fn do_edit_session_body(&self, ec: u32) -> Result<()> {
         let (composition, ctx, layout_cookie) = {
-            let inner = self.inner_arc.lock().unwrap();
+            let inner = lock_service(&self.inner_arc);
             let comp = inner.composition.clone();
             let ctx = inner.context.clone();
             let cookie = inner.layout_sink_cookie;
@@ -320,10 +329,7 @@ impl ITfEditSession_Impl for CancelCompositionEditSession_Impl {
                 Ok(())
             })();
 
-            self.inner_arc
-                .lock()
-                .unwrap()
-                .clear_composition(ctx.as_ref(), layout_cookie);
+            lock_service(&self.inner_arc).clear_composition(ctx.as_ref(), layout_cookie);
         }
 
         Ok(())

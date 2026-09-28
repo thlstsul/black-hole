@@ -32,7 +32,7 @@ use windows_core::{GUID, Interface, PCWSTR, w};
 use super::{PlatformError, PlatformIme};
 use black_hole_shared::{
     AutoModeSwitch, EngineCommand, InputModeSwitch, KeyEvent, ModeSuggestion, RuntimeSettings,
-    SchemeId, SchemeResult, Theme, UiCommand,
+    SchemeId, SchemeResult, Theme, UiCommand, panic_payload_text,
 };
 
 pub mod auto_register;
@@ -88,14 +88,63 @@ pub(crate) static GLOBAL_REF_COUNT: Mutex<u32> = Mutex::new(0);
 // DLL reference counting helpers
 // ---------------------------------------------------------------------------
 
+/// COM 回调 panic 防护：捕获 panic 并转为 COM 错误码，避免 unwind 跨越
+/// FFI 边界导致进程 abort（退出码 0xc0000409，无 WER 记录、无日志）。
+///
+/// TSF 宿主直接调用这些 `extern "system"` 接口方法，任何 panic 都不允许
+/// 向外传播。注意：本 DLL 加载在宿主应用进程内，daemon 安装的全局 panic
+/// hook 在这里不存在，因此 panic 现场必须在 catch 分支就地记录（payload
+/// 消息 + 线程名）。宿主进程内 tracing subscriber 通常未初始化，日志可能
+/// 无输出，但记录本身保持尽力而为。
+pub(crate) fn safe_com<T>(op: impl FnOnce() -> windows_core::Result<T>) -> windows_core::Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(op)).unwrap_or_else(|payload| {
+        let message = panic_payload_text(&payload);
+        let thread = std::thread::current();
+        error!(
+            "COM callback panicked in thread '{}': {} — returning E_UNEXPECTED",
+            thread.name().unwrap_or("<unnamed>"),
+            message
+        );
+        Err(windows_core::Error::from_hresult(
+            windows::Win32::Foundation::E_UNEXPECTED,
+        ))
+    })
+}
+
+/// 普通 Mutex 的 poison 恢复加锁（`ServiceInner` 用 [`lock_service`]）。
+pub(crate) fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub(crate) fn dll_add_ref() {
-    let mut count = GLOBAL_REF_COUNT.lock().unwrap();
-    *count += 1;
+    *locked(&GLOBAL_REF_COUNT) += 1;
 }
 
 pub(crate) fn dll_release() {
-    let mut count = GLOBAL_REF_COUNT.lock().unwrap();
-    *count -= 1;
+    *locked(&GLOBAL_REF_COUNT) -= 1;
+}
+
+/// 加锁 `ServiceInner`，poison 恢复时重置突变敏感字段。
+///
+/// 任一线程持锁 panic 会使 Mutex poison。直接 `into_inner()` 会带着
+/// 中途崩溃留下的不一致状态继续跑（如 composition 已清但 context_version
+/// 未 bump，合成提交/取消会作用到过期范围）。本函数在恢复路径上复用
+/// [`ServiceInner::clear_composition`] 收尾（结束合成态、反注册 layout
+/// sink、bump 版本号），并清空按键缓存，让下游的陈旧门控重新采样。
+pub(crate) fn lock_service(inner: &Mutex<ServiceInner>) -> std::sync::MutexGuard<'_, ServiceInner> {
+    match inner.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!("ServiceInner lock poisoned, resetting mutation-sensitive fields");
+            let mut guard = poisoned.into_inner();
+            let ctx = guard.context.clone();
+            let cookie = guard.layout_sink_cookie;
+            guard.clear_composition(ctx.as_ref(), cookie);
+            guard.last_key_event = None;
+            guard.last_eng_eval_key = None;
+            guard
+        }
+    }
 }
 
 pub(crate) fn set_dll_instance(inst: HINSTANCE) {
@@ -287,7 +336,7 @@ const RECONNECT_MIN_INTERVAL: Duration = Duration::from_millis(1000);
 /// 返回连接是否可用。供菜单命令、候选窗等非按键路径复用。
 /// 重连受 [`try_reconnect_ipc`] 限频，不会在调用线程上 sleep。
 pub(crate) fn ensure_ipc_connection(inner_arc: &Arc<Mutex<ServiceInner>>) -> bool {
-    if inner_arc.lock().unwrap().ipc_conn.is_some() {
+    if lock_service(inner_arc).ipc_conn.is_some() {
         return true;
     }
     try_reconnect_ipc(inner_arc)
@@ -298,7 +347,7 @@ pub(crate) fn ensure_ipc_connection(inner_arc: &Arc<Mutex<ServiceInner>>) -> boo
 /// 供按键路径在失败后调用一次，失败即返回，由下一次按键再试。
 pub(crate) fn try_reconnect_ipc(inner_arc: &Arc<Mutex<ServiceInner>>) -> bool {
     {
-        let inner = inner_arc.lock().unwrap();
+        let inner = lock_service(inner_arc);
         if inner.ipc_conn.is_some() {
             return true;
         }
@@ -310,7 +359,7 @@ pub(crate) fn try_reconnect_ipc(inner_arc: &Arc<Mutex<ServiceInner>>) -> bool {
     }
 
     // 先记录尝试时间再连接，使连续调用被限频。
-    inner_arc.lock().unwrap().last_reconnect_attempt = Some(Instant::now());
+    lock_service(inner_arc).last_reconnect_attempt = Some(Instant::now());
 
     match IpcStream::connect(IPC_PIPE_NAME) {
         Ok(stream) => {
@@ -318,7 +367,7 @@ pub(crate) fn try_reconnect_ipc(inner_arc: &Arc<Mutex<ServiceInner>>) -> bool {
                 Ok(r) => r,
                 Err(_) => return false,
             };
-            let mut inner = inner_arc.lock().unwrap();
+            let mut inner = lock_service(inner_arc);
             inner.ipc_conn = Some(IpcConnection {
                 writer: stream,
                 reader,
@@ -357,7 +406,7 @@ pub(crate) fn send_ui_command_inner(inner_arc: &Arc<Mutex<ServiceInner>>, cmd: U
     }
 
     let request = IpcRequest::UiCommand(cmd);
-    let mut inner = inner_arc.lock().unwrap();
+    let mut inner = lock_service(inner_arc);
     if let Some(ref mut conn) = inner.ipc_conn
         && let Err(e) = send_request_buf(&mut conn.writer, &request, &mut conn.send_buf)
     {
@@ -453,7 +502,7 @@ fn handle_ipc_client(
     let mut buf = Vec::with_capacity(4096);
 
     let send_engine = |cmd: EngineCommand| -> io::Result<SchemeResult> {
-        let rx = platform_rx.lock().unwrap();
+        let rx = locked(&platform_rx);
         engine_tx
             .send(cmd)
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
@@ -512,7 +561,7 @@ fn handle_ipc_client(
                 let _ = ui_tx.send(ui_cmd);
             }
             IpcRequest::GetSettings => {
-                let settings = *current.lock().unwrap();
+                let settings = *locked(&current);
                 let response = IpcResponse::Settings {
                     scheme_id: settings.scheme_id,
                     theme: settings.theme,

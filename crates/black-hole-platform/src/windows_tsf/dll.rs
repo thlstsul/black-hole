@@ -1,5 +1,8 @@
 use super::service::BlackHoleTextService;
-use super::{CLSID_BLACKHOLE_TIP, GLOBAL_REF_COUNT, dll_add_ref, dll_release, set_dll_instance};
+use super::{
+    CLSID_BLACKHOLE_TIP, GLOBAL_REF_COUNT, dll_add_ref, dll_release, locked, safe_com,
+    set_dll_instance,
+};
 #[cfg(debug_assertions)]
 use std::env;
 use std::ffi::c_void;
@@ -17,7 +20,8 @@ use tracing_appender::non_blocking;
 #[cfg(debug_assertions)]
 use tracing_subscriber::fmt;
 use windows::Win32::Foundation::{
-    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_POINTER, HINSTANCE, S_FALSE, S_OK,
+    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_POINTER, E_UNEXPECTED, HINSTANCE, S_FALSE,
+    S_OK,
 };
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows_core::{BOOL, GUID, HRESULT, IUnknown, Interface, Ref, Result, implement};
@@ -36,32 +40,36 @@ impl IClassFactory_Impl for BlackHoleClassFactory_Impl {
         riid: *const GUID,
         ppv: *mut *mut c_void,
     ) -> Result<()> {
-        if !punkouter.is_null() {
-            return Err(CLASS_E_NOAGGREGATION.into());
-        }
-        if ppv.is_null() {
-            return Err(E_POINTER.into());
-        }
-        unsafe {
-            *ppv = ptr::null_mut();
-        }
+        safe_com(|| {
+            if !punkouter.is_null() {
+                return Err(CLASS_E_NOAGGREGATION.into());
+            }
+            if ppv.is_null() {
+                return Err(E_POINTER.into());
+            }
+            unsafe {
+                *ppv = ptr::null_mut();
+            }
 
-        let service = BlackHoleTextService::new();
-        let unknown: IUnknown = service.into();
-        unsafe {
-            unknown.query(riid, ppv).ok()?;
-        }
-        dll_add_ref();
-        Ok(())
+            let service = BlackHoleTextService::new();
+            let unknown: IUnknown = service.into();
+            unsafe {
+                unknown.query(riid, ppv).ok()?;
+            }
+            dll_add_ref();
+            Ok(())
+        })
     }
 
     fn LockServer(&self, flock: BOOL) -> Result<()> {
-        if flock.as_bool() {
-            dll_add_ref();
-        } else {
-            dll_release();
-        }
-        Ok(())
+        safe_com(|| {
+            if flock.as_bool() {
+                dll_add_ref();
+            } else {
+                dll_release();
+            }
+            Ok(())
+        })
     }
 }
 
@@ -124,27 +132,33 @@ extern "system" fn DllGetClassObject(
     riid: *const GUID,
     ppv: *mut *mut c_void,
 ) -> HRESULT {
-    if ppv.is_null() {
-        return E_POINTER;
-    }
-    unsafe {
-        *ppv = ptr::null_mut();
-    }
+    safe_com(|| {
+        if ppv.is_null() {
+            return Err(E_POINTER.into());
+        }
+        unsafe {
+            *ppv = ptr::null_mut();
+        }
 
-    if rclsid.is_null() || unsafe { *rclsid } != CLSID_BLACKHOLE_TIP {
-        return CLASS_E_CLASSNOTAVAILABLE;
-    }
+        if rclsid.is_null() || unsafe { *rclsid } != CLSID_BLACKHOLE_TIP {
+            return Err(CLASS_E_CLASSNOTAVAILABLE.into());
+        }
 
-    let factory: IClassFactory = BlackHoleClassFactory.into();
-    let result = unsafe { factory.query(riid, ppv) };
-    if result.is_ok() {
-        dll_add_ref();
-    }
-    result
+        let factory: IClassFactory = BlackHoleClassFactory.into();
+        let result = unsafe { factory.query(riid, ppv) };
+        if result.is_ok() {
+            dll_add_ref();
+        }
+        Ok(result)
+    })
+    .unwrap_or(E_UNEXPECTED)
 }
 
 #[unsafe(no_mangle)]
 extern "system" fn DllCanUnloadNow() -> HRESULT {
-    let count = *GLOBAL_REF_COUNT.lock().unwrap();
-    if count == 0 { S_OK } else { S_FALSE }
+    safe_com(|| {
+        let count = *locked(&GLOBAL_REF_COUNT);
+        Ok(if count == 0 { S_OK } else { S_FALSE })
+    })
+    .unwrap_or(E_UNEXPECTED)
 }

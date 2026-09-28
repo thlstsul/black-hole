@@ -6,7 +6,7 @@
 //! - 点击弹出菜单：设置、输入方案、主题、退出
 
 use super::service::apply_input_mode_toggle;
-use super::{CLSID_BLACKHOLE_TIP, ServiceInner, send_ui_command_inner};
+use super::{CLSID_BLACKHOLE_TIP, ServiceInner, lock_service, safe_com, send_ui_command_inner};
 use crate::auto_start::is_auto_start;
 use crate::system_theme::system_uses_dark_mode;
 use black_hole_shared::{SchemeId, Theme, UiCommand};
@@ -142,17 +142,17 @@ impl BlackHoleLangBarItem {
     }
 
     fn current_scheme(&self) -> SchemeId {
-        let inner = self.inner.lock().unwrap();
+        let inner = lock_service(&self.inner);
         inner.current_scheme
     }
 
     fn current_theme(&self) -> Theme {
-        let inner = self.inner.lock().unwrap();
+        let inner = lock_service(&self.inner);
         inner.current_theme
     }
 
     fn is_english_mode(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = lock_service(&self.inner);
         inner.mode_switch.is_english()
     }
 
@@ -160,7 +160,7 @@ impl BlackHoleLangBarItem {
     /// 转发给 TSF，因此通过点击语言栏提供显式入口）。
     fn toggle_input_mode(&self) {
         let toggled = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = lock_service(&self.inner);
             let next = !inner.mode_switch.is_english();
             inner.mode_switch.set_english(next)
         };
@@ -173,7 +173,7 @@ impl BlackHoleLangBarItem {
 
     fn set_scheme(&self, scheme: SchemeId) {
         let sink = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = lock_service(&self.inner);
             inner.current_scheme = scheme;
             inner.langbar_item_sink.clone()
         };
@@ -184,7 +184,7 @@ impl BlackHoleLangBarItem {
 
     fn set_theme(&self, theme: Theme) {
         let sink = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = lock_service(&self.inner);
             inner.current_theme = theme;
             inner.langbar_item_sink.clone()
         };
@@ -402,6 +402,33 @@ impl BlackHoleLangBarItem {
 
 impl ITfLangBarItem_Impl for BlackHoleLangBarItem_Impl {
     fn GetInfo(&self, pinfo: *mut TF_LANGBARITEMINFO) -> Result<()> {
+        safe_com(|| self.get_info_body(pinfo))
+    }
+
+    fn GetStatus(&self) -> Result<u32> {
+        safe_com(|| {
+            debug!("LangBarItem::GetStatus called");
+            Ok(0)
+        })
+    }
+
+    fn Show(&self, fshow: BOOL) -> Result<()> {
+        safe_com(|| {
+            debug!("LangBarItem::Show called: fshow={}", fshow.0);
+            Ok(())
+        })
+    }
+
+    fn GetTooltipString(&self) -> Result<BSTR> {
+        safe_com(|| {
+            debug!("LangBarItem::GetTooltipString called");
+            Ok(BSTR::from("黑洞输入法"))
+        })
+    }
+}
+
+impl BlackHoleLangBarItem_Impl {
+    fn get_info_body(&self, pinfo: *mut TF_LANGBARITEMINFO) -> Result<()> {
         debug!("LangBarItem::GetInfo called");
         unsafe {
             let info = &mut *pinfo;
@@ -419,25 +446,43 @@ impl ITfLangBarItem_Impl for BlackHoleLangBarItem_Impl {
         }
         Ok(())
     }
-
-    fn GetStatus(&self) -> Result<u32> {
-        debug!("LangBarItem::GetStatus called");
-        Ok(0)
-    }
-
-    fn Show(&self, fshow: BOOL) -> Result<()> {
-        debug!("LangBarItem::Show called: fshow={}", fshow.0);
-        Ok(())
-    }
-
-    fn GetTooltipString(&self) -> Result<BSTR> {
-        debug!("LangBarItem::GetTooltipString called");
-        Ok(BSTR::from("黑洞输入法"))
-    }
 }
 
 impl ITfLangBarItemButton_Impl for BlackHoleLangBarItem_Impl {
     fn OnClick(&self, click: TfLBIClick, pt: &POINT, _prcarea: *const RECT) -> Result<()> {
+        safe_com(|| self.on_click_body(click, pt))
+    }
+
+    fn InitMenu(&self, pmenu: Ref<'_, ITfMenu>) -> Result<()> {
+        safe_com(|| self.init_menu_body(pmenu))
+    }
+
+    fn OnMenuSelect(&self, wid: u32) -> Result<()> {
+        safe_com(|| self.on_menu_select_body(wid))
+    }
+
+    fn GetIcon(&self) -> Result<HICON> {
+        safe_com(|| {
+            debug!("LangBarItem::GetIcon called");
+            render_scheme_icon(
+                self.current_scheme(),
+                self.current_theme(),
+                self.is_english_mode(),
+            )
+        })
+    }
+
+    fn GetText(&self) -> Result<BSTR> {
+        safe_com(|| {
+            debug!("LangBarItem::GetText called");
+            // 菜单按钮通常只显示图标；文本留空避免占用空间。
+            Ok(BSTR::new())
+        })
+    }
+}
+
+impl BlackHoleLangBarItem_Impl {
+    fn on_click_body(&self, click: TfLBIClick, pt: &POINT) -> Result<()> {
         debug!("LangBarItem::OnClick called: click={:?}", click.0);
         // Windows 8+ 对 GUID_LBI_INPUTMODE 项通常走 OnClick 而不是 InitMenu。
         // 左键点击直接切换中英模式，右键弹出上下文菜单。
@@ -449,7 +494,7 @@ impl ITfLangBarItemButton_Impl for BlackHoleLangBarItem_Impl {
         Ok(())
     }
 
-    fn InitMenu(&self, pmenu: Ref<'_, ITfMenu>) -> Result<()> {
+    fn init_menu_body(&self, pmenu: Ref<'_, ITfMenu>) -> Result<()> {
         debug!("LangBarItem::InitMenu called");
         let menu = pmenu.to_owned().ok_or(E_UNEXPECTED)?;
 
@@ -532,7 +577,7 @@ impl ITfLangBarItemButton_Impl for BlackHoleLangBarItem_Impl {
         Ok(())
     }
 
-    fn OnMenuSelect(&self, wid: u32) -> Result<()> {
+    fn on_menu_select_body(&self, wid: u32) -> Result<()> {
         debug!("LangBarItem::OnMenuSelect called: wid={}", wid);
         match wid {
             MENU_ID_SETTINGS => self.send_ui_command(UiCommand::ShowSettings),
@@ -566,25 +611,20 @@ impl ITfLangBarItemButton_Impl for BlackHoleLangBarItem_Impl {
         }
         Ok(())
     }
-
-    fn GetIcon(&self) -> Result<HICON> {
-        debug!("LangBarItem::GetIcon called");
-        render_scheme_icon(
-            self.current_scheme(),
-            self.current_theme(),
-            self.is_english_mode(),
-        )
-    }
-
-    fn GetText(&self) -> Result<BSTR> {
-        debug!("LangBarItem::GetText called");
-        // 菜单按钮通常只显示图标；文本留空避免占用空间。
-        Ok(BSTR::new())
-    }
 }
 
 impl ITfSource_Impl for BlackHoleLangBarItem_Impl {
     fn AdviseSink(&self, riid: *const GUID, punk: Ref<'_, IUnknown>) -> Result<u32> {
+        safe_com(|| self.advise_sink_body(riid, punk))
+    }
+
+    fn UnadviseSink(&self, dwcookie: u32) -> Result<()> {
+        safe_com(|| self.unadvise_sink_body(dwcookie))
+    }
+}
+
+impl BlackHoleLangBarItem_Impl {
+    fn advise_sink_body(&self, riid: *const GUID, punk: Ref<'_, IUnknown>) -> Result<u32> {
         let riid_safe = unsafe { riid.as_ref().copied() };
         debug!("LangBarItem::AdviseSink called: riid={:?}", riid_safe);
 
@@ -594,7 +634,7 @@ impl ITfSource_Impl for BlackHoleLangBarItem_Impl {
         {
             let unknown = punk.to_owned().ok_or(E_UNEXPECTED)?;
             let sink: ITfLangBarItemSink = unknown.cast()?;
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = lock_service(&self.inner);
             inner.langbar_item_sink = Some(sink.clone());
             inner.langbar_item_sink_cookie = 1;
             debug!("LangBarItem sink installed");
@@ -610,10 +650,10 @@ impl ITfSource_Impl for BlackHoleLangBarItem_Impl {
         Ok(0)
     }
 
-    fn UnadviseSink(&self, dwcookie: u32) -> Result<()> {
+    fn unadvise_sink_body(&self, dwcookie: u32) -> Result<()> {
         debug!("LangBarItem::UnadviseSink called: dwcookie={}", dwcookie);
         if dwcookie == 1 {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = lock_service(&self.inner);
             inner.langbar_item_sink = None;
             inner.langbar_item_sink_cookie = 0;
         }

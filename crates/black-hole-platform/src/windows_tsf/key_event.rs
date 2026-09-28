@@ -4,7 +4,7 @@ use super::caret::{
 };
 use super::commit::apply_result;
 use super::hook::focused_thread_id;
-use super::{ServiceInner, try_reconnect_ipc};
+use super::{ServiceInner, lock_service, safe_com, try_reconnect_ipc};
 use crate::ipc::{IpcRequest, read_response, send_request_buf};
 use black_hole_shared::{
     InputContext, KeyEvent, KeyState, ModeSuggestion, Modifiers, suggest_input_mode,
@@ -149,13 +149,15 @@ impl ITfEditSession_Impl for KeyHandlerEditSession_Impl {
         let key_event = self.key_event.clone();
         let auto_switched = self.auto_switched.clone();
 
-        match handle_key_event_with_reconnect(&service, ec, key_event, &auto_switched) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                error!("DoEditSession: failed with error: {:?}", e);
-                Err(e)
+        safe_com(|| {
+            match handle_key_event_with_reconnect(&service, ec, key_event, &auto_switched) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    error!("DoEditSession: failed with error: {:?}", e);
+                    Err(e)
+                }
             }
-        }
+        })
     }
 }
 
@@ -179,7 +181,7 @@ pub(crate) fn handle_key_event_with_reconnect(
     warn!("IPC operation failed, clearing connection");
 
     {
-        let mut inner = service.lock().unwrap();
+        let mut inner = lock_service(service);
         inner.ipc_conn = None;
     }
 
@@ -205,7 +207,7 @@ fn handle_key_event_internal(
         // 窗口内的近似快照继续消费（见 should_retry_read）。
         let mut retried = false;
         'read: loop {
-            let inner = service.lock().unwrap();
+            let inner = lock_service(service);
             let ctx = inner.context.clone().ok_or(E_UNEXPECTED)?;
             let composition = inner.composition.clone();
             let last_caret_pos = inner.last_caret_pos;
@@ -221,7 +223,7 @@ fn handle_key_event_internal(
                 read_surrounding_text(ec, &ctx, composition.as_ref());
 
             // 重新加锁：继续走消费 surrounding 的路径。
-            let mut inner = service.lock().unwrap();
+            let mut inner = lock_service(service);
             if should_retry_read(entry_version, inner.context_version, retried) {
                 retried = true;
                 continue 'read;
@@ -327,7 +329,7 @@ fn handle_key_event_internal(
             // 缓存本次采样（含焦点线程、光标位置与语境版本）：内容与位置都锚定
             // 读取前的快照（entry_version / last_caret_pos），版本盖章必须与
             // 采样文本同源（详见 record_context_sample 的文档）。
-            service.lock().unwrap().record_context_sample(
+            lock_service(service).record_context_sample(
                 surrounding
                     .as_ref()
                     .map(|(p, f)| suggest_input_mode(p.as_deref(), f.as_deref()))

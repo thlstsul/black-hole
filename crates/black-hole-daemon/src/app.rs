@@ -17,7 +17,7 @@ use black_hole_platform::{LinuxIbusIme, PlatformError as LinuxPlatformError};
 use black_hole_platform::{PlatformError as WindowsPlatformError, WindowsTsfIme};
 use black_hole_shared::{
     EngineCommand, InputContext, LlmCompletionSettings, RuntimeSettings, SchemeId, SchemeResult,
-    Settings, Theme, UiCommand,
+    Settings, Theme, UiCommand, panic_payload_text,
 };
 use black_hole_ui::{SettingsManager, run_candidate_window, run_settings_panel};
 use clap::Parser;
@@ -312,7 +312,35 @@ impl App {
             .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
             .init();
 
+        Self::install_panic_hook();
         guard
+    }
+
+    /// 全局 panic hook：panic 信息经 tracing 写入日志文件。
+    ///
+    /// windows_subsystem="windows" 下 stderr 不可见，且 panic 发生在
+    /// extern "system" 回调中时会跨越 FFI 边界直接 abort（退出码
+    /// 0xc0000409，无 WER 记录）——不落日志就完全没有现场可查。
+    /// 注意 non_blocking writer 是异线程刷写的，abort 前尽力而为。
+    /// 链式调用前一个 hook（默认 hook）：Linux/控制台场景 stderr 的
+    /// 标准 panic 输出保持可见，日志文件只是补充而非替代。
+    fn install_panic_hook() {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            previous_hook(info);
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let message = panic_payload_text(info.payload());
+            let thread = std::thread::current();
+            error!(
+                "PANIC in thread '{}': {} at {}",
+                thread.name().unwrap_or("<unnamed>"),
+                message,
+                location
+            );
+        }));
     }
 
     // ------------------------------------------------------------------

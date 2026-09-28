@@ -1,4 +1,4 @@
-use super::{ServiceInner, send_ui_command_inner};
+use super::{ServiceInner, lock_service, send_ui_command_inner};
 use black_hole_shared::{InputContext, UiCommand};
 use std::mem;
 use std::sync::{Arc, Mutex};
@@ -294,7 +294,7 @@ pub(crate) struct LayoutChangeEditSession {
 
 impl ITfEditSession_Impl for LayoutChangeEditSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
-        let inner = self.inner_arc.lock().unwrap();
+        let inner = lock_service(&self.inner_arc);
         let ctx = match &inner.context {
             Some(c) => c.clone(),
             None => return Ok(()),
@@ -303,7 +303,7 @@ impl ITfEditSession_Impl for LayoutChangeEditSession_Impl {
         drop(inner);
 
         if let Ok((caret_x, caret_y, caret_h)) = get_candidate_position(ec, &ctx, comp.as_ref()) {
-            let mut inner = self.inner_arc.lock().unwrap();
+            let mut inner = lock_service(&self.inner_arc);
             inner.last_caret_pos = Some((caret_x, caret_y, caret_h));
             drop(inner);
 
