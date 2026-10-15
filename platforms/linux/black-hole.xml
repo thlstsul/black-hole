@@ -20,7 +20,7 @@
       <description
             >Black-Hole IME with Pinyin and Shuangpin support</description>
       <rank>99</rank>
-      <symbol>CJ</symbol>
+      <symbol>BH</symbol>
     </engine>
   </engines>
 </component>

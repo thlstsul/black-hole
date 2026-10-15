@@ -30,7 +30,7 @@ const IBUS_COMPONENT_TEMPLATE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
       <longname>Black-Hole</longname>
       <description>Black-Hole IME with Pinyin and Shuangpin support</description>
       <rank>99</rank>
-      <symbol>CJ</symbol>
+      <symbol>BH</symbol>
     </engine>
   </engines>
 </component>
