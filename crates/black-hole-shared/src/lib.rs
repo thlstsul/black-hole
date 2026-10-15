@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
+use std::any::Any;
 
 pub mod candidate_layout;
 
 /// 提取 panic payload 的可打印内容（供各进程 panic 防护统一使用）
-pub fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+pub fn panic_payload_text(payload: &(dyn Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {

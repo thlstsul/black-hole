@@ -8,10 +8,17 @@
 use black_hole_shared::{
     Candidate, InputContext, KeyEvent, SchemeId, SchemeResult, Theme, UiCommand,
 };
+use rmp_serde::{Serializer, from_slice};
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::iter::once;
+use std::mem::size_of;
 use std::os::windows::io::FromRawHandle;
+use std::ptr::null_mut;
+use std::sync::OnceLock;
+use std::thread::sleep;
 use std::time::Duration;
 use tracing::warn;
 use windows::Win32::Foundation::{
@@ -34,7 +41,7 @@ use windows::Win32::System::Pipes::{
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PWSTR};
 
 /// TSF DLL → Daemon 的请求
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,14 +184,14 @@ fn read_frame<'a, R: Read>(reader: &mut R, buf: &'a mut Vec<u8>) -> Result<&'a [
 /// 再单次 write_all。
 fn write_frame_buf<W: Write>(
     writer: &mut W,
-    value: &impl serde::Serialize,
+    value: &impl Serialize,
     buf: &mut Vec<u8>,
 ) -> Result<(), io::Error> {
     buf.clear();
     // 预留 4 字节长度占位，直接序列化进同一缓冲后回填
     buf.extend_from_slice(&[0u8; 4]);
     value
-        .serialize(&mut rmp_serde::Serializer::new(&mut *buf))
+        .serialize(&mut Serializer::new(&mut *buf))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let len = u32::try_from(buf.len() - 4)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame too large"))?;
@@ -217,16 +224,16 @@ pub fn send_response_buf<W: Write>(
 pub fn read_request<R: Read>(reader: &mut R, buf: &mut Vec<u8>) -> Result<IpcRequest, io::Error> {
     let payload = read_frame(reader, buf)?;
     // to_vec 产出的数据自带完整边界，&[u8] 切片解码即可
-    let request: IpcRequest = rmp_serde::from_slice(payload)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let request: IpcRequest =
+        from_slice(payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(request)
 }
 
 /// IPC 通信辅助函数：读取响应（帧协议，MessagePack 载荷）。`buf` 复用避免每键分配。
 pub fn read_response<R: Read>(reader: &mut R, buf: &mut Vec<u8>) -> Result<IpcResponse, io::Error> {
     let payload = read_frame(reader, buf)?;
-    let response: IpcResponse = rmp_serde::from_slice(payload)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let response: IpcResponse =
+        from_slice(payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(response)
 }
 
@@ -248,7 +255,7 @@ struct SecAttrsValue(SecAttrsTuple);
 unsafe impl Send for SecAttrsValue {}
 unsafe impl Sync for SecAttrsValue {}
 
-struct SecAttrsCache(std::sync::OnceLock<Result<SecAttrsValue, String>>);
+struct SecAttrsCache(OnceLock<Result<SecAttrsValue, String>>);
 
 /// 构造仅授予当前用户访问权限的 SECURITY_ATTRIBUTES。
 /// 默认 DACL 会允许同会话任意进程连接管道并注入按键/UI 命令，
@@ -258,7 +265,7 @@ struct SecAttrsCache(std::sync::OnceLock<Result<SecAttrsValue, String>>);
 /// 保证其地址在进程内恒定有效；且 accept() 每连接都会调用本函数，
 /// 不缓存则每次泄漏一个 token 句柄和一份 ACL 分配。
 fn restricted_security_attributes() -> io::Result<&'static SecAttrsTuple> {
-    static SEC_ATTRS: SecAttrsCache = SecAttrsCache(std::sync::OnceLock::new());
+    static SEC_ATTRS: SecAttrsCache = SecAttrsCache(OnceLock::new());
     SEC_ATTRS
         .0
         .get_or_init(build_security_attributes)
@@ -291,11 +298,11 @@ fn build_security_attributes() -> Result<SecAttrsValue, String> {
 
         // EXPLICIT_ACCESS：当前用户 SID，GENERIC_ALL
         let trustee = TRUSTEE_W {
-            pMultipleTrustee: std::ptr::null_mut(),
+            pMultipleTrustee: null_mut(),
             MultipleTrusteeOperation: Default::default(),
             TrusteeForm: TRUSTEE_IS_SID,
             TrusteeType: TRUSTEE_IS_USER,
-            ptstrName: windows::core::PWSTR(sid_ptr.0 as *mut u16),
+            ptstrName: PWSTR(sid_ptr.0 as *mut u16),
         };
         let ea = EXPLICIT_ACCESS_W {
             grfAccessPermissions: (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
@@ -304,7 +311,7 @@ fn build_security_attributes() -> Result<SecAttrsValue, String> {
             Trustee: trustee,
         };
 
-        let mut new_acl: *mut ACL = std::ptr::null_mut();
+        let mut new_acl: *mut ACL = null_mut();
         let err = SetEntriesInAclW(Some(&[ea]), None, &mut new_acl);
         if !err.is_ok() || new_acl.is_null() {
             return Err(format!("SetEntriesInAclW failed: {}", err.0));
@@ -327,7 +334,7 @@ fn build_security_attributes() -> Result<SecAttrsValue, String> {
         .map_err(|e| e.to_string())?;
 
         let sa = Box::new(SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: &mut *sd as *mut _ as _,
             bInheritHandle: false.into(),
         });
@@ -394,7 +401,7 @@ impl IpcStream {
                         // 长间隔阶段：10ms 固定（再补约 100ms）
                         10
                     };
-                    std::thread::sleep(Duration::from_millis(ms));
+                    sleep(Duration::from_millis(ms));
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -431,7 +438,7 @@ pub struct IpcListener {
     /// bind() 创建的首个实例：既做名称冲突探测（fail-fast），也在
     /// 第一次 accept 时复用，避免"创建→关闭→重建"窗口吞掉客户端连接。
     /// Cell：accept(&self) 内取走一次性所有权。
-    probe: std::cell::Cell<Option<HANDLE>>,
+    probe: Cell<Option<HANDLE>>,
 }
 
 // HANDLE 是裸句柄（非线程亲和资源，内核对象可跨线程使用），probe 仅在
@@ -459,7 +466,7 @@ impl IpcListener {
     pub fn bind(pipe_name: &str) -> io::Result<Self> {
         let listener = Self {
             pipe_name: to_wide(pipe_name),
-            probe: std::cell::Cell::new(None),
+            probe: Cell::new(None),
         };
         let probe = listener.create_instance(true)?;
         listener.probe.set(Some(probe));
@@ -489,7 +496,7 @@ impl IpcListener {
                     "restricted_security_attributes failed, using default DACL: {}",
                     e
                 );
-                std::ptr::null_mut()
+                null_mut()
             }
         };
         let handle: HANDLE = unsafe {
@@ -538,7 +545,7 @@ impl IpcListener {
 
 /// UTF-8 → NUL 结尾 UTF-16
 fn to_wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
+    s.encode_utf16().chain(once(0)).collect()
 }
 
 #[cfg(test)]
@@ -565,7 +572,7 @@ mod tests {
             );
             // 经 MessagePack 序列化/反序列化（与 read_response 同一通道）后仍保留
             let payload = rmp_serde::to_vec(&response).unwrap();
-            let back: IpcResponse = rmp_serde::from_slice(&payload).unwrap();
+            let back: IpcResponse = from_slice(&payload).unwrap();
             let restored = SchemeResult::from(back);
             assert_eq!(
                 restored,
@@ -590,7 +597,7 @@ mod tests {
             0x81, 0xA4, b't', b'e', b'x', b't', 0xA3, b'a', b'b',
             b'c', // fixmap{1}, "text", "abc"
         ];
-        let response: IpcResponse = rmp_serde::from_slice(&legacy).unwrap();
+        let response: IpcResponse = from_slice(&legacy).unwrap();
         assert_eq!(
             response,
             IpcResponse::Committed {

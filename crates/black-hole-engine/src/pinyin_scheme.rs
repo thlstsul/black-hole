@@ -4,6 +4,7 @@ use crate::RawEntry;
 use crate::default_user_dict_dir;
 use crate::punctuation::QuotePair;
 use crate::scheme_helpers;
+use crate::user_dict::SAVE_INTERVAL;
 use crate::{
     Codec, CodecState, DecodeResult, Dictionary, GraphDecoder, InputScheme, LanguageModel,
     PinyinCodec, RimeDict, SyllableGraph, UserDictionary, global_user_dict, sort_candidates,
@@ -16,7 +17,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::env;
 #[cfg(test)]
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tracing::debug;
 
 /// 拼音输入方案
@@ -49,9 +52,9 @@ pub struct PinyinScheme {
     /// 上一轮上屏的末词（跨句 Bigram 上下文）：Escape/Reset 不清空，方案切换时清空
     prev_commit: Option<String>,
     /// Bigram 落盘防抖计时（复用 SAVE_INTERVAL 节奏）
-    last_bigram_save: Option<std::time::Instant>,
+    last_bigram_save: Option<Instant>,
     /// 个人 Bigram 持久化路径（with_dictionary 时确定；None 表示不落盘）
-    bigram_path: Option<std::path::PathBuf>,
+    bigram_path: Option<PathBuf>,
 }
 
 impl Default for PinyinScheme {
@@ -78,10 +81,7 @@ impl PinyinScheme {
 
     /// 指定个人 Bigram 路径的构造（测试用隔离落盘文件，避免并行测试共用文件
     /// 导致计数互相污染；生产路径由 `with_dictionary` 传入用户目录路径）
-    pub(crate) fn with_dictionary_and_bigram(
-        dict: Arc<RimeDict>,
-        bigram_path: std::path::PathBuf,
-    ) -> Self {
+    pub(crate) fn with_dictionary_and_bigram(dict: Arc<RimeDict>, bigram_path: PathBuf) -> Self {
         let lm = dict.build_language_model();
         let mut scheme = Self {
             codec: PinyinCodec::new(),
@@ -184,10 +184,10 @@ impl PinyinScheme {
         if self.bigram_path.is_none() {
             return;
         }
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         if self
             .last_bigram_save
-            .is_none_or(|t| now.duration_since(t) >= crate::user_dict::SAVE_INTERVAL)
+            .is_none_or(|t| now.duration_since(t) >= SAVE_INTERVAL)
         {
             self.flush_bigram();
         }
@@ -200,7 +200,7 @@ impl PinyinScheme {
         {
             debug!("save user bigram failed: {}", e);
         }
-        self.last_bigram_save = Some(std::time::Instant::now());
+        self.last_bigram_save = Some(Instant::now());
     }
 
     /// 解码期用户词频预取：对音节图内词长 1..=MAX_WORD_SYLLABLES 的

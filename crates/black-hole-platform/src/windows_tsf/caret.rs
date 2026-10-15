@@ -1,6 +1,7 @@
 use super::{ServiceInner, lock_service, send_ui_command_inner};
 use black_hole_shared::{InputContext, UiCommand};
 use std::mem;
+use std::ptr::null;
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{E_FAIL, POINT, RECT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
@@ -93,10 +94,9 @@ pub(crate) fn read_surrounding_text(
         let mut text = String::new();
         if let Ok(r) = unsafe { caret.Clone() } {
             let mut shifted = 0i32;
-            let ok =
-                unsafe { r.ShiftStart(ec, -MAX_PRECEDING_CHARS, &mut shifted, std::ptr::null()) }
-                    .is_ok()
-                    && shifted != 0;
+            let ok = unsafe { r.ShiftStart(ec, -MAX_PRECEDING_CHARS, &mut shifted, null()) }
+                .is_ok()
+                && shifted != 0;
             if ok {
                 // 光标落在合成串内/末尾时，前文会混入正在输入的字母，
                 // 把终点收回到合成串起点，只取真实前文。
@@ -116,8 +116,7 @@ pub(crate) fn read_surrounding_text(
         let mut text = String::new();
         if let Ok(r) = unsafe { caret.Clone() } {
             let mut shifted = 0i32;
-            let ok = unsafe { r.ShiftEnd(ec, MAX_FOLLOWING_CHARS, &mut shifted, std::ptr::null()) }
-                .is_ok()
+            let ok = unsafe { r.ShiftEnd(ec, MAX_FOLLOWING_CHARS, &mut shifted, null()) }.is_ok()
                 && shifted != 0;
             if ok {
                 // 光标落在合成串内/起点时，后文会混入正在输入的字母，

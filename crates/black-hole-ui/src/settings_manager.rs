@@ -1,5 +1,7 @@
 use black_hole_shared::Settings;
+use directories::ProjectDirs;
 use serde_json::{from_str, to_string_pretty};
+use std::env::temp_dir;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -137,12 +139,12 @@ impl SettingsManager {
     }
 
     fn config_dir() -> PathBuf {
-        directories::ProjectDirs::from("com", "black-hole", "ime")
+        ProjectDirs::from("com", "black-hole", "ime")
             .map(|dirs| dirs.config_dir().to_path_buf())
             .unwrap_or_else(|| {
                 // 极少数环境无法解析用户目录时回退到临时目录，避免 panic
                 warn!("Unable to determine config directory, falling back to temp dir");
-                std::env::temp_dir().join("black-hole-ime")
+                temp_dir().join("black-hole-ime")
             })
     }
 }

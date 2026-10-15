@@ -5,6 +5,16 @@
 // 「跟随系统」也依赖同一判断，故由平台层统一提供，避免两处实现漂移。
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "windows")]
+use std::mem;
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Registry::{
+    HKEY_CURRENT_USER, KEY_READ, REG_DWORD, REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW,
+    RegQueryValueExW,
+};
+#[cfg(target_os = "windows")]
+use windows_core::PCWSTR;
+
 /// 探测操作系统当前是否处于暗色模式。
 ///
 /// - Windows：读取 `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\
@@ -25,13 +35,6 @@ pub fn system_uses_dark_mode() -> bool {
 
 #[cfg(target_os = "windows")]
 fn windows_dark_mode() -> bool {
-    use std::mem;
-    use windows::Win32::System::Registry::{
-        HKEY_CURRENT_USER, KEY_READ, REG_DWORD, REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW,
-        RegQueryValueExW,
-    };
-    use windows_core::PCWSTR;
-
     unsafe {
         let path: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"
             .encode_utf16()

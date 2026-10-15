@@ -14,6 +14,7 @@ pub mod syllable_graph;
 pub mod user_dict;
 
 use std::borrow::Cow;
+use std::cmp::Ordering;
 
 use black_hole_shared::{
     Candidate, CompletionHint, EngineCommand, InputContext, KeyBindings, KeyEvent, SchemeId,
@@ -111,9 +112,9 @@ pub fn sort_candidates(
                 return 2;
             }
             match c.text.chars().count().cmp(&syllable_count) {
-                std::cmp::Ordering::Equal => 0,
-                std::cmp::Ordering::Less => 1,
-                std::cmp::Ordering::Greater => 2,
+                Ordering::Equal => 0,
+                Ordering::Less => 1,
+                Ordering::Greater => 2,
             }
         };
         length_priority(a)

@@ -7,6 +7,7 @@ use super::mode_indicator::{
     render_mode_indicator,
 };
 use super::*;
+use eframe::egui::InnerResponse;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -781,7 +782,7 @@ fn render_candidate_cell(
     show_label: bool,
     font_size: u32,
     colors: &theme::Palette,
-) -> eframe::egui::InnerResponse<()> {
+) -> InnerResponse<()> {
     let (tc, lc, bg) = item_colors(is_selected, colors);
     candidate_item_frame(ui, bg.unwrap_or(colors.base_100), |ui| {
         render_candidate_item(ui, col + 1, candidate, tc, lc, show_label, font_size);
@@ -816,7 +817,7 @@ fn candidate_item_frame(
     ui: &mut Ui,
     fill: Color32,
     content: impl FnOnce(&mut Ui),
-) -> eframe::egui::InnerResponse<()> {
+) -> InnerResponse<()> {
     EguiFrame::new()
         .fill(fill)
         .corner_radius(CornerRadius::same(4))

@@ -16,18 +16,19 @@ use crate::ipc::{
 use std::ffi::c_void;
 use std::io::{self};
 use std::mem::discriminant;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
-use windows::Win32::Foundation::{HINSTANCE, LPARAM, WPARAM};
+use windows::Win32::Foundation::{E_UNEXPECTED, HINSTANCE, LPARAM, WPARAM};
 use windows::Win32::UI::TextServices::{
     ITfComposition, ITfContext, ITfLangBarItem, ITfLangBarItemSink, ITfSource, ITfThreadMgr,
 };
-use windows_core::{GUID, Interface, PCWSTR, w};
+use windows_core::{Error, GUID, Interface, PCWSTR, Result as CoreResult, w};
 
 use super::{PlatformError, PlatformIme};
 use black_hole_shared::{
@@ -96,23 +97,21 @@ pub(crate) static GLOBAL_REF_COUNT: Mutex<u32> = Mutex::new(0);
 /// hook 在这里不存在，因此 panic 现场必须在 catch 分支就地记录（payload
 /// 消息 + 线程名）。宿主进程内 tracing subscriber 通常未初始化，日志可能
 /// 无输出，但记录本身保持尽力而为。
-pub(crate) fn safe_com<T>(op: impl FnOnce() -> windows_core::Result<T>) -> windows_core::Result<T> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(op)).unwrap_or_else(|payload| {
+pub(crate) fn safe_com<T>(op: impl FnOnce() -> CoreResult<T>) -> CoreResult<T> {
+    catch_unwind(AssertUnwindSafe(op)).unwrap_or_else(|payload| {
         let message = panic_payload_text(&payload);
-        let thread = std::thread::current();
+        let thread = thread::current();
         error!(
             "COM callback panicked in thread '{}': {} — returning E_UNEXPECTED",
             thread.name().unwrap_or("<unnamed>"),
             message
         );
-        Err(windows_core::Error::from_hresult(
-            windows::Win32::Foundation::E_UNEXPECTED,
-        ))
+        Err(Error::from_hresult(E_UNEXPECTED))
     })
 }
 
 /// 普通 Mutex 的 poison 恢复加锁（`ServiceInner` 用 [`lock_service`]）。
-pub(crate) fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -131,7 +130,7 @@ pub(crate) fn dll_release() {
 /// 未 bump，合成提交/取消会作用到过期范围）。本函数在恢复路径上复用
 /// [`ServiceInner::clear_composition`] 收尾（结束合成态、反注册 layout
 /// sink、bump 版本号），并清空按键缓存，让下游的陈旧门控重新采样。
-pub(crate) fn lock_service(inner: &Mutex<ServiceInner>) -> std::sync::MutexGuard<'_, ServiceInner> {
+pub(crate) fn lock_service(inner: &Mutex<ServiceInner>) -> MutexGuard<'_, ServiceInner> {
     match inner.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
@@ -156,10 +155,10 @@ pub(crate) fn lock_service(inner: &Mutex<ServiceInner>) -> std::sync::MutexGuard
 /// 刷新 context，竞争时跳过是安全的。
 pub(crate) fn try_lock_service(
     inner: &Mutex<ServiceInner>,
-) -> Option<std::sync::MutexGuard<'_, ServiceInner>> {
+) -> Option<MutexGuard<'_, ServiceInner>> {
     match inner.try_lock() {
         Ok(guard) => Some(guard),
-        Err(std::sync::TryLockError::Poisoned(p)) => {
+        Err(TryLockError::Poisoned(p)) => {
             warn!("ServiceInner lock poisoned, resetting mutation-sensitive fields");
             let mut guard = p.into_inner();
             unadvise_sink_pair(guard.clear_composition());
@@ -167,7 +166,7 @@ pub(crate) fn try_lock_service(
             guard.last_eng_eval_key = None;
             Some(guard)
         }
-        Err(std::sync::TryLockError::WouldBlock) => None,
+        Err(TryLockError::WouldBlock) => None,
     }
 }
 

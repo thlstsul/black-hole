@@ -21,13 +21,14 @@ use black_hole_shared::{
 };
 use black_hole_ui::{SettingsManager, run_candidate_window, run_settings_panel};
 use clap::Parser;
-use notify::Watcher;
+use ctrlc::set_handler;
+use notify::{Event, RecursiveMode, Result as NotifyResult, Watcher, recommended_watcher};
 use std::env;
 use std::error::Error;
 use std::fs;
 use std::io;
 use std::mem::discriminant;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{AssertUnwindSafe, catch_unwind, set_hook, take_hook};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -210,8 +211,8 @@ impl App {
         let watch_stop_flag = Arc::clone(&watch_stop);
         let watch_handle = thread::spawn(move || {
             let settings_mgr = SettingsManager::new();
-            let (watch_tx, watch_rx) = mpsc::channel::<notify::Result<notify::Event>>();
-            let mut watcher = match notify::recommended_watcher(watch_tx) {
+            let (watch_tx, watch_rx) = mpsc::channel::<NotifyResult<Event>>();
+            let mut watcher = match recommended_watcher(watch_tx) {
                 Ok(w) => w,
                 Err(e) => {
                     warn!("Failed to create settings watcher: {}", e);
@@ -224,7 +225,7 @@ impl App {
                 if let Err(e) = fs::create_dir_all(config_dir) {
                     warn!("Failed to create config dir {:?}: {}", config_dir, e);
                 }
-                if let Err(e) = watcher.watch(config_dir, notify::RecursiveMode::NonRecursive) {
+                if let Err(e) = watcher.watch(config_dir, RecursiveMode::NonRecursive) {
                     warn!("Failed to watch config dir {:?}: {}", config_dir, e);
                 }
             }
@@ -325,15 +326,15 @@ impl App {
     /// 链式调用前一个 hook（默认 hook）：Linux/控制台场景 stderr 的
     /// 标准 panic 输出保持可见，日志文件只是补充而非替代。
     fn install_panic_hook() {
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
+        let previous_hook = take_hook();
+        set_hook(Box::new(move |info| {
             previous_hook(info);
             let location = info
                 .location()
                 .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
                 .unwrap_or_else(|| "<unknown>".to_string());
             let message = panic_payload_text(info.payload());
-            let thread = std::thread::current();
+            let thread = thread::current();
             error!(
                 "PANIC in thread '{}': {} at {}",
                 thread.name().unwrap_or("<unnamed>"),
@@ -413,7 +414,7 @@ impl App {
     // ------------------------------------------------------------------
 
     fn setup_signal_handler(ui_tx: mpsc::Sender<UiCommand>) {
-        let result = ctrlc::set_handler(move || {
+        let result = set_handler(move || {
             info!("Received interrupt signal, requesting shutdown...");
             // ctrlc 回调运行在专用线程上，可安全发送事件
             let _ = ui_tx.send(UiCommand::Exit);

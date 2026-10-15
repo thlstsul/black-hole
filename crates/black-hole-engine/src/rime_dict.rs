@@ -9,6 +9,7 @@
 //!   （切分路径去重 + 前缀结果按音节序列缓存，避免重复输入时的全量重查）
 
 use crate::{Dictionary, LanguageModel};
+pub use ::rime_dict::RawEntry;
 use black_hole_shared::Candidate;
 use lru::LruCache;
 use pinyin::ToPinyin;
@@ -54,9 +55,6 @@ self_cell!(
         dependent: Prism,
     }
 );
-
-/// 词条构建输入（供测试与内置词典使用）
-pub use ::rime_dict::RawEntry;
 
 /// Prism 构建所用的字母集
 const ALPHABET: &str = "abcdefghijklmnopqrstuvwxyz";
