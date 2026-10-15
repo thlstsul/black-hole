@@ -1,6 +1,6 @@
 use super::caret::get_candidate_position;
 use super::service::BlackHoleTextService;
-use super::{ServiceInner, lock_service, safe_com, send_ui_command_inner};
+use super::{ServiceInner, lock_service, safe_com, send_ui_command_inner, unadvise_sink_pair};
 use black_hole_shared::{InputContext, SchemeResult, UiCommand};
 use std::mem;
 use std::slice;
@@ -84,15 +84,63 @@ pub(crate) fn apply_result(
                 }
 
                 {
-                    let sink = BlackHoleTextService::new_for_sink(inner_arc.clone());
-                    let sink_iface: ITfTextLayoutSink = sink.into();
-                    if let Ok(source) = ctx.cast::<ITfSource>()
-                        && let Ok(cookie) = unsafe {
-                            source.AdviseSink(&<ITfTextLayoutSink as Interface>::IID, &sink_iface)
+                    // 幂等挂载（补偿式）：仅当已注册 sink 属于同一 context 时跳过；
+                    // 属于其它 context（前一文档残留）时先反注册旧配对再挂载——
+                    // cookie 与 context 绑定，直接跳过会让新 context 收不到
+                    // TF_LC_CHANGE、光标跟踪静默失效（评审 P3 修复）。
+                    // 反注册打回"判定时捕获的精确 (context, cookie)"而非
+                    // 当前存储值：即便 readvise_layout_sink 在判定与卸载
+                    // 之间已为聚焦 context 换挂新 sink，卸载的也只是旧
+                    // cookie（误打已卸载 cookie 仅返回错误，无副作用），
+                    // 不会误删新注册；存储清除仅限配对仍相同时执行
+                    let stale_pair = {
+                        let inner = lock_service(&inner_arc);
+                        inner
+                            .layout_sink
+                            .as_ref()
+                            .map(|(c, ck)| (c.clone(), *ck))
+                            .filter(|(c, _)| c.as_raw() != ctx.as_raw())
+                    };
+                    if let Some((stale_ctx, stale_cookie)) = stale_pair {
+                        if let Ok(source) = stale_ctx.cast::<ITfSource>() {
+                            let _ = unsafe { source.UnadviseSink(stale_cookie) };
                         }
-                    {
                         let mut inner = lock_service(&inner_arc);
-                        inner.layout_sink_cookie = Some(cookie);
+                        if let Some((c, ck)) = &inner.layout_sink
+                            && c.as_raw() == stale_ctx.as_raw()
+                            && *ck == stale_cookie
+                        {
+                            inner.layout_sink = None;
+                        }
+                    }
+                    let already_advised = lock_service(&inner_arc).layout_sink.is_some();
+                    if !already_advised {
+                        // 先取 source：AdviseSink 与竞态回退共用，回退路径
+                        // 不再二次 cast（cast 失败会泄漏已注册的 cookie）
+                        if let Ok(source) = ctx.cast::<ITfSource>() {
+                            let sink = BlackHoleTextService::new_for_sink(inner_arc.clone());
+                            let sink_iface: ITfTextLayoutSink = sink.into();
+                            if let Ok(cookie) = unsafe {
+                                source
+                                    .AdviseSink(&<ITfTextLayoutSink as Interface>::IID, &sink_iface)
+                            } {
+                                // 记入配对存储（写入前复查：他方可能已注册）
+                                let rollback = {
+                                    let mut inner = lock_service(&inner_arc);
+                                    if inner.layout_sink.is_none() {
+                                        inner.layout_sink = Some((ctx.clone(), cookie));
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                };
+                                if rollback {
+                                    // 他方（readvise_layout_sink）已注册：回退本次注册。
+                                    // COM 调用在释放 inner 锁后进行（既定模式）
+                                    let _ = unsafe { source.UnadviseSink(cookie) };
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -202,16 +250,13 @@ pub(crate) fn apply_result(
                 set_caret_to_range_end(ec, ctx, &range);
                 Ok(())
             })();
-            {
+            let pending = {
                 let mut inner = lock_service(&inner_arc);
                 inner.last_caret_pos = None;
                 inner.context_version += 1;
-                if let Some(cookie) = inner.layout_sink_cookie.take()
-                    && let Ok(source) = ctx.cast::<ITfSource>()
-                {
-                    let _ = unsafe { source.UnadviseSink(cookie) };
-                }
-            }
+                inner.take_layout_sink()
+            };
+            unadvise_sink_pair(pending);
         }
         SchemeResult::Cancelled => {
             // 取消输入（Esc / cancel 绑定）：结束进行中的合成（清空行内编码）
@@ -260,12 +305,9 @@ impl ITfEditSession_Impl for CommitCompositionEditSession_Impl {
 
 impl CommitCompositionEditSession_Impl {
     fn do_edit_session_body(&self, ec: u32) -> Result<()> {
-        let (composition, ctx, layout_cookie) = {
+        let (composition, ctx) = {
             let inner = lock_service(&self.inner_arc);
-            let comp = inner.composition.clone();
-            let ctx = inner.context.clone();
-            let cookie = inner.layout_sink_cookie;
-            (comp, ctx, cookie)
+            (inner.composition.clone(), inner.context.clone())
         };
 
         if let Some(comp) = composition {
@@ -293,7 +335,8 @@ impl CommitCompositionEditSession_Impl {
                 Ok(())
             })();
 
-            lock_service(&self.inner_arc).clear_composition(ctx.as_ref(), layout_cookie);
+            let pending = lock_service(&self.inner_arc).clear_composition();
+            unadvise_sink_pair(pending);
         }
 
         Ok(())
@@ -313,13 +356,9 @@ impl ITfEditSession_Impl for CancelCompositionEditSession_Impl {
 
 impl CancelCompositionEditSession_Impl {
     fn do_edit_session_body(&self, ec: u32) -> Result<()> {
-        let (composition, ctx, layout_cookie) = {
-            let inner = lock_service(&self.inner_arc);
-            let comp = inner.composition.clone();
-            let ctx = inner.context.clone();
-            let cookie = inner.layout_sink_cookie;
-            (comp, ctx, cookie)
-        };
+        // 仅需 composition：layout sink 的反注册由 clear_composition 返回的
+        // 配对（unadvise_sink_pair）在锁外完成，无需外部传入 context
+        let composition = lock_service(&self.inner_arc).composition.clone();
 
         if let Some(comp) = composition {
             let _ = (|| -> Result<()> {
@@ -329,7 +368,8 @@ impl CancelCompositionEditSession_Impl {
                 Ok(())
             })();
 
-            lock_service(&self.inner_arc).clear_composition(ctx.as_ref(), layout_cookie);
+            let pending = lock_service(&self.inner_arc).clear_composition();
+            unadvise_sink_pair(pending);
         }
 
         Ok(())

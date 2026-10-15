@@ -2,9 +2,14 @@
 // 跨平台候选窗口: eframe + egui
 // ---------------------------------------------------------------------------
 
+use super::mode_indicator::{
+    BADGE_HEIGHT, BADGE_WIDTH, IndicatorSent, IndicatorState, MonitorRects, indicator_viewport_id,
+    render_mode_indicator,
+};
 use super::*;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const SCROLL_AREA_MAX_HEIGHT: f32 = 200.0;
 
@@ -39,6 +44,10 @@ pub(crate) struct AppState {
     completion_index: usize,
     /// "整句上屏"实际绑定的按键名（daemon 同步，默认 Tab），首行提示用
     commit_sentence: String,
+    /// 中英模式徽标状态：聚焦显示、输入隐藏、切换再现（见 mode_indicator）
+    indicator: IndicatorState,
+    /// 显示器矩形缓存（物理像素 + 缩放），供徽标夹取光标所在工作区
+    monitors: MonitorRects,
 }
 
 impl Default for AppState {
@@ -60,6 +69,8 @@ impl Default for AppState {
             completion_code: String::new(),
             completion_index: 0,
             commit_sentence: "Tab".to_string(),
+            indicator: IndicatorState::default(),
+            monitors: Vec::new(),
         }
     }
 }
@@ -70,7 +81,12 @@ pub struct ImeUiApp {
     /// 已应用全局样式的主题（含 `System` 解析后的明暗），仅在变化时重设：
     /// 候选窗每次按键都会重绘，逐帧 `set_visuals` 会白白丢弃样式缓存。
     applied_theme: Option<(Theme, bool)>,
+    /// 上次刷新显示器缓存（存于 AppState.monitors）的时间
+    monitors_refreshed_at: Option<Instant>,
 }
+
+/// 显示器拓扑仅在热插拔/显示设置变化时改变，周期刷新兜底即可
+const MONITORS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 impl ImeUiApp {
     pub fn new(_cc: &CreationContext<'_>, state: Arc<Mutex<AppState>>) -> Self {
@@ -78,6 +94,7 @@ impl ImeUiApp {
             state,
             win_style_applied: false,
             applied_theme: None,
+            monitors_refreshed_at: None,
         }
     }
 }
@@ -91,12 +108,80 @@ impl App for ImeUiApp {
             self.win_style_applied = true;
         }
 
-        let state = self.state.lock().unwrap();
+        // 显示器缓存刷新与徽标显隐读取的锁窗口保持短小，随后即释放：
+        // deferred viewport 的回调与父 pass 共用同一把 state 锁，若在持锁
+        // 期间注册 viewport，而某后端（egui 的 embed_viewports，如 wasm）
+        // 同步调用该回调，就会自死锁。桌面端 eframe 的 embed_viewports 为
+        // false（回调走独立 pass），但这里不依赖该前提。
+        //
+        // 显示器枚举（winit 系统调用）不持锁执行：命令线程处理每条
+        // UiCommand 都要取同一把锁，持锁枚举会把进行中的命令阻塞整个
+        // 枚举时长（缓存每 ~5s 过期一次即触发）。
+        let monitors_maybe = {
+            let state = self.state.lock().unwrap();
+            if state.should_exit {
+                drop(state);
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+                return;
+            }
+            // 显示器矩形缓存（物理像素 + 缩放），供徽标定位夹取使用；
+            // 仅在首次或超期时重新枚举，避免每帧 EnumDisplayMonitors 开销
+            if self
+                .monitors_refreshed_at
+                .is_none_or(|t| t.elapsed() >= MONITORS_REFRESH_INTERVAL)
+            {
+                Some(collect_monitors(frame))
+            } else {
+                None
+            }
+        };
 
-        if state.should_exit {
-            ctx.send_viewport_cmd(ViewportCommand::Close);
-            return;
+        let indicator_visible = {
+            let mut state = self.state.lock().unwrap();
+
+            if state.should_exit {
+                drop(state);
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+                return;
+            }
+
+            if let Some(monitors) = monitors_maybe {
+                state.monitors = monitors;
+                self.monitors_refreshed_at = Some(Instant::now());
+            }
+
+            state.indicator.visible
+        };
+
+        // 中英模式徽标：与候选窗同一事件循环的 deferred viewport。
+        // 必须在候选窗早退（隐藏）之前注册，保证候选窗隐藏时徽标仍能显示。
+        // 隐藏时不再注册，egui 会自动关闭该 viewport。
+        if indicator_visible {
+            let state_arc = Arc::clone(&self.state);
+            ctx.show_viewport_deferred(
+                indicator_viewport_id(),
+                ViewportBuilder::default()
+                    .with_decorations(false)
+                    .with_transparent(true)
+                    .with_always_on_top()
+                    .with_active(false)
+                    .with_resizable(false)
+                    .with_visible(false)
+                    .with_taskbar(false)
+                    .with_inner_size([BADGE_WIDTH, BADGE_HEIGHT]),
+                move |vui, _class| {
+                    let mut guard = state_arc.lock().unwrap();
+                    // 先降级为 &mut AppState：MutexGuard 的字段访问都经过
+                    // Deref/DerefMut（借用整个 guard），无法拆分字段借用
+                    let st = &mut *guard;
+                    // 传 &mut：渲染时顺便记录已下发的 viewport 命令状态，
+                    // 避免每帧重发无变化命令而自我触发重绘（见 IndicatorSent）
+                    render_mode_indicator(&mut st.indicator, st.theme, &st.monitors, vui);
+                },
+            );
         }
+
+        let state = self.state.lock().unwrap();
 
         // 不可见或无候选时隐藏窗口：停放到屏幕外并置不可见。
         // 仅 Visible(false) 不够——eframe 每帧 post_rendering 都会强制
@@ -163,7 +248,7 @@ fn apply_windows_style(frame: &mut Frame) {
 fn apply_windows_style(_frame: &mut Frame) {}
 
 /// 获取当前显示器工作区逻辑坐标矩形（排除任务栏），用于边界防越
-fn get_screen_rect(frame: &Frame) -> Option<Rect> {
+pub(crate) fn get_screen_rect(frame: &Frame) -> Option<Rect> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let window = frame.winit_window()?;
@@ -422,9 +507,22 @@ fn spawn_command_thread(ctx: Context, ui_rx: Receiver<UiCommand>, state: Arc<Mut
                 cmd = ?mem::discriminant(&cmd),
                 "channel thread recv"
             );
-            let should_repaint = apply_ui_command(&mut state.lock().unwrap(), cmd);
+            // 单次加锁：apply_ui_command 与徽标可见性读取共用一把锁，
+            // 该路径是每条命令的必经热路径（锁被渲染线程整帧持有）
+            let (should_repaint, indicator_visible) = {
+                let mut s = state.lock().unwrap();
+                let repaint = apply_ui_command(&mut s, cmd);
+                (repaint, s.indicator.visible)
+            };
             if should_repaint {
                 ctx.request_repaint();
+                // 徽标是独立的 deferred viewport，但（egui 0.36）所有 viewport
+                // 共享同一个 Context：pass 之外调用的 request_repaint() 只作用
+                // 于 ROOT（主窗口），必须用 request_repaint_of 定向徽标，否则
+                // 字样/位置变化后画面停留在旧状态
+                if indicator_visible {
+                    ctx.request_repaint_of(indicator_viewport_id());
+                }
             }
         }
         info!("channel thread exited");
@@ -728,6 +826,28 @@ fn candidate_item_frame(
         })
 }
 
+/// 枚举所有显示器（物理像素全幅矩形），供徽标定位夹取。
+/// 注意是全幅边界而非工作区（未排除任务栏）：徽标夹取用，任务栏遮挡的
+/// 概率与影响都很小。不存各显示器自身 scale：徽标坐标以全局
+/// `pixels_per_point` 换算，夹取矩形须用同一全局缩放换算才一致
+/// （混合 DPI 下按各屏自身 scale 换算会错位）；获取失败返回空列表。
+fn collect_monitors(frame: &Frame) -> MonitorRects {
+    let Some(window) = frame.winit_window() else {
+        return Vec::new();
+    };
+    window
+        .available_monitors()
+        .map(|m| {
+            let pos = m.position();
+            let size = m.size();
+            Rect::from_min_size(
+                Pos2::new(pos.x as f32, pos.y as f32),
+                Vec2::new(size.width as f32, size.height as f32),
+            )
+        })
+        .collect()
+}
+
 /// 应用一条 UI 命令到共享状态，返回是否需要重绘。
 /// 命令仅在窗口可见（或刚显示/退出）时触发重绘，避免隐藏时频繁刷新。
 fn apply_ui_command(s: &mut AppState, cmd: UiCommand) -> bool {
@@ -754,6 +874,8 @@ fn apply_ui_command(s: &mut AppState, cmd: UiCommand) -> bool {
             s.candidates = candidates;
             s.selected_index = selected_index.min(s.candidates.len().saturating_sub(1));
             s.expanded = expanded;
+            // 开始输入：隐藏中英模式徽标（切换时再现）
+            s.indicator.visible = false;
             should_repaint = true;
         }
         UiCommand::SetCandidateWindowSettings(cw) => {
@@ -773,11 +895,88 @@ fn apply_ui_command(s: &mut AppState, cmd: UiCommand) -> bool {
                 s.caret_y = context.caret_y;
                 s.caret_h = context.caret_h;
             }
+            // 徽标始终记录最新光标（不受候选窗显隐影响），聚焦后
+            // 输入前即可就位；仅可见时才需要重绘
+            let moved = s.indicator.caret_x != context.caret_x
+                || s.indicator.caret_y != context.caret_y
+                || s.indicator.caret_h != context.caret_h;
+            let first = !s.indicator.has_caret;
+            s.indicator.caret_x = context.caret_x;
+            s.indicator.caret_y = context.caret_y;
+            s.indicator.caret_h = context.caret_h;
+            s.indicator.has_caret = true;
+            if s.indicator.visible && (moved || first) {
+                should_repaint = true;
+            }
         }
         UiCommand::HideCandidates | UiCommand::CommitText(_) => {
             s.visible = false;
+            // 上屏同样属于"开始输入"：隐藏中英模式徽标。
+            // 徽标可见时必须重绘（其 deferred viewport 的画面需消失）；
+            // 徽标本就不可见时恢复旧的"候选窗隐藏不重绘"语义，避免
+            // 每次整句上屏/收起都多一次全量重绘
+            let hid_indicator = s.indicator.visible;
+            s.indicator.visible = false;
+            should_repaint = hid_indicator;
             clear_completion(s);
-            should_repaint = false;
+        }
+        UiCommand::ShowModeIndicator {
+            context,
+            invalidate_caret,
+        } => {
+            match context {
+                Some(ctx) => {
+                    s.indicator.caret_x = ctx.caret_x;
+                    s.indicator.caret_y = ctx.caret_y;
+                    s.indicator.caret_h = ctx.caret_h;
+                    s.indicator.has_caret = true;
+                }
+                // 本次没取到光标位置：作废与否取决于焦点会话是否变更。
+                // - 焦点已切到别的窗口（invalidate_caret=true）：旧坐标对本窗口
+                //   无效，作废并屏外停放（见 mode_indicator），待新位置上报后
+                //   立即就位，避免在旧窗口的位置闪现；
+                // - 同一会话内重显（切换中英，invalidate_caret=false）：沿用已
+                //   记录的位置。此处若一律作废，Chromium 等无系统 caret 的应用
+                //   在切换中英时徽标会屏外停放且再无唤醒机会——模式切换不产生
+                //   文本变化，等不到后续 TF_LC_CHANGE 上报位置
+                None => {
+                    if invalidate_caret {
+                        s.indicator.has_caret = false;
+                    }
+                }
+            }
+            s.indicator.visible = true;
+            // 强制下一帧重新下发一次 viewport 命令：Show 是新焦点会话/新
+            // viewport 的起点，此前的下发状态对它无效（否则新建窗口可能
+            // 停在系统默认位置）
+            s.indicator.sent = IndicatorSent::Unknown;
+            should_repaint = true;
+        }
+        UiCommand::HideModeIndicator { invalidate_caret } => {
+            // 焦点失效时同步作废光标位置：has_caret 必须忠实表示"当前焦点
+            // 的光标有效"，否则模式同步命令会在旧窗口的过期位置重显徽标。
+            // 英文直输隐藏（invalidate_caret=false）保留位置，切换中英时
+            // 仍可在原光标处重显。已隐藏时不再置位重绘：英文逐键下发本命令，
+            // 避免无谓重绘
+            if invalidate_caret {
+                // 焦点已失效，同步作废光标位置。跨进程乱序的 Hide 已在
+                // daemon 平台层按"聚焦连接"仲裁丢弃（见 windows_tsf/mod.rs）
+                s.indicator.has_caret = false;
+            }
+            if s.indicator.visible {
+                s.indicator.visible = false;
+                should_repaint = true;
+            }
+        }
+        UiCommand::SetInputMode(english) | UiCommand::SetInputModeTransient(english) => {
+            // 仅同步徽标字样，不改显隐：重显由切换实例自身的
+            // ShowModeIndicator（携带自己必然持有的焦点光标位置）驱动。
+            // 跨进程模式同步不带光标信息，若在此基于可能过期的 has_caret
+            // 重显，徽标会在旧窗口的过期光标位置闪现/停留（评审 P2 修复）
+            s.indicator.english = english;
+            // 徽标当前可见时字样变化必须重绘：deferred viewport 仅在对自身
+            // 请求重绘时才刷新，否则旧"中/英"字样一直停留在屏幕上
+            should_repaint = s.indicator.visible;
         }
         UiCommand::Completion {
             code,
@@ -807,4 +1006,353 @@ fn apply_ui_command(s: &mut AppState, cmd: UiCommand) -> bool {
 fn clear_completion(s: &mut AppState) {
     s.completion = None;
     s.completion_code.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use black_hole_shared::InputContext;
+    use eframe::egui::RawInput;
+
+    /// 构造仅含定位信息的上下文
+    fn ctx_at(x: i32, y: i32) -> InputContext {
+        InputContext::caret(x, y, 20)
+    }
+
+    /// 跑一次徽标 viewport 的 pass，返回该 pass 下发的 viewport 命令。
+    /// 测试在 ROOT pass 内渲染，命令因此记在 ROOT 上——去重行为与命令落在
+    /// 哪个 viewport 无关，故此处断言有效（egui 自身也可能为 ROOT 追加
+    /// 命令，故断言只看本模块关心的两类命令）。
+    fn badge_commands_per_pass(
+        indicator: &mut IndicatorState,
+        monitors: &MonitorRects,
+    ) -> Vec<ViewportCommand> {
+        let ctx = Context::default();
+        let mut output = ctx.run_ui(RawInput::default(), |ui| {
+            render_mode_indicator(indicator, Theme::Light, monitors, ui);
+        });
+        let commands = output
+            .viewport_output
+            .get(&ViewportId::ROOT)
+            .map_or_else(Vec::new, |v| v.commands.clone());
+        // 绘制文字会产生字体纹理增量；epaint 要求 drop 前消费或清空它，
+        // 否则 panic（真实运行时由 eframe 上传后清空）
+        output.textures_delta.clear();
+        commands
+    }
+
+    /// 本次 pass 下发的位置命令
+    fn positions(cmds: &[ViewportCommand]) -> Vec<Pos2> {
+        cmds.iter()
+            .filter_map(|c| match c {
+                ViewportCommand::OuterPosition(p) => Some(*p),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 本次 pass 下发的显隐命令
+    fn visibilities(cmds: &[ViewportCommand]) -> Vec<bool> {
+        cmds.iter()
+            .filter_map(|c| match c {
+                ViewportCommand::Visible(v) => Some(*v),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 断言徽标状态。真实显示条件是 `visible && has_caret`（渲染端任一
+    /// 不满足即屏外停放）：`visible` 单独为 true 只表示"已请求显示"，
+    /// 无光标位置时不会实际出现在屏幕上。
+    fn assert_indicator(s: &AppState, want_displayed: bool, want_has_caret: bool, line: u32) {
+        let displayed = s.indicator.visible && s.indicator.has_caret;
+        assert_eq!(displayed, want_displayed, "line {line}: displayed");
+        assert_eq!(
+            s.indicator.has_caret, want_has_caret,
+            "line {line}: has_caret"
+        );
+    }
+
+    #[test]
+    fn show_without_caret_then_set_input_mode_stays_offscreen() {
+        // Show(None)（无光标位置，如 Chromium 聚焦）→ SetInputMode：
+        // 无光标位置时徽标屏外停放，模式同步不得使其出现在屏幕上
+        let mut s = AppState::default();
+        apply_ui_command(
+            &mut s,
+            UiCommand::ShowModeIndicator {
+                context: None,
+                invalidate_caret: true,
+            },
+        );
+        apply_ui_command(&mut s, UiCommand::SetInputMode(true));
+        assert_indicator(&s, false, false, line!());
+    }
+
+    #[test]
+    fn focus_loss_hide_invalidates_caret() {
+        // Show(Some) → Hide(invalidate=true)（焦点失效）→ SetInputMode：
+        // 光标已作废，模式同步（仅同步字样）不得在旧窗口位置重显
+        let mut s = AppState::default();
+        apply_ui_command(
+            &mut s,
+            UiCommand::ShowModeIndicator {
+                context: Some(ctx_at(100, 200)),
+                invalidate_caret: true,
+            },
+        );
+        apply_ui_command(
+            &mut s,
+            UiCommand::HideModeIndicator {
+                invalidate_caret: true,
+            },
+        );
+        assert_indicator(&s, false, false, line!());
+        apply_ui_command(&mut s, UiCommand::SetInputMode(false));
+        assert_indicator(&s, false, false, line!());
+    }
+
+    #[test]
+    fn english_input_hide_keeps_caret_and_setinputmode_only_updates_label() {
+        // Show(Some) → Hide(invalidate=false)（英文直输隐藏）→ SetInputMode：
+        // 焦点仍在输入，光标保留；SetInputMode 仅同步字样不改显隐（重显由
+        // 切换实例显式 Show 驱动），显式 Show 在原光标处重显
+        let mut s = AppState::default();
+        apply_ui_command(
+            &mut s,
+            UiCommand::ShowModeIndicator {
+                context: Some(ctx_at(100, 200)),
+                invalidate_caret: true,
+            },
+        );
+        apply_ui_command(
+            &mut s,
+            UiCommand::HideModeIndicator {
+                invalidate_caret: false,
+            },
+        );
+        assert_indicator(&s, false, true, line!());
+        // 徽标不可见时仅同步字样，不触发重绘
+        let repainted = apply_ui_command(&mut s, UiCommand::SetInputMode(true));
+        assert!(
+            !repainted,
+            "line {}: 隐藏时 SetInputMode 不应触发重绘",
+            line!()
+        );
+        assert_indicator(&s, false, true, line!());
+        apply_ui_command(
+            &mut s,
+            UiCommand::ShowModeIndicator {
+                context: Some(ctx_at(100, 200)),
+                // 模式切换后的重显走生产路径的 false（同一焦点会话沿用已记录位置）
+                invalidate_caret: false,
+            },
+        );
+        assert_indicator(&s, true, true, line!());
+        // 徽标可见时字样变化必须触发重绘，否则 deferred viewport 停留旧字样
+        let repainted = apply_ui_command(&mut s, UiCommand::SetInputMode(false));
+        assert!(
+            repainted,
+            "line {}: 可见时 SetInputMode 必须触发重绘",
+            line!()
+        );
+    }
+
+    #[test]
+    fn start_input_hides_badge() {
+        // 打字（ShowCandidates）与上屏（CommitText）均属于"开始输入"：
+        // 徽标隐藏；CommitText 不作废光标（焦点仍在输入）
+        let mut s = AppState::default();
+        apply_ui_command(
+            &mut s,
+            UiCommand::ShowModeIndicator {
+                context: Some(ctx_at(100, 200)),
+                invalidate_caret: true,
+            },
+        );
+        apply_ui_command(
+            &mut s,
+            UiCommand::ShowCandidates {
+                code: "nh".into(),
+                candidates: vec![Candidate {
+                    text: "你好".into(),
+                    comment: None,
+                    score: 0,
+                }],
+                selected_index: 0,
+                context: ctx_at(100, 200),
+                expanded: false,
+            },
+        );
+        assert_indicator(&s, false, true, line!());
+        apply_ui_command(&mut s, UiCommand::CommitText("你好".into()));
+        assert_indicator(&s, false, true, line!());
+    }
+
+    #[test]
+    fn badge_sends_viewport_commands_only_on_change() {
+        // Show 后首帧必须下发（新建 viewport 不能停在系统默认位置），此后
+        // 状态未变时不得再发：send_viewport_cmd 会对当前 viewport 无条件
+        // 请求重绘，每帧重发会让徽标窗口持续自我触发重绘而永不空闲
+        let mut s = AppState::default();
+        apply_ui_command(
+            &mut s,
+            UiCommand::ShowModeIndicator {
+                context: Some(ctx_at(100, 200)),
+                invalidate_caret: true,
+            },
+        );
+        assert_eq!(s.indicator.sent, IndicatorSent::Unknown, "line {}", line!());
+
+        let first = badge_commands_per_pass(&mut s.indicator, &Vec::new());
+        assert!(
+            matches!(s.indicator.sent, IndicatorSent::Shown(..)),
+            "line {}",
+            line!()
+        );
+        assert_eq!(visibilities(&first), vec![true], "line {}", line!());
+        let first_pos = positions(&first);
+        assert_eq!(first_pos.len(), 1, "line {}", line!());
+
+        // 状态未变：不得再下发任何位置/显隐命令
+        let idle = badge_commands_per_pass(&mut s.indicator, &Vec::new());
+        assert!(positions(&idle).is_empty(), "line {}", line!());
+        assert!(visibilities(&idle).is_empty(), "line {}", line!());
+
+        // 光标下移 → 位置变化 → 重新下发一次
+        apply_ui_command(
+            &mut s,
+            UiCommand::UpdatePosition {
+                context: ctx_at(300, 400),
+            },
+        );
+        let moved = badge_commands_per_pass(&mut s.indicator, &Vec::new());
+        let moved_pos = positions(&moved);
+        assert_eq!(moved_pos.len(), 1, "line {}", line!());
+        assert!(moved_pos[0].y > first_pos[0].y, "line {}", line!());
+        assert_eq!(visibilities(&moved), vec![true], "line {}", line!());
+
+        let idle = badge_commands_per_pass(&mut s.indicator, &Vec::new());
+        assert!(positions(&idle).is_empty(), "line {}", line!());
+    }
+
+    #[test]
+    fn badge_reshows_after_hide_even_at_same_position() {
+        // 隐藏后 viewport 会被关闭（下一次 Show 是新建窗口），因此再次 Show
+        // 必须重新下发一次——即使光标位置与上次完全相同，去重状态也不能
+        // 让它停在系统默认位置
+        let mut s = AppState::default();
+        apply_ui_command(
+            &mut s,
+            UiCommand::ShowModeIndicator {
+                context: Some(ctx_at(100, 200)),
+                invalidate_caret: true,
+            },
+        );
+        assert!(!positions(&badge_commands_per_pass(&mut s.indicator, &Vec::new())).is_empty());
+
+        apply_ui_command(
+            &mut s,
+            UiCommand::HideModeIndicator {
+                invalidate_caret: true,
+            },
+        );
+        // Hide 不改写下发状态（重发由 Show 触发）
+        assert!(
+            matches!(s.indicator.sent, IndicatorSent::Shown(..)),
+            "line {}",
+            line!()
+        );
+
+        // 与上次完全相同的位置：仍必须重发
+        apply_ui_command(
+            &mut s,
+            UiCommand::ShowModeIndicator {
+                context: Some(ctx_at(100, 200)),
+                invalidate_caret: true,
+            },
+        );
+        assert_eq!(s.indicator.sent, IndicatorSent::Unknown, "line {}", line!());
+        let again = badge_commands_per_pass(&mut s.indicator, &Vec::new());
+        assert_eq!(positions(&again).len(), 1, "line {}", line!());
+        assert_eq!(visibilities(&again), vec![true], "line {}", line!());
+    }
+
+    #[test]
+    fn badge_parks_offscreen_without_caret_and_only_once() {
+        // 无光标位置（Chromium 等无系统 caret 的应用）：停放到屏幕外，
+        // 且同样只下发一次
+        let mut s = AppState::default();
+        apply_ui_command(
+            &mut s,
+            UiCommand::ShowModeIndicator {
+                context: None,
+                invalidate_caret: true,
+            },
+        );
+
+        let parked = badge_commands_per_pass(&mut s.indicator, &Vec::new());
+        assert_eq!(s.indicator.sent, IndicatorSent::Parked, "line {}", line!());
+        assert_eq!(visibilities(&parked), vec![false], "line {}", line!());
+        let parked_pos = positions(&parked);
+        assert_eq!(parked_pos.len(), 1, "line {}", line!());
+        assert!(parked_pos[0].x < -1000.0, "line {}", line!());
+
+        let idle = badge_commands_per_pass(&mut s.indicator, &Vec::new());
+        assert!(positions(&idle).is_empty(), "line {}", line!());
+        assert!(visibilities(&idle).is_empty(), "line {}", line!());
+    }
+
+    #[test]
+    fn mode_switch_without_caret_keeps_last_known_position() {
+        // 回归：Chromium 等无系统 caret 的应用只有 TF_LC_CHANGE → UpdatePosition
+        // 这一条位置来源。此后切换中英的 Show 取不到实时位置（context=None）时，
+        // 同一焦点会话内必须沿用已记录的位置；若一律作废，徽标会屏外停放且再
+        // 无唤醒机会——模式切换不产生文本变化，等不到后续位置上报，用户切换
+        // 中英时看不到任何反馈（本次缺陷）
+        let mut s = AppState::default();
+        apply_ui_command(
+            &mut s,
+            UiCommand::UpdatePosition {
+                context: ctx_at(100, 200),
+            },
+        );
+        apply_ui_command(
+            &mut s,
+            UiCommand::ShowModeIndicator {
+                context: None,
+                invalidate_caret: false,
+            },
+        );
+        assert_indicator(&s, true, true, line!());
+        let cmds = badge_commands_per_pass(&mut s.indicator, &Vec::new());
+        assert_eq!(visibilities(&cmds), vec![true], "line {}", line!());
+        let pos = positions(&cmds);
+        assert_eq!(pos.len(), 1, "line {}", line!());
+        // 沿用 UpdatePosition 报来的位置（ppp=1 且无显示器缓存时不夹取）
+        assert!(pos[0].x > 100.0 && pos[0].y >= 200.0, "line {}", line!());
+    }
+
+    #[test]
+    fn focus_change_without_caret_parks_offscreen() {
+        // 另一侧语义：焦点会话已变更（新窗口）且未取到位置时，旧窗口的坐标
+        // 必须作废并屏外停放，避免在新窗口的旧位置闪现
+        let mut s = AppState::default();
+        apply_ui_command(
+            &mut s,
+            UiCommand::UpdatePosition {
+                context: ctx_at(100, 200),
+            },
+        );
+        apply_ui_command(
+            &mut s,
+            UiCommand::ShowModeIndicator {
+                context: None,
+                invalidate_caret: true,
+            },
+        );
+        assert_indicator(&s, false, false, line!());
+        let cmds = badge_commands_per_pass(&mut s.indicator, &Vec::new());
+        assert_eq!(visibilities(&cmds), vec![false], "line {}", line!());
+    }
 }

@@ -601,6 +601,9 @@ impl App {
                 debug!("UI dispatch: set input mode english={}", english);
                 let mut cur = current_settings.lock().unwrap();
                 cur.english = english;
+                drop(cur);
+                // 转发给候选窗线程：徽标在同一进程内随命令切换中英并重新显示
+                let _ = ui_render_tx.send(UiCommand::SetInputMode(english));
             }
             UiCommand::SetAutoSwitch(enabled) => {
                 info!("UI dispatch: set auto switch mode to {}", enabled);
@@ -617,8 +620,26 @@ impl App {
                 // 保留分支以穷尽匹配，并防止误转发到候选窗线程。
                 info!("UI dispatch: exit requested");
             }
+            UiCommand::ShowModeIndicator {
+                context,
+                invalidate_caret,
+            } => {
+                // 聚焦显示徽标并同步 daemon 当前模式字样：徽标文字由
+                // SetInputMode* 命令驱动，跨进程自动切换若存在上报窗口期，
+                // 旧字样会残留到下次切换——聚焦时以 daemon 共享状态为准刷新
+                // 先发 SetInputMode（同步字样），再转发 Show：Show 触发的
+                // 重绘发生在字样写入之后，不会呈现上一次的字样（两条命令
+                // 按序应用到同一状态，重绘是异步的，反序会出现旧字样一帧）
+                let english = current_settings.lock().unwrap().english;
+                let _ = ui_render_tx.send(UiCommand::SetInputMode(english));
+                let _ = ui_render_tx.send(UiCommand::ShowModeIndicator {
+                    context,
+                    invalidate_caret,
+                });
+            }
             other => {
-                // 候选窗等命令转发给 UI 渲染线程
+                // 候选窗等命令转发给 UI 渲染线程（含徽标显隐/光标位置命令，
+                // 徽标在同一进程内由候选窗命令线程处理）
                 let _ = ui_render_tx.send(other);
             }
         }

@@ -5,7 +5,7 @@
 //! - 不可移动（语言栏项固定位置）
 //! - 点击弹出菜单：设置、输入方案、主题、退出
 
-use super::service::apply_input_mode_toggle;
+use super::service::{apply_input_mode_toggle, caret_context_for_show};
 use super::{CLSID_BLACKHOLE_TIP, ServiceInner, lock_service, safe_com, send_ui_command_inner};
 use crate::auto_start::is_auto_start;
 use crate::system_theme::system_uses_dark_mode;
@@ -166,8 +166,15 @@ impl BlackHoleLangBarItem {
         };
         if let Some(english) = toggled {
             apply_input_mode_toggle(&self.inner, english);
-            // 上报 daemon 持久化并更新全局状态，供其它进程（管理员/普通）同步
+            // 上报 daemon 持久化并更新全局状态，供其它进程（管理员/普通）同步；
+            // 随后显式 Show 徽标（携带本实例焦点光标）：先字样后 Show，
+            // Show 触发的重绘必然呈现新字样
             self.send_ui_command(UiCommand::SetInputMode(english));
+            let context = caret_context_for_show();
+            self.send_ui_command(UiCommand::ShowModeIndicator {
+                context,
+                invalidate_caret: false,
+            });
         }
     }
 

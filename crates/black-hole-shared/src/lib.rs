@@ -423,6 +423,31 @@ pub enum UiCommand {
     /// daemon → 候选窗线程：同步"整句上屏"实际绑定的按键名，
     /// 用于首行 Tab 提示显示真实绑定而非硬编码
     SetCommitSentenceKey(String),
+    /// 中英模式徽标：显示（进入可编辑焦点时，输入前即可见）。
+    ///
+    /// `context` 为本次取得的已知光标位置。取不到位置（`None`）的处置由
+    /// `invalidate_caret` 决定：焦点会话变更时必须作废旧位置（旧窗口坐标对
+    /// 新窗口无效），而同一焦点会话内的重显（切换中英）必须**沿用**已记录的
+    /// 位置——否则一次没查到光标就把徽标清成"位置未知"而屏外停放，用户切换
+    /// 中英时看不到任何反馈；且模式切换不产生文本变化，不会有后续光标上报
+    /// 来救场（Chromium 等无系统 caret 的应用只能靠 TF_LC_CHANGE 上报位置）。
+    ShowModeIndicator {
+        #[serde(default)]
+        context: Option<InputContext>,
+        /// true = 本次 Show 伴随焦点会话变更，`context` 为 `None` 时作废旧位置
+        /// （屏外停放待新位置上报）；false = 同一会话内重显，`None` 时沿用旧位置
+        #[serde(default)]
+        invalidate_caret: bool,
+    },
+    /// 中英模式徽标：隐藏。
+    /// `invalidate_caret` 为 true 表示焦点已失效（焦点离开文档/TIP 停用），
+    /// 需同时作废已记录的光标位置——防止后续模式同步命令在旧窗口的过期
+    /// 光标位置重新显示徽标；英文直输等"当前焦点仍在输入"的隐藏传 false，
+    /// 保留位置供切换中英时在原光标处重显。
+    HideModeIndicator {
+        #[serde(default)]
+        invalidate_caret: bool,
+    },
     Exit,
 }
 

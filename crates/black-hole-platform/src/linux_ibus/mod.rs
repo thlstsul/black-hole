@@ -8,6 +8,7 @@ use black_hole_shared::{
     ModeSuggestion, Modifiers, RuntimeSettings, SchemeResult, UiCommand, suggest_input_mode,
 };
 use std::future::pending;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use tracing::info;
@@ -71,6 +72,8 @@ impl LinuxIbusIme {
             mode_switch: Mutex::new(InputModeSwitch::default()),
             auto_mode: Mutex::new(AutoModeSwitch::default()),
             last_code: Mutex::new(None),
+            caret_reported: AtomicBool::new(false),
+            badge_visible: AtomicBool::new(false),
             current_settings: Arc::clone(&self.current_settings),
             conn: conn.clone(),
         };
@@ -100,6 +103,12 @@ struct IbusEngine {
     auto_mode: Mutex<AutoModeSwitch>,
     /// 最近一次 composition 的编码（切英文模式时上屏保留）
     last_code: Mutex<Option<String>>,
+    /// 本焦点会话内光标坐标是否已上报（set_cursor_location）：模式切换
+    /// Show 的"尚无光标"判定与 UpdatePosition 去重依据
+    caret_reported: AtomicBool,
+    /// 徽标按发送端视角是否可见：Show 置真、Hide 置假，英文直输 Hide 的
+    /// 源侧去重依据（已隐藏时不再逐键发 IPC）
+    badge_visible: AtomicBool,
     /// daemon 共享的运行时设置（方案/主题/中英模式/自动切换开关），
     /// auto_switch 字段为自动切换开关，每次评估时读取
     current_settings: Arc<Mutex<RuntimeSettings>>,
@@ -116,7 +125,10 @@ impl IbusEngine {
 
     /// 模式切换后的收尾：切英文模式时先上屏保留输入框内容，
     /// 然后重置引擎并向面板广播新的 InputMode 属性。
-    async fn apply_mode_change(&self, english: bool) {
+    async fn apply_mode_change(&self, english: bool, report: UiCommand) {
+        // 上报 daemon 更新共享状态（手动/自动切换路径各传对应变体），否则
+        // 徽标与其它进程同步的模式脱节
+        let _ = locked(&self.ui_tx).send(report);
         // 切换到英文模式时，把输入框中的编码上屏，避免输入丢失。
         if english {
             let code = locked(&self.last_code).take();
@@ -127,17 +139,41 @@ impl IbusEngine {
         } else {
             *locked(&self.last_code) = None;
         }
-        // 取消未完成的输入并重置引擎（幂等）；daemon 处理 Reset 时会自行隐藏候选窗。
+        // 取消未完成的输入并重置引擎（幂等）；daemon 处理 Reset 时会自行
+        // 隐藏候选窗——其 UI 命令同样会清掉徽标显隐，显式重显必须排在其后
         let sent = {
             let engine_tx = locked(&self.engine_tx);
             engine_tx.send(EngineCommand::Reset).is_ok()
         };
         if sent {
             let _ = locked(&self.platform_rx).recv();
+            // recv() 即 Reset 处理完成的屏障：daemon 在同一守护线程上先向
+            // UI 队列入队 Reset 的 HideCandidates、再回执本结果；下方 Show
+            // 在收到回执后才入队同一 UI 队列。MPSC 保序，HideCandidates
+            // 必然先于 Show 应用，无需额外同步
         }
         // 更新 InputMode 属性，供面板/桌面 shell 感知中英文状态。
         self.emit_engine_signal("UpdateProperty", &input_mode_property(english))
             .await;
+        // 显式重显徽标（最后一条徽标相关命令）：UI 侧 SetInputMode 仅同步
+        // 字样不改显隐（跨进程同步不得基于过期光标重显），切换方（必然
+        // 持有焦点）用自身光标位置 Show；尚无光标上报时传 None，徽标屏外
+        // 停放待光标就位。排在 Reset 回程之后，否则刚显示的徽标立即被
+        // 同序应用的重置隐藏（评审 P2 修复）
+        let context = self.caret_reported.load(Ordering::Relaxed).then(|| {
+            // 只携带光标三元组：完整 InputContext 的 preceding_text（周围
+            // 文本缓存）对 UI 无用，整体 clone 徒增 IPC 载荷
+            let ctx = locked(&self.context);
+            InputContext::caret(ctx.caret_x, ctx.caret_y, ctx.caret_h)
+        });
+        // 同一焦点会话内重显：未取到光标时沿用 UI 已记录的位置
+        // （invalidate_caret=false），否则切换中英时徽标会被清成"位置未知"
+        // 而屏外停放、用户看不到任何反馈
+        let _ = locked(&self.ui_tx).send(UiCommand::ShowModeIndicator {
+            context,
+            invalidate_caret: false,
+        });
+        self.badge_visible.store(true, Ordering::Relaxed);
     }
 
     /// 根据光标周围文本自动评估并切换中英模式。
@@ -172,7 +208,8 @@ impl IbusEngine {
                 "Input mode auto switched: {}",
                 if english { "英文" } else { "中文" }
             );
-            self.apply_mode_change(english).await;
+            self.apply_mode_change(english, UiCommand::SetInputModeTransient(english))
+                .await;
         }
     }
 
@@ -215,7 +252,8 @@ impl IbusEngine {
                 // 同语境的自动建议不再撤销本次选择
                 let suggestion = self.current_context_suggestion();
                 locked(&self.auto_mode).lock_manual(suggestion);
-                self.apply_mode_change(english).await;
+                self.apply_mode_change(english, UiCommand::SetInputMode(english))
+                    .await;
             }
             return false;
         }
@@ -228,8 +266,34 @@ impl IbusEngine {
         // 根据光标周围文本自动切换中英模式（开关开启且非合成态时评估一次）
         self.maybe_auto_switch_mode().await;
 
-        // 英文模式下不消费任何按键。
+        // 英文模式下不消费任何按键；可打印字符直输属于"开始输入"，
+        // 隐藏中英模式徽标（方向键/修饰键等非输入键不改变显隐）。
+        // 判定覆盖 ASCII 与 Latin-1（该区间 keysym 与 Unicode 码点同值，
+        // 含 KP 小键盘字符键）；keysym 高段（功能键 0xFFxx 等）不视为可打印
         if locked(&self.mode_switch).is_english() {
+            // 可打印判定：Latin-1 段 keysym 与码点同值；非 Latin 文字的
+            // legacy keysym 段取西里尔（0x6A1-0x6FF）与希腊（0x7A1-0x7F9）
+            // 两个已分配区间（0x700-0x7A0 为未分配空洞，不得纳入）；
+            // 0x1000000 段为 Unicode 直接编码（keysym = 0x1000000 + 码点），
+            // 上界取 0x1110000 以覆盖到 U+10FFFF（合法标量终点）。
+            // 另须排除 XF86 媒体/浏览器键段（0x1008FF00-0x1008FFFF，如音量/
+            // 播放键）：其差值为 0x8FF00-0x8FFFF，属合法标量（Plane 8 未分配
+            // 区），from_u32 判定会放行，不排除就会把媒体键当成字符键。
+            // keysym 高段功能键（0xFFxx）不视为可打印
+            let printable = ((0x20..=0xFF).contains(&keyval)
+                && char::from_u32(keyval).is_some_and(|c| !c.is_control()))
+                || (0x6A1..=0x6FF).contains(&keyval)
+                || (0x7A1..=0x7F9).contains(&keyval)
+                || ((0x1000000..0x1110000).contains(&keyval)
+                    && !(0x1008FF00..=0x1008FFFF).contains(&keyval)
+                    && char::from_u32(keyval - 0x1000000).is_some_and(|c| !c.is_control()));
+            if printable && self.badge_visible.swap(false, Ordering::Relaxed) {
+                // 英文直输隐藏：当前焦点仍在输入，保留光标位置；
+                // 已隐藏时不再逐键发 IPC（swap 顺带置假完成源侧去重）
+                let _ = locked(&self.ui_tx).send(UiCommand::HideModeIndicator {
+                    invalidate_caret: false,
+                });
+            }
             return false;
         }
 
@@ -301,14 +365,26 @@ impl IbusEngine {
 
     /// 更新光标位置
     async fn set_cursor_location(&self, x: i32, y: i32, _w: i32, h: i32) {
+        // 首次上报（本焦点会话）与坐标变化均视为位置更新；其余为应用重复
+        // 上报同一位置，跳过 UI 通知（逐键 IPC + 强制重绘是纯开销）
+        let mut changed = !self.caret_reported.swap(true, Ordering::Relaxed);
         // 合并更新：保留 set_surrounding_text 缓存的周围文本，仅刷新光标坐标；
         // 整体覆盖会清掉文本缓存，使自动切换中英模式评估失去依据
         let mut ctx = locked(&self.context).clone();
+        changed |= ctx.caret_x != x || ctx.caret_y != y || ctx.caret_h != h;
         ctx.caret_x = x;
         ctx.caret_y = y;
         ctx.caret_h = h;
         *locked(&self.context) = ctx.clone();
         let _ = locked(&self.engine_tx).send(EngineCommand::SetContext(ctx));
+        if changed {
+            // 同步通知 UI（含中英模式徽标）光标已移动，使其持续跟随。
+            // 通道为 MPSC（进程内直发 UI 渲染循环），不涉及 Windows 命名
+            // 管道的字节合并问题，重复位置跳过仅是逐键开销优化
+            let _ = locked(&self.ui_tx).send(UiCommand::UpdatePosition {
+                context: InputContext::caret(x, y, h),
+            });
+        }
     }
 
     /// 应用推送的光标周围文本（IBus SetSurroundingText，IBus 1.5+）。
@@ -369,8 +445,29 @@ impl IbusEngine {
         true
     }
 
-    async fn focus_in(&self) {}
-    async fn focus_out(&self) {}
+    async fn focus_in(&self) {
+        // 新焦点窗口的光标位置未知：重置上报标记（否则模式切换 Show 会
+        // 携带上一窗口的过期坐标重显）；聚焦输入区即显示中英模式徽标
+        // （输入前可见），光标坐标随后由 set_cursor_location 上报，
+        // 未到前徽标屏外停放
+        self.caret_reported.store(false, Ordering::Relaxed);
+        // 焦点会话已变更：作废旧窗口的光标位置，屏外停放待本次会话上报
+        let _ = locked(&self.ui_tx).send(UiCommand::ShowModeIndicator {
+            context: None,
+            invalidate_caret: true,
+        });
+        self.badge_visible.store(true, Ordering::Relaxed);
+    }
+
+    async fn focus_out(&self) {
+        // 焦点离开输入区：隐藏徽标并作废光标位置（焦点已失效）；
+        // 重置上报标记，下一焦点会话重新等待光标就位
+        self.caret_reported.store(false, Ordering::Relaxed);
+        let _ = locked(&self.ui_tx).send(UiCommand::HideModeIndicator {
+            invalidate_caret: true,
+        });
+        self.badge_visible.store(false, Ordering::Relaxed);
+    }
 
     async fn reset(&self) {
         // 引擎已重置，清空记录的编码
@@ -422,7 +519,8 @@ impl IbusEngine {
             // 同语境的自动建议不再撤销本次选择
             let suggestion = self.current_context_suggestion();
             locked(&self.auto_mode).lock_manual(suggestion);
-            self.apply_mode_change(english).await;
+            self.apply_mode_change(english, UiCommand::SetInputMode(english))
+                .await;
         }
     }
     async fn candidate_clicked(&self, _index: u32, _button: u32, _state: u32) {}

@@ -4,6 +4,8 @@ use std::mem;
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{E_FAIL, POINT, RECT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::TextServices::{
     ITfComposition, ITfContext, ITfContextView, ITfEditSession, ITfEditSession_Impl, ITfRange,
     TF_ANCHOR_END, TF_ANCHOR_START, TF_DEFAULT_SELECTION, TF_SELECTION,
@@ -11,8 +13,8 @@ use windows::Win32::UI::TextServices::{
 use windows::Win32::UI::WindowsAndMessaging::{
     GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
 };
-use windows_core::implement;
 use windows_core::{BOOL, Result};
+use windows_core::{Interface, implement};
 
 /// 前文最大读取字符数（补全上下文足够即可，避免逐键开销）
 const MAX_PRECEDING_CHARS: i32 = 32;
@@ -251,7 +253,15 @@ pub(crate) fn get_candidate_position(
 }
 
 /// Get caret position via `GetGUIThreadInfo` Windows API.
-pub(crate) fn get_caret_position_via_gui_thread_info() -> Result<(i32, i32, i32)> {
+///
+/// `require_own_thread`：仅当光标窗口属于当前线程时才返回坐标。徽标 Show
+/// 路径必须开启——焦点切换通知期间前台窗口可能尚未完成切换，旧窗口的光标
+/// 属于旧线程，携带会把徽标闪现在旧窗口位置；候选窗锚定的 Layer-3 回退
+/// 保持宽松——多线程 UI 宿主（WebView2 等）的编辑控件常在其它线程，此时
+/// 坐标仍可用于候选窗定位，误拒会丢掉最后兜底
+pub(crate) fn get_caret_position_via_gui_thread_info_impl(
+    require_own_thread: bool,
+) -> Result<(i32, i32, i32)> {
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.0.is_null() {
@@ -272,6 +282,12 @@ pub(crate) fn get_caret_position_via_gui_thread_info() -> Result<(i32, i32, i32)
             return Err(E_FAIL.into());
         }
 
+        if require_own_thread
+            && GetWindowThreadProcessId(gui_thread_info.hwndCaret, None) != GetCurrentThreadId()
+        {
+            return Err(E_FAIL.into());
+        }
+
         let mut point = POINT {
             x: gui_thread_info.rcCaret.right,
             y: gui_thread_info.rcCaret.bottom,
@@ -283,6 +299,17 @@ pub(crate) fn get_caret_position_via_gui_thread_info() -> Result<(i32, i32, i32)
     }
 }
 
+/// 宽松版：候选窗锚定的最后兜底（Layer 3），不校验光标窗口线程归属
+pub(crate) fn get_caret_position_via_gui_thread_info() -> Result<(i32, i32, i32)> {
+    get_caret_position_via_gui_thread_info_impl(false)
+}
+
+/// 严格版：徽标 Show 专用——要求光标窗口属于当前线程，防止焦点切换
+/// 竞态期间携带旧窗口/旧线程的光标坐标
+pub(crate) fn get_own_thread_caret_position() -> Result<(i32, i32, i32)> {
+    get_caret_position_via_gui_thread_info_impl(true)
+}
+
 // ---------------------------------------------------------------------------
 // Edit session used by ITfTextLayoutSink to query updated caret position
 // ---------------------------------------------------------------------------
@@ -290,17 +317,30 @@ pub(crate) fn get_caret_position_via_gui_thread_info() -> Result<(i32, i32, i32)
 #[implement(ITfEditSession)]
 pub(crate) struct LayoutChangeEditSession {
     pub(crate) inner_arc: Arc<Mutex<ServiceInner>>,
+    /// 会话携带的源 context：会话排队/执行期间锁内 context 可能已被
+    /// OnSetFocus 等路径覆写，必须用发起时的 context 查询布局
+    pub(crate) context: ITfContext,
 }
 
 impl ITfEditSession_Impl for LayoutChangeEditSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
-        let inner = lock_service(&self.inner_arc);
-        let ctx = match &inner.context {
-            Some(c) => c.clone(),
-            None => return Ok(()),
+        // 使用会话携带的源 context（发起时的聚焦 context）：会话排队/执行
+        // 期间锁内 context 可能已被 OnSetFocus 等路径覆写
+        let ctx = self.context.clone();
+        let comp = {
+            let inner = lock_service(&self.inner_arc);
+            // 会话排队/执行期间焦点可能已切换（异步会话从 OnSetFocus 发起，
+            // 排队窗口更长）：context 已被覆写说明本次坐标属于旧窗口，
+            // 直接丢弃，不向 UI 发送过期坐标
+            if inner
+                .context
+                .as_ref()
+                .is_some_and(|c| c.as_raw() != ctx.as_raw())
+            {
+                return Ok(());
+            }
+            inner.composition.as_ref().cloned()
         };
-        let comp = inner.composition.as_ref().cloned();
-        drop(inner);
 
         if let Ok((caret_x, caret_y, caret_h)) = get_candidate_position(ec, &ctx, comp.as_ref()) {
             let mut inner = lock_service(&self.inner_arc);

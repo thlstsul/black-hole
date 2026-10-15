@@ -1,6 +1,8 @@
 use super::super::ipc::{IpcRequest, IpcResponse, read_response, send_request_buf};
 use super::auto_switch::{AutoSwitchEditSession, SuggestionReadSession, apply_auto_mode_toggle};
-use super::caret::LayoutChangeEditSession;
+use super::caret::{
+    LayoutChangeEditSession, get_caret_position_via_gui_thread_info, get_own_thread_caret_position,
+};
 use super::commit::{CancelCompositionEditSession, CommitCompositionEditSession};
 use super::dll_release;
 use super::hook::{
@@ -10,8 +12,9 @@ use super::key_event::{KeyHandlerEditSession, virtual_key_to_key_event};
 use super::langbar::BlackHoleLangBarItem;
 use super::{
     ServiceInner, ensure_ipc_connection, lock_service, locked, safe_com, send_ui_command_inner,
+    try_lock_service, unadvise_sink_pair,
 };
-use black_hole_shared::{KeyEvent, KeyState, ModeSuggestion, UiCommand};
+use black_hole_shared::{InputContext, KeyEvent, KeyState, ModeSuggestion, UiCommand};
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,8 +33,8 @@ use windows::Win32::UI::TextServices::{
     ITfKeystrokeMgr, ITfLangBarItem, ITfLangBarItemMgr, ITfSource, ITfTextInputProcessor,
     ITfTextInputProcessor_Impl, ITfTextLayoutSink, ITfTextLayoutSink_Impl, ITfThreadMgr,
     ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl, TF_CONVERSIONMODE_ALPHANUMERIC,
-    TF_CONVERSIONMODE_NATIVE, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC, TF_LBI_ICON, TF_LC_CHANGE,
-    TfLayoutCode,
+    TF_CONVERSIONMODE_NATIVE, TF_ES_ASYNC, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC, TF_LBI_ICON,
+    TF_LC_CHANGE, TfLayoutCode,
 };
 use windows_core::{BOOL, GUID, Interface, Ref, Result, implement};
 
@@ -419,11 +422,30 @@ pub(crate) fn sync_settings_from_daemon_inner(inner_arc: &Arc<Mutex<ServiceInner
     }
 }
 
-/// 语言栏菜单入口触发的模式切换收尾：与快捷键路径共用同一套逻辑
-/// （取消 composition、重置引擎、同步 compartment、刷新语言栏图标）。
+/// 各路径（钩子/语言栏/Ctrl 释放/自动切换）共用的模式切换收尾：
+/// 结束合成、重置引擎、同步 compartment、刷新语言栏图标。调用方须随后
+/// 依次发送 SetInputMode* 上报模式并显式 Show 徽标（顺序先字样后 Show，
+/// 使 Show 触发的重绘必然呈现新字样）——切换实例必然持有输入焦点，Show
+/// 携带本实例自己的有效焦点光标；其它进程收到模式上报（SetInputMode*）
+/// 只同步字样不改显隐（评审 P2 修复：跨进程同步不得基于过期光标重显）。
 pub(crate) fn apply_input_mode_toggle(inner: &Arc<Mutex<ServiceInner>>, english: bool) {
     let svc = BlackHoleTextService::new_for_sink(inner.clone());
     svc.on_input_mode_toggled(english);
+}
+
+/// 获取徽标 Show 所需的光标上下文：取得到前台系统光标时携带位置；
+/// 取不到时传 None，徽标屏外停放待光标上报。
+///
+/// 用宽松版查询：本函数服务于钩子（WH_KEYBOARD_LL 专用线程）/语言栏点击
+/// （TSF/语言栏线程）/自动切换路径，均不运行在持有光标窗口的应用 UI 线程
+/// 上——严格线程校验在这里恒失败，模式切换 Show 将永远不带光标。
+/// 过期焦点风险只存在于焦点通知回调（OnSetFocus），那条路径直接用严格版
+pub(crate) fn caret_context_for_show() -> Option<InputContext> {
+    let caret = get_caret_position_via_gui_thread_info().ok();
+    // 诊断：模式切换的 Show 若不携带位置，UI 只能沿用已记录位置
+    // （见 ShowModeIndicator::invalidate_caret），此处记录实时查询结果
+    debug!(?caret, "caret_context_for_show");
+    caret.map(|(x, y, h)| InputContext::caret(x, y, h))
 }
 
 /// 构造 VT_I4 类型的 VARIANT（windows crate 的 Win32 VARIANT 未提供 From<i32>）
@@ -561,6 +583,11 @@ impl BlackHoleTextService_Impl {
         }
 
         self.send_reset(false);
+        // TIP 停用（焦点切到无本文档输入的场景/其它输入法）：隐藏中英模式徽标
+        // 并作废光标位置（焦点已失效），须在断开 IPC 前发送
+        self.send_ui_command(UiCommand::HideModeIndicator {
+            invalidate_caret: true,
+        });
         self.disconnect_ipc();
         unregister_service(unsafe { GetCurrentThreadId() });
         let mut inner = lock_service(&self.inner);
@@ -684,12 +711,14 @@ impl BlackHoleTextService_Impl {
                 drop(inner);
                 let decision = self.evaluate_english_auto_switch(&pic, wparam, lparam, vk, false);
                 if !decision.evaluate {
+                    self.hide_indicator_on_english_input(wparam, lparam, vk);
                     return Ok(BOOL(0));
                 }
                 // 记录本次评估的按键与时间，供 OnKeyDown 去重：
                 // 部分应用对同一按键两个回调都会调用，避免同一按键双重评估
                 lock_service(&self.inner).last_eng_eval_key = Some((wparam.0, Instant::now()));
                 if !self.try_auto_switch_to_chinese() {
+                    self.hide_indicator_on_english_input(wparam, lparam, vk);
                     return Ok(BOOL(0));
                 }
             }
@@ -730,6 +759,69 @@ impl BlackHoleTextService_Impl {
 }
 
 impl BlackHoleTextService_Impl {
+    /// 英文模式字符键放行前隐藏中英模式徽标（英文直输同样属于"开始输入"）。
+    /// 仅字符键触发；方向键等非输入键不改变徽标显隐。
+    fn hide_indicator_on_english_input(&self, wparam: WPARAM, lparam: LPARAM, vk: VIRTUAL_KEY) {
+        if let Some(evt) = virtual_key_to_key_event(vk, wparam, lparam, KeyState::Press)
+            && is_input_char_event(&evt)
+        {
+            self.hide_indicator_keeping_caret();
+        }
+    }
+
+    /// 发送"英文直输"隐藏（保留光标位置）。源侧去重统一由
+    /// send_ui_command_inner 维护可见标志（已隐藏时吞掉本命令），
+    /// OnTestKeyDown+OnKeyDown 双回调对同一按键只发一条命令
+    fn hide_indicator_keeping_caret(&self) {
+        self.send_ui_command(UiCommand::HideModeIndicator {
+            invalidate_caret: false,
+        });
+    }
+
+    /// 为新聚焦的 context 重新挂载布局通知（ITfTextLayoutSink）。
+    ///
+    /// 布局 sink 按 context 注册（commit.rs 在首次合成时挂载），切换窗口后
+    /// 新 context 上没有 sink，打字前收不到 TF_LC_CHANGE、拿不到光标位置
+    /// （Chromium 系应用无系统 caret，GetGUIThreadInfo 回退也失败，徽标屏外
+    /// 停放）。AdviseSink/UnadviseSink 不需要文档锁，可在焦点通知中
+    /// 安全调用；COM 调用一律在释放 inner 锁后进行（既定模式）。
+    fn readvise_layout_sink(&self, new_ctx: &ITfContext) {
+        // 取出配对存储的 (旧 context, cookie)：反注册必然打到当初 AdviseSink
+        // 的同一 context 上——调用方可能已覆盖 inner.context，不能从那里读旧值
+        let old = lock_service(&self.inner).layout_sink.take();
+        if let Some((old_ctx, cookie)) = old
+            && let Ok(source) = old_ctx.cast::<ITfSource>()
+        {
+            let _ = unsafe { source.UnadviseSink(cookie) };
+        }
+
+        // 先取 source：AdviseSink 与竞态回退共用，回退路径不再二次 cast
+        if let Ok(source) = new_ctx.cast::<ITfSource>() {
+            let sink = BlackHoleTextService::new_for_sink(self.inner.clone());
+            let sink_iface: ITfTextLayoutSink = sink.into();
+            if let Ok(cookie) =
+                unsafe { source.AdviseSink(&<ITfTextLayoutSink as Interface>::IID, &sink_iface) }
+            {
+                // 写入前复查（镜像 apply_result 的补偿式幂等）：与首次合成
+                // 挂载并发时他方可能已注册，覆盖会导致其 cookie 永久泄漏，
+                // 此时回退本次注册
+                let rollback = {
+                    let mut inner = lock_service(&self.inner);
+                    if inner.layout_sink.is_none() {
+                        inner.layout_sink = Some((new_ctx.clone(), cookie));
+                        false
+                    } else {
+                        true
+                    }
+                };
+                if rollback {
+                    // COM 调用在释放 inner 锁后进行（既定模式）
+                    let _ = unsafe { source.UnadviseSink(cookie) };
+                }
+            }
+        }
+    }
+
     fn on_test_key_up_body(&self, wparam: WPARAM) -> Result<BOOL> {
         let vk = VIRTUAL_KEY(wparam.0 as u16);
         debug!(
@@ -761,6 +853,16 @@ impl BlackHoleTextService_Impl {
                 self.on_input_mode_toggled(english);
                 // 上报 daemon 持久化并更新全局状态，供其它进程同步
                 self.send_ui_command(UiCommand::SetInputMode(english));
+                // 必须与钩子/语言栏路径一样显式 Show 徽标：徽标显隐只由
+                // Show/Hide 驱动，本路径（钩子未抢先完成切换时使用，如设置面板等
+                // 无消息循环、钩子回调不可靠的宿主）漏发 Show 会让切换中英时
+                // 徽标不出现。同一焦点会话内重显，取不到实时光标时沿用 UI 已记录
+                // 的位置（invalidate_caret=false）
+                let context = caret_context_for_show();
+                self.send_ui_command(UiCommand::ShowModeIndicator {
+                    context,
+                    invalidate_caret: false,
+                });
             }
         }
         Ok(BOOL(0))
@@ -796,6 +898,11 @@ impl BlackHoleTextService_Impl {
                     already_evaluated,
                 );
                 if !decision.evaluate || !self.try_auto_switch_to_chinese() {
+                    self.hide_indicator_on_english_input(
+                        wparam,
+                        lparam,
+                        VIRTUAL_KEY(wparam.0 as u16),
+                    );
                     return Ok(BOOL(0));
                 }
             }
@@ -884,18 +991,16 @@ impl ITfCompositionSink_Impl for BlackHoleTextService_Impl {
 
 impl BlackHoleTextService_Impl {
     fn on_composition_terminated_body(&self) -> Result<()> {
-        let mut inner = lock_service(&self.inner);
-        inner.composition = None;
-        // 应用主动终止合成（Esc/点击等绕过 Commit/Cancel 编辑会话）：
-        // 与 commit.rs 的合成结束路径保持一致，同步清空光标位置并作废缓存
-        inner.last_caret_pos = None;
-        inner.context_version += 1;
-        if let Some(cookie) = inner.layout_sink_cookie.take()
-            && let Some(ref ctx) = inner.context
-            && let Ok(source) = ctx.cast::<ITfSource>()
-        {
-            let _ = unsafe { source.UnadviseSink(cookie) };
-        }
+        let pending = {
+            let mut inner = lock_service(&self.inner);
+            inner.composition = None;
+            // 应用主动终止合成（Esc/点击等绕过 Commit/Cancel 编辑会话）：
+            // 与 commit.rs 的合成结束路径保持一致，同步清空光标位置并作废缓存
+            inner.last_caret_pos = None;
+            inner.context_version += 1;
+            inner.take_layout_sink()
+        };
+        unadvise_sink_pair(pending);
         Ok(())
     }
 }
@@ -922,30 +1027,96 @@ impl BlackHoleTextService_Impl {
         }
 
         {
-            let inner = lock_service(&self.inner);
-            let current_ctx = match &inner.context {
-                Some(c) => c,
-                None => return Ok(()),
+            // 先在锁内只取决策输入（context 是否已记录），GetFocus/GetTop
+            // 等 COM 调用一律在释放 inner 锁后进行（既定模式）：虽不需要
+            // 文档锁，但仍是 TSF COM 调用，若 TSF 内部重入布局/焦点通知
+            // 回调，回调中的 lock_service 会与本次持有的锁形成死锁。
+            // thread_mgr 仅在下方 None 分支用到，故不在此克隆（每次按键
+            // 的 Some 常见路径省去一次 COM AddRef/DecRef）
+            let ctx_recorded = {
+                let inner = lock_service(&self.inner);
+                inner.context.clone()
             };
-            if let Some(pic_ctx) = pic.to_owned() {
-                if pic_ctx.as_raw() != current_ctx.as_raw() {
-                    return Ok(());
+            let current_ctx = match ctx_recorded {
+                Some(c) => Some(c),
+                None => {
+                    // context 尚未记录（OnPushContext 竞争跳过/应用未压栈）：
+                    // 布局通知的 context 通常即当前焦点文档，采纳前校验其
+                    // 确属聚焦文档——布局事件也会为后台文档触发，盲目采纳
+                    // 会让 GetTextExt 跑在非聚焦文档上、把过期光标送给 UI
+                    let Some(pic_ctx) = pic.to_owned() else {
+                        return Ok(());
+                    };
+                    let thread_mgr = {
+                        let inner = lock_service(&self.inner);
+                        inner.thread_mgr.clone()
+                    };
+                    let focused_top = unsafe {
+                        thread_mgr
+                            .as_ref()
+                            .and_then(|tm| tm.GetFocus().ok())
+                            .and_then(|doc| doc.GetTop().ok())
+                    };
+                    match focused_top {
+                        Some(top) if top.as_raw() == pic_ctx.as_raw() => {
+                            // 重新短暂加锁存储：期间可能已被 OnSetFocus 等
+                            // 路径覆写，仅在仍未记录时写入，不覆盖更新的
+                            // 焦点状态
+                            let mut inner = lock_service(&self.inner);
+                            if inner.context.is_none() {
+                                inner.context = Some(pic_ctx);
+                            }
+                            None
+                        }
+                        // thread_mgr 缺失（Activate 前）时保守放行，
+                        // 保持既有行为，否则徽标永远拿不到光标
+                        None => {
+                            let mut inner = lock_service(&self.inner);
+                            if inner.context.is_none() {
+                                inner.context = Some(pic_ctx);
+                            }
+                            None
+                        }
+                        _ => return Ok(()),
+                    }
                 }
-            } else {
+            };
+            if let Some(pic_ctx) = pic.to_owned()
+                && let Some(current_ctx) = current_ctx
+                && pic_ctx.as_raw() != current_ctx.as_raw()
+            {
                 return Ok(());
             }
         }
 
+        // 会话携带本次布局事件的源 context：会话执行时锁内 context 可能
+        // 已被 OnSetFocus/OnPushContext 等路径覆写，从锁重取会让 GetTextExt
+        // 跑在错误 context 上（评审 P3 修复）
+        let Some(ctx) = pic.to_owned() else {
+            // 非编辑上下文的布局事件（pic 为 None）：无可查询布局，按回调
+            // 语义成功返回（Err 会作为 HRESULT 上抛给 TSF）
+            return Ok(());
+        };
         let session = LayoutChangeEditSession {
             inner_arc: self.inner.clone(),
+            context: ctx.clone(),
         };
         let edit_session: ITfEditSession = session.into();
 
-        let inner = lock_service(&self.inner);
-        let client_id = inner.client_id;
-        drop(inner);
+        // COM 调用一律在释放 inner 锁后进行（既定模式）
+        let (client_id, focus_ctx) = {
+            let inner = lock_service(&self.inner);
+            (inner.client_id, inner.context.clone())
+        };
+        // 本事件所属 context 已不是聚焦 context（被其它路径覆写）：过期
+        // 布局事件，跳过，不向 UI 发送过期光标坐标
+        if focus_ctx
+            .as_ref()
+            .is_some_and(|c| c.as_raw() != ctx.as_raw())
+        {
+            return Ok(());
+        }
 
-        let ctx = pic.to_owned().ok_or(E_UNEXPECTED)?;
         let _ =
             unsafe { ctx.RequestEditSession(client_id, &edit_session, TF_ES_SYNC | TF_ES_READ) };
 
@@ -968,7 +1139,7 @@ impl ITfThreadMgrEventSink_Impl for BlackHoleTextService_Impl {
 
     fn OnSetFocus(
         &self,
-        _pdocmgrfocus: Ref<'_, ITfDocumentMgr>,
+        pdocmgrfocus: Ref<'_, ITfDocumentMgr>,
         _pdocmgrprevfocus: Ref<'_, ITfDocumentMgr>,
     ) -> Result<()> {
         safe_com(|| {
@@ -978,16 +1149,113 @@ impl ITfThreadMgrEventSink_Impl for BlackHoleTextService_Impl {
                 inner.context_version += 1;
             }
             self.send_reset(false);
+            // 焦点进入/离开可编辑文档驱动徽标显隐：聚焦即显示（输入前可见），
+            // 焦点离开文档则隐藏。
+            // 光标位置用 GetGUIThreadInfo 系统光标回退获取：纯 Win32 调用、
+            // 无需文档锁（焦点通知期间请求编辑会话会死锁，见下方注释）。
+            // 取不到时传 None，徽标屏外停放，待 TF_LC_CHANGE 上报后立即就位；
+            // 旧窗口的光标坐标已随上方重置失效，绝不携带。
+            if pdocmgrfocus.is_some() {
+                // 记录焦点文档的 context（OnPushContext 竞争跳过时在此补上），
+                // 并为新 context 重挂布局 sink：打字前的光标位置只能靠
+                // TF_LC_CHANGE → GetTextExt 路径获取
+                let mut focused_ctx = None;
+                if let Some(doc) = pdocmgrfocus.to_owned()
+                    && let Ok(new_ctx) = unsafe { doc.GetTop() }
+                {
+                    let client_id = {
+                        let mut inner = lock_service(&self.inner);
+                        inner.context = Some(new_ctx.clone());
+                        inner.client_id
+                    };
+                    self.readvise_layout_sink(&new_ctx);
+                    focused_ctx = Some((new_ctx, client_id));
+                }
+                let context = get_own_thread_caret_position()
+                    .ok()
+                    .map(|(x, y, h)| InputContext::caret(x, y, h));
+                // 取到系统 caret 与否决定是否需要异步会话补报（见下方注释），
+                // 先于 Show 的 move 保存
+                let need_caret_session = context.is_none();
+                // 焦点会话已变更：取不到位置时必须作废旧窗口的坐标，
+                // 屏外停放待新窗口的光标上报（TF_LC_CHANGE → GetTextExt）
+                self.send_ui_command(UiCommand::ShowModeIndicator {
+                    context,
+                    invalidate_caret: true,
+                });
+
+                // WebView2/Chromium 系应用无系统 caret，上面取不到位置；而
+                // 焦点恢复（如 alt-tab 切回）不触发 TF_LC_CHANGE（布局未变），
+                // 徽标会屏外停放直到点击或输入。请求一次**异步**只读会话
+                // 主动读选区位置补上报：不在本回调内同步取文档锁（TF_ES_SYNC
+                // 在焦点通知中有死锁风险，见下方注释），会话排队后由应用在
+                // 空闲时授予读锁执行。在 Show 之后发起，保证 UpdatePosition
+                // 不会先于 Show 到达 UI（否则会被 invalidate_caret 作废）。
+                // 取到位置的应用（有系统 caret）无需此会话
+                if need_caret_session && let Some((new_ctx, client_id)) = focused_ctx {
+                    let session = LayoutChangeEditSession {
+                        inner_arc: self.inner.clone(),
+                        context: new_ctx.clone(),
+                    };
+                    let edit_session: ITfEditSession = session.into();
+                    let _ = unsafe {
+                        new_ctx.RequestEditSession(
+                            client_id,
+                            &edit_session,
+                            TF_ES_ASYNC | TF_ES_READ,
+                        )
+                    };
+                }
+            } else {
+                // 无焦点文档：隐藏并作废光标位置（焦点已失效）
+                self.send_ui_command(UiCommand::HideModeIndicator {
+                    invalidate_caret: true,
+                });
+            }
+
+            // 注意：不要在此请求**同步**编辑会话（即使只读 + TF_ES_SYNC）。
+            // 焦点切换通知期间应用通常无法授予文档锁（MS 文档明确 TF_ES_SYNC
+            // 在 OnSetFocus 中有死锁风险），Notepad 等应用会因此卡死；异步
+            // 只读会话（上方 TF_ES_ASYNC 路径）不取文档锁，无此风险。输入前
+            // 的光标定位依赖 OnPushContext 记录的 context：应用绘制触发
+            // TF_LC_CHANGE 后，OnLayoutChange 的既有会话路径即可拿到光标。
             Ok(())
         })
     }
 
-    fn OnPushContext(&self, _pic: Ref<'_, ITfContext>) -> Result<()> {
-        safe_com(|| Ok(()))
+    fn OnPushContext(&self, pic: Ref<'_, ITfContext>) -> Result<()> {
+        safe_com(|| {
+            // 记录最近压栈的 context：焦点切换后 OnSetFocus/OnLayoutChange
+            // 需要它请求光标读取会话（输入前定位徽标）；按键路径随后也会刷新。
+            // 仅在当前未记录 context 时采纳：应用可能向非聚焦文档压入
+            // context（后台文档/弹出层），直接覆写会挤掉聚焦 context——后续
+            // TF_LC_CHANGE 因 context 不匹配被跳过，打字前光标跟踪静默失效
+            // （评审 P3 修复）。非阻塞：teardown 路径持 TSF 内部锁回调，
+            // 同步等本锁会锁序倒置死锁
+            if let Some(c) = pic.to_owned()
+                && let Some(mut inner) = try_lock_service(&self.inner)
+                && inner.context.is_none()
+            {
+                inner.context = Some(c);
+            }
+            Ok(())
+        })
     }
 
-    fn OnPopContext(&self, _pic: Ref<'_, ITfContext>) -> Result<()> {
-        safe_com(|| Ok(()))
+    fn OnPopContext(&self, pic: Ref<'_, ITfContext>) -> Result<()> {
+        safe_com(|| {
+            // 弹出的正是当前记录的 context 时清除，避免保留过期 context。
+            // 非阻塞：竞争时跳过即可，按键路径会无条件刷新 context
+            let popped = pic.to_owned();
+            if let Some(mut inner) = try_lock_service(&self.inner)
+                && let Some(popped) = popped
+                && let Some(cur) = inner.context.clone()
+                && popped.as_raw() == cur.as_raw()
+            {
+                inner.context = None;
+            }
+            Ok(())
+        })
     }
 }
 
