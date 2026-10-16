@@ -3,6 +3,7 @@ use black_hole_shared::{InputContext, UiCommand};
 use std::mem;
 use std::ptr::null;
 use std::sync::{Arc, Mutex};
+use tracing::{debug, info};
 use windows::Win32::Foundation::{E_FAIL, POINT, RECT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 #[cfg(target_os = "windows")]
@@ -12,7 +13,7 @@ use windows::Win32::UI::TextServices::{
     TF_ANCHOR_END, TF_ANCHOR_START, TF_DEFAULT_SELECTION, TF_SELECTION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
+    GUITHREADINFO, GetClientRect, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
 };
 use windows_core::{BOOL, Result};
 use windows_core::{Interface, implement};
@@ -163,13 +164,52 @@ pub(crate) fn truncate_for_log(text: &str) -> &str {
 }
 
 /// 取文本范围在屏幕上的矩形（`ITfContextView::GetTextExt`）；
-/// 失败（应用无文本视图/范围失效）返回 None。
+/// 失败（应用无文本视图/范围失效）或结果为占位矩形时返回 None。
+///
+/// 占位矩形过滤（Tauri/WebView2 徽标左下角缺陷）：Chromium 系 TSF 桥在布局
+/// 未就绪时（焦点切换竞态、目标元素尚未渲染）不报失败，而是返回覆盖整个
+/// 文档视图的全幅矩形。徽标/候选窗取 (left, bottom) 锚点——全幅矩形的左下角
+/// 恰是"屏幕左缘+底缘"，即用户看到的"左下角"。真实光标是细条（宽度趋零、
+/// 高度≈行高），不可能占满视图两维：rect 同时覆盖宿主窗口客户区宽高的
+/// 90% 即判定占位。允许 10% 余量以兼容全屏编辑器（正常光标 rect 高度仅
+/// 一行，宽度趋零，远达不到阈值）。
 fn text_ext(ec: u32, view: &ITfContextView, range: &ITfRange) -> Option<RECT> {
     let mut rect = RECT::default();
     let mut clipped = BOOL(0);
-    unsafe { view.GetTextExt(ec, range, &mut rect, &mut clipped) }
-        .is_ok()
-        .then_some(rect)
+    if unsafe { view.GetTextExt(ec, range, &mut rect, &mut clipped) }.is_err() {
+        return None;
+    }
+    // 宿主窗口客户区尺寸：GetWnd 取不到（返回空句柄/失败）时跳过占位判定，
+    // 保持旧行为
+    let (client_w, client_h) = match unsafe { view.GetWnd() } {
+        Ok(hwnd) if !hwnd.0.is_null() => {
+            let mut rc = RECT::default();
+            if unsafe { GetClientRect(hwnd, &mut rc) }.is_ok() {
+                (rc.right - rc.left, rc.bottom - rc.top)
+            } else {
+                (0, 0)
+            }
+        }
+        _ => (0, 0),
+    };
+    let rect_w = rect.right - rect.left;
+    let rect_h = rect.bottom - rect.top;
+    let placeholder = client_w > 0
+        && client_h > 0
+        && rect_w as f64 >= client_w as f64 * 0.9
+        && rect_h as f64 >= client_h as f64 * 0.9;
+    if placeholder {
+        // 布局未就绪的占位矩形：丢弃而非使用，徽标屏外停放待真实布局
+        // 上报（TF_LC_CHANGE 会随应用完成渲染再次触发）
+        info!(
+            rect = ?(rect.left, rect.top, rect.right, rect.bottom),
+            client = ?(client_w, client_h),
+            "GetTextExt returned full-view placeholder rect, discarding"
+        );
+        return None;
+    }
+    debug!(rect = ?(rect.left, rect.top, rect.right, rect.bottom), "GetTextExt");
+    Some(rect)
 }
 
 /// Get the screen coordinates of the current caret position.

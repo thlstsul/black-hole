@@ -439,6 +439,14 @@ pub enum UiCommand {
         /// （屏外停放待新位置上报）；false = 同一会话内重显，`None` 时沿用旧位置
         #[serde(default)]
         invalidate_caret: bool,
+        /// 本次 Show 应呈现的中英模式：字样随命令自带（聚焦实例上报本地模式、
+        /// 切换方上报新模式），不依赖"先发 SetInputMode 再发 Show"的跨命令
+        /// 顺序，Show 的重绘必然呈现命令声明的模式。
+        /// `None` = 发送方为旧版本（不含该字段，TSF DLL 滚动升级窗口）：
+        /// UI 维持现有字样（旧版平台仍发送 SetInputMode 驱动字样），
+        /// Show 仅负责显隐。
+        #[serde(default)]
+        english: Option<bool>,
     },
     /// 中英模式徽标：隐藏。
     /// `invalidate_caret` 为 true 表示焦点已失效（焦点离开文档/TIP 停用），

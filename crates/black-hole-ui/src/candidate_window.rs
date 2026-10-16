@@ -924,6 +924,7 @@ fn apply_ui_command(s: &mut AppState, cmd: UiCommand) -> bool {
         UiCommand::ShowModeIndicator {
             context,
             invalidate_caret,
+            english,
         } => {
             match context {
                 Some(ctx) => {
@@ -945,6 +946,14 @@ fn apply_ui_command(s: &mut AppState, cmd: UiCommand) -> bool {
                         s.indicator.has_caret = false;
                     }
                 }
+            }
+            // 字样随 Show 命令自带（english 字段）：Show 的重绘必然呈现
+            // 命令声明的模式，不依赖先行的 SetInputMode 命令到达顺序。
+            // None = 旧版发送方（TSF DLL 滚动升级窗口，不含该字段）：
+            // 维持现有字样，由旧版仍会发送的 SetInputMode 驱动字样，
+            // Show 仅负责显隐。
+            if let Some(english) = english {
+                s.indicator.english = english;
             }
             s.indicator.visible = true;
             // 强制下一帧重新下发一次 viewport 命令：Show 是新焦点会话/新
@@ -1084,10 +1093,71 @@ mod tests {
             UiCommand::ShowModeIndicator {
                 context: None,
                 invalidate_caret: true,
+                english: Some(false),
             },
         );
         apply_ui_command(&mut s, UiCommand::SetInputMode(true));
         assert_indicator(&s, false, false, line!());
+    }
+
+    #[test]
+    fn show_english_field_sets_label_directly() {
+        // 字样随 Show 命令自带（english 字段）：即使没有任何先行的
+        // SetInputMode 命令，Show 也必须把徽标字样设为命令声明的模式
+        // （不依赖跨命令到达顺序）
+        let mut s = AppState::default();
+        apply_ui_command(
+            &mut s,
+            UiCommand::ShowModeIndicator {
+                context: Some(ctx_at(100, 200)),
+                invalidate_caret: true,
+                english: Some(true),
+            },
+        );
+        assert!(
+            s.indicator.english,
+            "line {}: Show 的 english 字段必须直接设置徽标字样",
+            line!()
+        );
+        assert_indicator(&s, true, true, line!());
+        // 再次 Show 携带相反模式：字样随命令翻转
+        apply_ui_command(
+            &mut s,
+            UiCommand::ShowModeIndicator {
+                context: Some(ctx_at(100, 200)),
+                invalidate_caret: false,
+                english: Some(false),
+            },
+        );
+        assert!(
+            !s.indicator.english,
+            "line {}: Show 的 english 字段必须直接设置徽标字样",
+            line!()
+        );
+        assert_indicator(&s, true, true, line!());
+    }
+
+    #[test]
+    fn show_without_english_keeps_existing_label() {
+        // None = 旧版发送方（TSF DLL 滚动升级窗口，不含 english 字段）：
+        // Show 仅负责显隐，字样维持现状（由旧版仍会发送的 SetInputMode
+        // 驱动），不得回落为中文
+        let mut s = AppState::default();
+        apply_ui_command(&mut s, UiCommand::SetInputMode(true));
+        apply_ui_command(
+            &mut s,
+            UiCommand::ShowModeIndicator {
+                context: Some(ctx_at(100, 200)),
+                invalidate_caret: true,
+                english: None,
+            },
+        );
+        assert!(
+            s.indicator.english,
+            "line {}: None 的 Show 不得改写字样",
+            line!()
+        );
+        assert_indicator(&s, true, true, line!());
     }
 
     #[test]
@@ -1100,6 +1170,7 @@ mod tests {
             UiCommand::ShowModeIndicator {
                 context: Some(ctx_at(100, 200)),
                 invalidate_caret: true,
+                english: Some(false),
             },
         );
         apply_ui_command(
@@ -1124,6 +1195,7 @@ mod tests {
             UiCommand::ShowModeIndicator {
                 context: Some(ctx_at(100, 200)),
                 invalidate_caret: true,
+                english: Some(false),
             },
         );
         apply_ui_command(
@@ -1147,6 +1219,7 @@ mod tests {
                 context: Some(ctx_at(100, 200)),
                 // 模式切换后的重显走生产路径的 false（同一焦点会话沿用已记录位置）
                 invalidate_caret: false,
+                english: Some(false),
             },
         );
         assert_indicator(&s, true, true, line!());
@@ -1169,6 +1242,7 @@ mod tests {
             UiCommand::ShowModeIndicator {
                 context: Some(ctx_at(100, 200)),
                 invalidate_caret: true,
+                english: Some(false),
             },
         );
         apply_ui_command(
@@ -1201,6 +1275,7 @@ mod tests {
             UiCommand::ShowModeIndicator {
                 context: Some(ctx_at(100, 200)),
                 invalidate_caret: true,
+                english: Some(false),
             },
         );
         assert_eq!(s.indicator.sent, IndicatorSent::Unknown, "line {}", line!());
@@ -1248,6 +1323,7 @@ mod tests {
             UiCommand::ShowModeIndicator {
                 context: Some(ctx_at(100, 200)),
                 invalidate_caret: true,
+                english: Some(false),
             },
         );
         assert!(!positions(&badge_commands_per_pass(&mut s.indicator, &Vec::new())).is_empty());
@@ -1271,6 +1347,7 @@ mod tests {
             UiCommand::ShowModeIndicator {
                 context: Some(ctx_at(100, 200)),
                 invalidate_caret: true,
+                english: Some(false),
             },
         );
         assert_eq!(s.indicator.sent, IndicatorSent::Unknown, "line {}", line!());
@@ -1289,6 +1366,7 @@ mod tests {
             UiCommand::ShowModeIndicator {
                 context: None,
                 invalidate_caret: true,
+                english: Some(false),
             },
         );
 
@@ -1323,6 +1401,7 @@ mod tests {
             UiCommand::ShowModeIndicator {
                 context: None,
                 invalidate_caret: false,
+                english: Some(false),
             },
         );
         assert_indicator(&s, true, true, line!());
@@ -1350,6 +1429,7 @@ mod tests {
             UiCommand::ShowModeIndicator {
                 context: None,
                 invalidate_caret: true,
+                english: Some(false),
             },
         );
         assert_indicator(&s, false, false, line!());

@@ -174,6 +174,7 @@ impl IbusEngine {
         let _ = locked(&self.ui_tx).send(UiCommand::ShowModeIndicator {
             context,
             invalidate_caret: false,
+            english: Some(english),
         });
         self.badge_visible.store(true, Ordering::Relaxed);
     }
@@ -442,6 +443,8 @@ impl IbusEngine {
         let _ = locked(&self.ui_tx).send(UiCommand::ShowModeIndicator {
             context: None,
             invalidate_caret: true,
+            // 字样随命令自带：单进程内本地模式即权威
+            english: Some(locked(&self.mode_switch).is_english()),
         });
         self.badge_visible.store(true, Ordering::Relaxed);
     }

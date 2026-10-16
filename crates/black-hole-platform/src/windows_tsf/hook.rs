@@ -348,6 +348,7 @@ fn on_ctrl_released() {
             UiCommand::ShowModeIndicator {
                 context,
                 invalidate_caret: false,
+                english: Some(english),
             },
         );
     }

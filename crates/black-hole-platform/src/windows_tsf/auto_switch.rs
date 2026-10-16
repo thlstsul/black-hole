@@ -42,6 +42,7 @@ pub(crate) fn apply_auto_mode_toggle(inner: &Arc<Mutex<ServiceInner>>, target: b
         UiCommand::ShowModeIndicator {
             context,
             invalidate_caret: false,
+            english: Some(target),
         },
     );
 }

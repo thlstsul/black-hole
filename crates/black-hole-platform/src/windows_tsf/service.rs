@@ -379,47 +379,35 @@ impl BlackHoleTextService {
 }
 
 /// sync_settings_from_daemon 的自由函数版本：供 IPC 重连成功等无 service
-/// 实例上下文的路径复用（语义与该方法一致）。始终应用 daemon 当前中英模式。
+/// 实例上下文的路径复用（语义与该方法一致）。只同步方案/主题/自动切换
+/// 开关；中英模式是实例本地状态（权威为聚焦实例），不在拉取范围——
+/// 聚焦时由 OnSetFocus 上报本地模式给 daemon（徽标字样随之），切换时
+/// 由各切换路径上报。
 pub(crate) fn sync_settings_from_daemon_inner(inner_arc: &Arc<Mutex<ServiceInner>>) {
-    let settings = {
-        let mut inner = lock_service(inner_arc);
-        let Some(ref mut conn) = inner.ipc_conn else {
-            return;
-        };
-        let request = IpcRequest::GetSettings;
-        if send_request_buf(&mut conn.writer, &request, &mut conn.send_buf).is_err() {
-            return;
-        }
-        let Ok(IpcResponse::Settings {
-            scheme_id,
-            theme,
-            english,
-            auto_switch,
-        }) = read_response(&mut conn.reader, &mut conn.resp_buf)
-        else {
-            return;
-        };
-        inner.current_scheme = scheme_id;
-        inner.current_theme = theme;
-        inner.auto_switch = auto_switch;
-        info!(
-            "Synced settings from daemon: scheme={:?}, theme={:?}, english={}, auto_switch={}",
-            scheme_id, theme, english, auto_switch
-        );
-        english
+    let mut inner = lock_service(inner_arc);
+    let Some(ref mut conn) = inner.ipc_conn else {
+        return;
     };
-    // 先释放 inner 锁再应用模式切换：apply_input_mode_toggle 内部会重新加锁。
-    let changed = {
-        let mut inner = lock_service(inner_arc);
-        inner.mode_switch.set_english(settings).is_some()
-    };
-    if changed {
-        info!(
-            "Input mode synced from daemon: {}",
-            if settings { "英文" } else { "中文" }
-        );
-        apply_input_mode_toggle(inner_arc, settings);
+    let request = IpcRequest::GetSettings;
+    if send_request_buf(&mut conn.writer, &request, &mut conn.send_buf).is_err() {
+        return;
     }
+    let Ok(IpcResponse::Settings {
+        scheme_id,
+        theme,
+        english: _,
+        auto_switch,
+    }) = read_response(&mut conn.reader, &mut conn.resp_buf)
+    else {
+        return;
+    };
+    inner.current_scheme = scheme_id;
+    inner.current_theme = theme;
+    inner.auto_switch = auto_switch;
+    info!(
+        "Synced settings from daemon: scheme={:?}, theme={:?}, auto_switch={}",
+        scheme_id, theme, auto_switch
+    );
 }
 
 /// 各路径（钩子/语言栏/Ctrl 释放/自动切换）共用的模式切换收尾：
@@ -536,10 +524,10 @@ impl BlackHoleTextService_Impl {
         // TSF，需通过 WH_KEYBOARD_LL 直接监听物理按键。
         register_service(unsafe { GetCurrentThreadId() }, self.inner.clone());
 
-        // 连接时同步 daemon 当前设置（含中英模式），并同步系统 compartment，
-        // 使托盘菜单勾选正确、跨进程（管理员/普通）模式保持一致。
-        // 不再以"连接默认中文"兜底：英文模式下自动切换已由 OnTestKeyDown
-        // 补设 context 后正常触发，连接时即使处于英文模式也能自动切回中文。
+        // 连接时同步 daemon 当前设置（方案/主题/自动切换开关），并同步系统
+        // compartment，使托盘菜单勾选正确。中英模式不在拉取范围：它是实例
+        // 本地状态（权威为聚焦实例），新实例默认中文，聚焦/切换时上报给
+        // daemon 供徽标字样显示。
         self.sync_settings_from_daemon();
         let english = lock_service(&self.inner).mode_switch.is_english();
         self.sync_input_mode_compartments(english);
@@ -862,6 +850,7 @@ impl BlackHoleTextService_Impl {
                 self.send_ui_command(UiCommand::ShowModeIndicator {
                     context,
                     invalidate_caret: false,
+                    english: Some(english),
                 });
             }
         }
@@ -1171,9 +1160,23 @@ impl ITfThreadMgrEventSink_Impl for BlackHoleTextService_Impl {
                     self.readvise_layout_sink(&new_ctx);
                     focused_ctx = Some((new_ctx, client_id));
                 }
-                let context = get_own_thread_caret_position()
-                    .ok()
-                    .map(|(x, y, h)| InputContext::caret(x, y, h));
+                // 聚焦即上报本实例当前模式：中英模式的权威是"聚焦实例的本地
+                // mode_switch"——只有聚焦实例消费按键，一切模式变化也只发生
+                // 在聚焦实例（按键/切换都要求焦点），因此无需从 daemon 拉取
+                // 传播。模式随 Show 命令自带（english 字段），Show 的重绘必然
+                // 呈现本实例的真实模式，徽标字样恒等于正在打字实例的实际行为，
+                // 一致性由构造保证。
+                let local_english = lock_service(&self.inner).mode_switch.is_english();
+                // 光标查询一次并复用（GetGUIThreadInfo 类调用）：结果同时供
+                // 日志 has_caret 与 Show 的 context 使用，避免同一聚焦内两次
+                // 查询竞态窗口内结果不一致
+                let caret = get_own_thread_caret_position().ok();
+                info!(
+                    local_english,
+                    has_caret = caret.is_some(),
+                    "focus in: show mode indicator (badge label follows focused instance)"
+                );
+                let context = caret.map(|(x, y, h)| InputContext::caret(x, y, h));
                 // 取到系统 caret 与否决定是否需要异步会话补报（见下方注释），
                 // 先于 Show 的 move 保存
                 let need_caret_session = context.is_none();
@@ -1182,6 +1185,7 @@ impl ITfThreadMgrEventSink_Impl for BlackHoleTextService_Impl {
                 self.send_ui_command(UiCommand::ShowModeIndicator {
                     context,
                     invalidate_caret: true,
+                    english: Some(local_english),
                 });
 
                 // WebView2/Chromium 系应用无系统 caret，上面取不到位置；而
@@ -1279,8 +1283,10 @@ mod tests {
     }
 
     /// 启动一个 mock daemon：循环接受连接并按帧协议响应请求。
-    /// GetSettings 固定返回 english=true 的 Settings，其余请求返回 Ignored。
-    fn spawn_mock_daemon() -> String {
+    /// GetSettings 返回指定 english 的 Settings，其余请求返回 Ignored。
+    /// english 可指定为与本地模式相反的值，使"同步不回写本地模式"的
+    /// 断言能区分保持与覆盖（同值时两种行为断言结果相同，测试失效）
+    fn spawn_mock_daemon(english: bool) -> String {
         let pipe_name = unique_pipe_name();
         let listener = IpcListener::bind(&pipe_name).unwrap();
         thread::spawn(move || {
@@ -1295,7 +1301,7 @@ mod tests {
                                 IpcRequest::GetSettings => IpcResponse::Settings {
                                     scheme_id: SchemeId::Pinyin,
                                     theme: Theme::Light,
-                                    english: true,
+                                    english,
                                     auto_switch: false,
                                 },
                                 _ => IpcResponse::Ignored,
@@ -1340,41 +1346,41 @@ mod tests {
     }
 
     #[test]
-    fn sync_settings_applies_daemon_english() {
-        // 同步始终应用 daemon 当前模式：mock 返回 english=true → 本地英文
-        let addr = spawn_mock_daemon();
+    fn sync_settings_does_not_touch_local_mode() {
+        // 中英模式是实例本地状态（权威为聚焦实例，聚焦/切换时上报）：
+        // 设置同步只应用 scheme/theme/auto_switch，不得把 daemon 的模式
+        // 覆盖到本地（mock 返回 english=true，与本地默认中文相反：若同步
+        // 回写本地会变为英文，断言即失败）
+        let addr = spawn_mock_daemon(true);
         let inner_arc = connect_to_mock(&addr);
         sync_settings_from_daemon_inner(&inner_arc);
-        assert!(lock_service(&inner_arc).mode_switch.is_english());
+        assert!(!lock_service(&inner_arc).mode_switch.is_english());
+        // mock 返回 auto_switch=false：设置类字段仍应照常应用
+        assert!(!lock_service(&inner_arc).auto_switch);
     }
 
     #[test]
-    fn connect_always_applies_daemon_mode() {
-        // 全新连接也始终应用 daemon 当前模式（含英文），不再以"连接默认
-        // 中文"兜底：英文模式下自动切换已由 OnTestKeyDown 补设 context
-        // 后正常触发，连接时处于英文模式也能自动切回中文。
-        let addr = spawn_mock_daemon();
-        let inner_arc = Arc::new(Mutex::new(ServiceInner::new()));
-        establish_connection(&inner_arc, &addr);
-        sync_settings_from_daemon_inner(&inner_arc);
-        assert!(lock_service(&inner_arc).mode_switch.is_english());
-    }
-
-    #[test]
-    fn reconnect_applies_daemon_current_mode() {
-        // 会话中重连同样应用 daemon 当前模式（含英文），跨进程保持一致
-        let addr = spawn_mock_daemon();
+    fn reconnect_sync_keeps_local_mode() {
+        // 会话中重连（daemon 重启后管道断开重建）同样不回写本地模式：
+        // daemon 共享状态已随重启播种回中文，若据此覆盖本地会静默重置
+        // 用户当前模式；本地模式保持，由聚焦时的上报反向刷新 daemon。
+        // mock 返回 english=false（中文），与本地英文相反：若同步回写本地
+        // 会变为中文，断言即失败
+        let addr = spawn_mock_daemon(false);
         let inner_arc = connect_to_mock(&addr);
+        // 先本地切到英文（模拟用户已切换/自动切换过）
+        let _ = lock_service(&inner_arc).mode_switch.set_english(true);
         sync_settings_from_daemon_inner(&inner_arc);
         assert!(lock_service(&inner_arc).mode_switch.is_english());
     }
 
     #[test]
-    fn first_activate_failure_then_reconnect_applies_daemon_mode() {
+    fn first_activate_failure_then_reconnect_keeps_local_mode() {
         // 首次 Activate 连接失败（daemon 未就绪）不建立连接；之后按键路径
-        // 重连成功并同步——始终应用 daemon 当前模式（mock 返回 english=true），
-        // 无"门控被无连接同步提前消费"的问题（门控已随连接默认中文回退）。
-        let addr = spawn_mock_daemon();
+        // 重连成功并同步设置——模式不回写，本地保持（含英文），聚焦时上报
+        // 会把 daemon 共享状态纠正为本地真实值。mock 返回 english=false，
+        // 与本地英文相反：若同步回写本地会变为中文，断言即失败
+        let addr = spawn_mock_daemon(false);
         let inner_arc = Arc::new(Mutex::new(ServiceInner::new()));
 
         // 首次 Activate 失败：无连接、未同步
@@ -1382,6 +1388,7 @@ mod tests {
 
         // 按键路径 try_reconnect_ipc 重连成功：建立连接
         establish_connection(&inner_arc, &addr);
+        let _ = lock_service(&inner_arc).mode_switch.set_english(true);
         sync_settings_from_daemon_inner(&inner_arc);
         assert!(lock_service(&inner_arc).mode_switch.is_english());
     }

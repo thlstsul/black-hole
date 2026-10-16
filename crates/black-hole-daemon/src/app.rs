@@ -125,11 +125,11 @@ impl App {
 
         // 运行时方案/主题/中英模式/自动切换开关状态，平台线程通过 IPC GetSettings 读取，dispatch 时同步更新
         // 中英模式是运行时状态而非设置项：daemon 启动播种为中文（false），
-        // 会话内由 SetInputMode/SetInputModeTransient 更新共享状态供跨进程
-        // 同步，不持久化 settings.json，重启后回到中文。连接时各平台实例
-        // 直接应用 daemon 当前模式（含会话内已切换的英文）：英文模式下
-        // 自动切换已由 OnTestKeyDown 补设 context 正常触发，无需再以
-        // "连接默认中文"兜底。
+        // 会话内由 SetInputMode/SetInputModeTransient 更新共享状态，不持久化
+        // settings.json，重启后回到中文。中英模式的权威是聚焦实例的本地
+        // mode_switch：聚焦（OnSetFocus）与切换/自动切换时由 TSF 实例上报，
+        // 本共享状态由这些上报（及 Show 命令声明的模式值）回写刷新——
+        // 连接/重连时不向实例回写模式（见 sync_settings_from_daemon）。
         // auto_switch 是持久化设置项，须在启动时从 settings 恢复，否则用户开启的
         // 自动切换在 daemon 重启后静默失效（直到下次手动切换或热更新才恢复）。
         let current_settings: Arc<Mutex<RuntimeSettings>> = Arc::new(Mutex::new(
@@ -624,18 +624,19 @@ impl App {
             UiCommand::ShowModeIndicator {
                 context,
                 invalidate_caret,
+                english,
             } => {
-                // 聚焦显示徽标并同步 daemon 当前模式字样：徽标文字由
-                // SetInputMode* 命令驱动，跨进程自动切换若存在上报窗口期，
-                // 旧字样会残留到下次切换——聚焦时以 daemon 共享状态为准刷新
-                // 先发 SetInputMode（同步字样），再转发 Show：Show 触发的
-                // 重绘发生在字样写入之后，不会呈现上一次的字样（两条命令
-                // 按序应用到同一状态，重绘是异步的，反序会出现旧字样一帧）
-                let english = current_settings.lock().unwrap().english;
-                let _ = ui_render_tx.send(UiCommand::SetInputMode(english));
+                // 聚焦显示徽标：显隐与字样随 Show 命令自带（english 字段），
+                // 转发时不得以共享状态改写（权威 = 聚焦实例本地 mode_switch）；
+                // 同时把声明的模式回写共享状态，使 GetSettings 消费方读到
+                // 聚焦实例的真实模式（聚焦上报即刷新，无陈旧窗口期）
+                if let Some(english) = english {
+                    current_settings.lock().unwrap().english = english;
+                }
                 let _ = ui_render_tx.send(UiCommand::ShowModeIndicator {
                     context,
                     invalidate_caret,
+                    english,
                 });
             }
             other => {

@@ -174,6 +174,7 @@ impl BlackHoleLangBarItem {
             self.send_ui_command(UiCommand::ShowModeIndicator {
                 context,
                 invalidate_caret: false,
+                english: Some(english),
             });
         }
     }
