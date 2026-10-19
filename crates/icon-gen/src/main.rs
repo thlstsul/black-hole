@@ -6,6 +6,9 @@
 //! 用法:
 //!   cargo run -p icon-gen [SVG路径] [ICO输出路径]
 
+use resvg::render;
+use resvg::tiny_skia::{Pixmap, Transform};
+use resvg::usvg::{Options, Tree};
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -50,8 +53,8 @@ fn run(svg_path: &Path, ico_path: &Path) -> Result<(), Box<dyn Error>> {
     let svg_data = fs::read(svg_path)?;
 
     // --- 加载并解析 SVG ---
-    let opt = resvg::usvg::Options::default();
-    let tree = resvg::usvg::Tree::from_data(&svg_data, &opt)?;
+    let opt = Options::default();
+    let tree = Tree::from_data(&svg_data, &opt)?;
     eprintln!(
         "  SVG loaded: {}x{}",
         tree.size().width(),
@@ -67,12 +70,11 @@ fn run(svg_path: &Path, ico_path: &Path) -> Result<(), Box<dyn Error>> {
 
         let scale_x = width as f32 / tree.size().width() as f32;
         let scale_y = height as f32 / tree.size().height() as f32;
-        let ts = resvg::tiny_skia::Transform::from_scale(scale_x, scale_y);
+        let ts = Transform::from_scale(scale_x, scale_y);
 
-        let mut pixmap =
-            resvg::tiny_skia::Pixmap::new(width, height).ok_or("Failed to create pixmap")?;
+        let mut pixmap = Pixmap::new(width, height).ok_or("Failed to create pixmap")?;
 
-        resvg::render(&tree, ts, &mut pixmap.as_mut());
+        render(&tree, ts, &mut pixmap.as_mut());
 
         let png_data = pixmap.encode_png()?;
         png_entries.push((size, png_data));

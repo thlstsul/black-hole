@@ -1,3 +1,4 @@
+use crate::graph_decoder::{MAX_WORD_SYLLABLES, for_each_syllable_prefix};
 use crate::punctuation::{QuotePair, convert_punctuation};
 use crate::syllable_graph::SyllableGraph;
 use crate::{Dictionary, UserDictionary};
@@ -7,6 +8,8 @@ use black_hole_shared::candidate_layout::{
 };
 use black_hole_shared::{Candidate, InputContext, KeyEvent, SchemeId, SchemeResult};
 use rustc_hash::{FxHashMap, FxHashSet};
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// 临时英文模式下的按键处理（两套方案逻辑完全一致）。
@@ -106,7 +109,7 @@ pub(super) fn learned_words<'a>(words: &'a [String], word_codes: &'a [String]) -
 /// 避免同一进程内并行测试共用文件导致计数互相污染。
 /// 生产路径由方案的 `with_dictionary` 指向用户目录，不经此函数。
 #[cfg(test)]
-pub(super) fn test_bigram_path(prefix: &str) -> std::path::PathBuf {
+pub(super) fn test_bigram_path(prefix: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -127,18 +130,13 @@ pub(super) fn collect_sub_codes(graph: &SyllableGraph) -> Vec<String> {
     let mut seen = FxHashSet::default();
     let mut codes = Vec::new();
     for start in 0..=n {
-        crate::graph_decoder::for_each_syllable_prefix(
-            graph,
-            start,
-            crate::graph_decoder::MAX_WORD_SYLLABLES,
-            |_, code, _| {
-                // 先按 &str 查重：重复项（单音节子编码在各起点反复出现）零分配
-                if !seen.contains(code) {
-                    seen.insert(code.to_string());
-                    codes.push(code.to_string());
-                }
-            },
-        );
+        for_each_syllable_prefix(graph, start, MAX_WORD_SYLLABLES, |_, code, _| {
+            // 先按 &str 查重：重复项（单音节子编码在各起点反复出现）零分配
+            if !seen.contains(code) {
+                seen.insert(code.to_string());
+                codes.push(code.to_string());
+            }
+        });
     }
     codes
 }

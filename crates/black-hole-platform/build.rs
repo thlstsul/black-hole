@@ -6,6 +6,9 @@
 use std::env;
 use std::path::PathBuf;
 
+#[cfg(target_os = "windows")]
+use winresource::WindowsResource;
+
 fn main() {
     #[cfg(target_os = "windows")]
     {
@@ -19,7 +22,7 @@ fn main() {
         let ico = manifest_dir.join("../../assets/icons/black-hole.ico");
 
         if ico.exists() {
-            let mut res = winresource::WindowsResource::new();
+            let mut res = WindowsResource::new();
             res.set_icon(ico.to_str().unwrap());
             res.compile()
                 .expect("Failed to embed icon into DLL resource");

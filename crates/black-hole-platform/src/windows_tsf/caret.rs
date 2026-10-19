@@ -1,18 +1,22 @@
 use super::{ServiceInner, lock_service, send_ui_command_inner};
 use black_hole_shared::{InputContext, UiCommand};
 use std::mem;
+use std::ptr::null;
 use std::sync::{Arc, Mutex};
+use tracing::{debug, info};
 use windows::Win32::Foundation::{E_FAIL, POINT, RECT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::TextServices::{
     ITfComposition, ITfContext, ITfContextView, ITfEditSession, ITfEditSession_Impl, ITfRange,
     TF_ANCHOR_END, TF_ANCHOR_START, TF_DEFAULT_SELECTION, TF_SELECTION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
+    GUITHREADINFO, GetClientRect, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
 };
-use windows_core::implement;
 use windows_core::{BOOL, Result};
+use windows_core::{Interface, implement};
 
 /// 前文最大读取字符数（补全上下文足够即可，避免逐键开销）
 const MAX_PRECEDING_CHARS: i32 = 32;
@@ -91,10 +95,9 @@ pub(crate) fn read_surrounding_text(
         let mut text = String::new();
         if let Ok(r) = unsafe { caret.Clone() } {
             let mut shifted = 0i32;
-            let ok =
-                unsafe { r.ShiftStart(ec, -MAX_PRECEDING_CHARS, &mut shifted, std::ptr::null()) }
-                    .is_ok()
-                    && shifted != 0;
+            let ok = unsafe { r.ShiftStart(ec, -MAX_PRECEDING_CHARS, &mut shifted, null()) }
+                .is_ok()
+                && shifted != 0;
             if ok {
                 // 光标落在合成串内/末尾时，前文会混入正在输入的字母，
                 // 把终点收回到合成串起点，只取真实前文。
@@ -114,8 +117,7 @@ pub(crate) fn read_surrounding_text(
         let mut text = String::new();
         if let Ok(r) = unsafe { caret.Clone() } {
             let mut shifted = 0i32;
-            let ok = unsafe { r.ShiftEnd(ec, MAX_FOLLOWING_CHARS, &mut shifted, std::ptr::null()) }
-                .is_ok()
+            let ok = unsafe { r.ShiftEnd(ec, MAX_FOLLOWING_CHARS, &mut shifted, null()) }.is_ok()
                 && shifted != 0;
             if ok {
                 // 光标落在合成串内/起点时，后文会混入正在输入的字母，
@@ -162,13 +164,52 @@ pub(crate) fn truncate_for_log(text: &str) -> &str {
 }
 
 /// 取文本范围在屏幕上的矩形（`ITfContextView::GetTextExt`）；
-/// 失败（应用无文本视图/范围失效）返回 None。
+/// 失败（应用无文本视图/范围失效）或结果为占位矩形时返回 None。
+///
+/// 占位矩形过滤（Tauri/WebView2 徽标左下角缺陷）：Chromium 系 TSF 桥在布局
+/// 未就绪时（焦点切换竞态、目标元素尚未渲染）不报失败，而是返回覆盖整个
+/// 文档视图的全幅矩形。徽标/候选窗取 (left, bottom) 锚点——全幅矩形的左下角
+/// 恰是"屏幕左缘+底缘"，即用户看到的"左下角"。真实光标是细条（宽度趋零、
+/// 高度≈行高），不可能占满视图两维：rect 同时覆盖宿主窗口客户区宽高的
+/// 90% 即判定占位。允许 10% 余量以兼容全屏编辑器（正常光标 rect 高度仅
+/// 一行，宽度趋零，远达不到阈值）。
 fn text_ext(ec: u32, view: &ITfContextView, range: &ITfRange) -> Option<RECT> {
     let mut rect = RECT::default();
     let mut clipped = BOOL(0);
-    unsafe { view.GetTextExt(ec, range, &mut rect, &mut clipped) }
-        .is_ok()
-        .then_some(rect)
+    if unsafe { view.GetTextExt(ec, range, &mut rect, &mut clipped) }.is_err() {
+        return None;
+    }
+    // 宿主窗口客户区尺寸：GetWnd 取不到（返回空句柄/失败）时跳过占位判定，
+    // 保持旧行为
+    let (client_w, client_h) = match unsafe { view.GetWnd() } {
+        Ok(hwnd) if !hwnd.0.is_null() => {
+            let mut rc = RECT::default();
+            if unsafe { GetClientRect(hwnd, &mut rc) }.is_ok() {
+                (rc.right - rc.left, rc.bottom - rc.top)
+            } else {
+                (0, 0)
+            }
+        }
+        _ => (0, 0),
+    };
+    let rect_w = rect.right - rect.left;
+    let rect_h = rect.bottom - rect.top;
+    let placeholder = client_w > 0
+        && client_h > 0
+        && rect_w as f64 >= client_w as f64 * 0.9
+        && rect_h as f64 >= client_h as f64 * 0.9;
+    if placeholder {
+        // 布局未就绪的占位矩形：丢弃而非使用，徽标屏外停放待真实布局
+        // 上报（TF_LC_CHANGE 会随应用完成渲染再次触发）
+        info!(
+            rect = ?(rect.left, rect.top, rect.right, rect.bottom),
+            client = ?(client_w, client_h),
+            "GetTextExt returned full-view placeholder rect, discarding"
+        );
+        return None;
+    }
+    debug!(rect = ?(rect.left, rect.top, rect.right, rect.bottom), "GetTextExt");
+    Some(rect)
 }
 
 /// Get the screen coordinates of the current caret position.
@@ -251,7 +292,15 @@ pub(crate) fn get_candidate_position(
 }
 
 /// Get caret position via `GetGUIThreadInfo` Windows API.
-pub(crate) fn get_caret_position_via_gui_thread_info() -> Result<(i32, i32, i32)> {
+///
+/// `require_own_thread`：仅当光标窗口属于当前线程时才返回坐标。徽标 Show
+/// 路径必须开启——焦点切换通知期间前台窗口可能尚未完成切换，旧窗口的光标
+/// 属于旧线程，携带会把徽标闪现在旧窗口位置；候选窗锚定的 Layer-3 回退
+/// 保持宽松——多线程 UI 宿主（WebView2 等）的编辑控件常在其它线程，此时
+/// 坐标仍可用于候选窗定位，误拒会丢掉最后兜底
+pub(crate) fn get_caret_position_via_gui_thread_info_impl(
+    require_own_thread: bool,
+) -> Result<(i32, i32, i32)> {
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.0.is_null() {
@@ -272,6 +321,12 @@ pub(crate) fn get_caret_position_via_gui_thread_info() -> Result<(i32, i32, i32)
             return Err(E_FAIL.into());
         }
 
+        if require_own_thread
+            && GetWindowThreadProcessId(gui_thread_info.hwndCaret, None) != GetCurrentThreadId()
+        {
+            return Err(E_FAIL.into());
+        }
+
         let mut point = POINT {
             x: gui_thread_info.rcCaret.right,
             y: gui_thread_info.rcCaret.bottom,
@@ -283,6 +338,17 @@ pub(crate) fn get_caret_position_via_gui_thread_info() -> Result<(i32, i32, i32)
     }
 }
 
+/// 宽松版：候选窗锚定的最后兜底（Layer 3），不校验光标窗口线程归属
+pub(crate) fn get_caret_position_via_gui_thread_info() -> Result<(i32, i32, i32)> {
+    get_caret_position_via_gui_thread_info_impl(false)
+}
+
+/// 严格版：徽标 Show 专用——要求光标窗口属于当前线程，防止焦点切换
+/// 竞态期间携带旧窗口/旧线程的光标坐标
+pub(crate) fn get_own_thread_caret_position() -> Result<(i32, i32, i32)> {
+    get_caret_position_via_gui_thread_info_impl(true)
+}
+
 // ---------------------------------------------------------------------------
 // Edit session used by ITfTextLayoutSink to query updated caret position
 // ---------------------------------------------------------------------------
@@ -290,17 +356,30 @@ pub(crate) fn get_caret_position_via_gui_thread_info() -> Result<(i32, i32, i32)
 #[implement(ITfEditSession)]
 pub(crate) struct LayoutChangeEditSession {
     pub(crate) inner_arc: Arc<Mutex<ServiceInner>>,
+    /// 会话携带的源 context：会话排队/执行期间锁内 context 可能已被
+    /// OnSetFocus 等路径覆写，必须用发起时的 context 查询布局
+    pub(crate) context: ITfContext,
 }
 
 impl ITfEditSession_Impl for LayoutChangeEditSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
-        let inner = lock_service(&self.inner_arc);
-        let ctx = match &inner.context {
-            Some(c) => c.clone(),
-            None => return Ok(()),
+        // 使用会话携带的源 context（发起时的聚焦 context）：会话排队/执行
+        // 期间锁内 context 可能已被 OnSetFocus 等路径覆写
+        let ctx = self.context.clone();
+        let comp = {
+            let inner = lock_service(&self.inner_arc);
+            // 会话排队/执行期间焦点可能已切换（异步会话从 OnSetFocus 发起，
+            // 排队窗口更长）：context 已被覆写说明本次坐标属于旧窗口，
+            // 直接丢弃，不向 UI 发送过期坐标
+            if inner
+                .context
+                .as_ref()
+                .is_some_and(|c| c.as_raw() != ctx.as_raw())
+            {
+                return Ok(());
+            }
+            inner.composition.as_ref().cloned()
         };
-        let comp = inner.composition.as_ref().cloned();
-        drop(inner);
 
         if let Ok((caret_x, caret_y, caret_h)) = get_candidate_position(ec, &ctx, comp.as_ref()) {
             let mut inner = lock_service(&self.inner_arc);

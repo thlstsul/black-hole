@@ -4,6 +4,9 @@
 use std::env;
 use std::path::PathBuf;
 
+#[cfg(target_os = "windows")]
+use winresource::WindowsResource;
+
 fn main() {
     #[cfg(target_os = "windows")]
     {
@@ -14,7 +17,7 @@ fn main() {
         let icon = if ico.exists() { ico } else { png };
 
         if icon.exists() {
-            let mut res = winresource::WindowsResource::new();
+            let mut res = WindowsResource::new();
             res.set_icon(icon.to_str().unwrap());
             res.compile().expect("Failed to embed Windows resource");
             println!("cargo:rerun-if-changed={}", icon.display());

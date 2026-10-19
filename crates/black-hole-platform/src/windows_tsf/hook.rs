@@ -26,7 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::send_ui_command_inner;
-use super::service::apply_input_mode_toggle;
+use super::service::{apply_input_mode_toggle, caret_context_for_show};
 use super::{ContextSample, ServiceInner, locked};
 use black_hole_shared::UiCommand;
 use tracing::{debug, warn};
@@ -335,8 +335,22 @@ fn on_ctrl_released() {
             if english { "英文" } else { "中文" }
         );
         apply_input_mode_toggle(&inner, english);
-        // 上报 daemon 持久化并更新全局状态，供其它进程（管理员/普通）同步
+        // 上报 daemon 持久化并更新全局状态，供其它进程（管理员/普通）同步；
+        // 随后显式 Show 徽标（携带本实例焦点光标）：先字样后 Show，
+        // Show 触发的重绘必然呈现新字样
         send_ui_command_inner(&inner, UiCommand::SetInputMode(english));
+        let context = caret_context_for_show();
+        // 同一焦点会话内重显：未取到光标时沿用 UI 已记录的位置
+        // （invalidate_caret=false），否则切换中英时徽标会被清成"位置未知"
+        // 而屏外停放、用户看不到任何反馈
+        send_ui_command_inner(
+            &inner,
+            UiCommand::ShowModeIndicator {
+                context,
+                invalidate_caret: false,
+                english: Some(english),
+            },
+        );
     }
 }
 

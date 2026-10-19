@@ -5,6 +5,7 @@
 //! - Linux/macOS: `~/.local/share/black-hole/{scheme}.userdb.txt`
 
 use black_hole_shared::{Candidate, SchemeId};
+use dirs::data_dir;
 use rime_dict::UserDb;
 use std::collections::HashMap;
 #[cfg(test)]
@@ -42,7 +43,7 @@ pub fn global_user_dict() -> Option<Arc<Mutex<UserDictionary>>> {
 /// - Windows: `%APPDATA%/black-hole`
 /// - Linux/macOS: `~/.local/share/black-hole`
 pub fn default_user_dict_dir() -> PathBuf {
-    let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+    let base = data_dir().unwrap_or_else(|| PathBuf::from("."));
     base.join("black-hole")
 }
 

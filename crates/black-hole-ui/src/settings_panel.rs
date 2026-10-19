@@ -1,5 +1,7 @@
 use black_hole_platform::auto_start::set_auto_start;
-use black_hole_shared::{KeyBindings, SchemeId, Settings, Theme};
+use black_hole_shared::{
+    CandidateWindowSettings, KeyBindings, LlmCompletionSettings, SchemeId, Settings, Theme,
+};
 
 use crate::configure_fonts;
 use crate::settings_manager::SettingsManager;
@@ -311,10 +313,7 @@ fn scheme_group(ui: &mut Ui, settings: &mut Settings) -> bool {
     .inner
 }
 
-fn candidate_window_group(
-    ui: &mut Ui,
-    cw: &mut black_hole_shared::CandidateWindowSettings,
-) -> bool {
+fn candidate_window_group(ui: &mut Ui, cw: &mut CandidateWindowSettings) -> bool {
     ui.group(|ui| {
         ui.label("候选窗口");
         drag_row(ui, "字体大小:", &mut cw.font_size, 1.0, (10, 32))
@@ -354,7 +353,7 @@ fn auto_switch_group(ui: &mut Ui, settings: &mut Settings) -> bool {
     .inner
 }
 
-fn llm_group(ui: &mut Ui, llm: &mut black_hole_shared::LlmCompletionSettings) -> bool {
+fn llm_group(ui: &mut Ui, llm: &mut LlmCompletionSettings) -> bool {
     ui.group(|ui| {
         ui.label("整句补全（LLM）");
         let mut changed = ui.checkbox(&mut llm.enabled, "启用 LLM 整句补全").changed();

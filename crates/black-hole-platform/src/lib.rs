@@ -1,6 +1,14 @@
 use black_hole_shared::{EngineCommand, SchemeResult, UiCommand};
 use std::sync::mpsc::{Receiver, Sender};
 
+#[cfg(target_os = "windows")]
+pub use windows_tsf::WindowsTsfIme;
+
+#[cfg(target_os = "linux")]
+pub use linux_ibus::LinuxIbusIme;
+
+pub use system_theme::system_uses_dark_mode;
+
 /// 平台输入法抽象 trait
 ///
 /// 平台层负责将系统原生输入事件转换为 `EngineCommand` 发送给引擎线程，
@@ -36,19 +44,11 @@ pub mod auto_start;
 /// 系统明暗主题探测（UI 解析 `Theme::System` 与语言栏按钮共用）
 pub mod system_theme;
 
-pub use system_theme::system_uses_dark_mode;
-
 #[cfg(target_os = "windows")]
 pub mod ipc;
 
 #[cfg(target_os = "windows")]
 pub mod windows_tsf;
 
-#[cfg(target_os = "windows")]
-pub use windows_tsf::WindowsTsfIme;
-
 #[cfg(target_os = "linux")]
 pub mod linux_ibus;
-
-#[cfg(target_os = "linux")]
-pub use linux_ibus::LinuxIbusIme;

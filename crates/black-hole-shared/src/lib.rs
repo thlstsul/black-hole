@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
+use std::any::Any;
 
 pub mod candidate_layout;
 
 /// 提取 panic payload 的可打印内容（供各进程 panic 防护统一使用）
-pub fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+pub fn panic_payload_text(payload: &(dyn Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -423,6 +424,39 @@ pub enum UiCommand {
     /// daemon → 候选窗线程：同步"整句上屏"实际绑定的按键名，
     /// 用于首行 Tab 提示显示真实绑定而非硬编码
     SetCommitSentenceKey(String),
+    /// 中英模式徽标：显示（进入可编辑焦点时，输入前即可见）。
+    ///
+    /// `context` 为本次取得的已知光标位置。取不到位置（`None`）的处置由
+    /// `invalidate_caret` 决定：焦点会话变更时必须作废旧位置（旧窗口坐标对
+    /// 新窗口无效），而同一焦点会话内的重显（切换中英）必须**沿用**已记录的
+    /// 位置——否则一次没查到光标就把徽标清成"位置未知"而屏外停放，用户切换
+    /// 中英时看不到任何反馈；且模式切换不产生文本变化，不会有后续光标上报
+    /// 来救场（Chromium 等无系统 caret 的应用只能靠 TF_LC_CHANGE 上报位置）。
+    ShowModeIndicator {
+        #[serde(default)]
+        context: Option<InputContext>,
+        /// true = 本次 Show 伴随焦点会话变更，`context` 为 `None` 时作废旧位置
+        /// （屏外停放待新位置上报）；false = 同一会话内重显，`None` 时沿用旧位置
+        #[serde(default)]
+        invalidate_caret: bool,
+        /// 本次 Show 应呈现的中英模式：字样随命令自带（聚焦实例上报本地模式、
+        /// 切换方上报新模式），不依赖"先发 SetInputMode 再发 Show"的跨命令
+        /// 顺序，Show 的重绘必然呈现命令声明的模式。
+        /// `None` = 发送方为旧版本（不含该字段，TSF DLL 滚动升级窗口）：
+        /// UI 维持现有字样（旧版平台仍发送 SetInputMode 驱动字样），
+        /// Show 仅负责显隐。
+        #[serde(default)]
+        english: Option<bool>,
+    },
+    /// 中英模式徽标：隐藏。
+    /// `invalidate_caret` 为 true 表示焦点已失效（焦点离开文档/TIP 停用），
+    /// 需同时作废已记录的光标位置——防止后续模式同步命令在旧窗口的过期
+    /// 光标位置重新显示徽标；英文直输等"当前焦点仍在输入"的隐藏传 false，
+    /// 保留位置供切换中英时在原光标处重显。
+    HideModeIndicator {
+        #[serde(default)]
+        invalidate_caret: bool,
+    },
     Exit,
 }
 

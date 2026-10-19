@@ -6,8 +6,9 @@ use black_hole_shared::{Candidate, CandidateWindowSettings, Theme, UiCommand};
 pub use candidate_window::run_candidate_window;
 use eframe::egui::Frame as EguiFrame;
 use eframe::egui::{
-    Align, Color32, Context, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Label,
-    Layout, Margin, Pos2, Rect, RichText, ScrollArea, Ui, Vec2, ViewportBuilder, ViewportCommand,
+    Align, Color32, Context, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Id,
+    Label, Layout, Margin, Pos2, Rect, RichText, ScrollArea, Ui, Vec2, ViewportBuilder,
+    ViewportCommand, ViewportId,
 };
 use eframe::egui_wgpu::{WgpuSetup, WgpuSetupCreateNew};
 use eframe::run_native;
@@ -29,7 +30,7 @@ use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::thread;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{HWND, RECT};
 #[cfg(target_os = "windows")]
@@ -43,6 +44,7 @@ use winit::platform::windows::EventLoopBuilderExtWindows;
 use winit::window::Window;
 
 mod candidate_window;
+mod mode_indicator;
 pub mod settings_manager;
 pub mod settings_panel;
 pub mod theme;

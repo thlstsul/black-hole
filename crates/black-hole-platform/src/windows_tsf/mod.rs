@@ -16,18 +16,19 @@ use crate::ipc::{
 use std::ffi::c_void;
 use std::io::{self};
 use std::mem::discriminant;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
-use windows::Win32::Foundation::{HINSTANCE, LPARAM, WPARAM};
+use windows::Win32::Foundation::{E_UNEXPECTED, HINSTANCE, LPARAM, WPARAM};
 use windows::Win32::UI::TextServices::{
     ITfComposition, ITfContext, ITfLangBarItem, ITfLangBarItemSink, ITfSource, ITfThreadMgr,
 };
-use windows_core::{GUID, Interface, PCWSTR, w};
+use windows_core::{Error, GUID, Interface, PCWSTR, Result as CoreResult, w};
 
 use super::{PlatformError, PlatformIme};
 use black_hole_shared::{
@@ -96,23 +97,21 @@ pub(crate) static GLOBAL_REF_COUNT: Mutex<u32> = Mutex::new(0);
 /// hook 在这里不存在，因此 panic 现场必须在 catch 分支就地记录（payload
 /// 消息 + 线程名）。宿主进程内 tracing subscriber 通常未初始化，日志可能
 /// 无输出，但记录本身保持尽力而为。
-pub(crate) fn safe_com<T>(op: impl FnOnce() -> windows_core::Result<T>) -> windows_core::Result<T> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(op)).unwrap_or_else(|payload| {
+pub(crate) fn safe_com<T>(op: impl FnOnce() -> CoreResult<T>) -> CoreResult<T> {
+    catch_unwind(AssertUnwindSafe(op)).unwrap_or_else(|payload| {
         let message = panic_payload_text(&payload);
-        let thread = std::thread::current();
+        let thread = thread::current();
         error!(
             "COM callback panicked in thread '{}': {} — returning E_UNEXPECTED",
             thread.name().unwrap_or("<unnamed>"),
             message
         );
-        Err(windows_core::Error::from_hresult(
-            windows::Win32::Foundation::E_UNEXPECTED,
-        ))
+        Err(Error::from_hresult(E_UNEXPECTED))
     })
 }
 
 /// 普通 Mutex 的 poison 恢复加锁（`ServiceInner` 用 [`lock_service`]）。
-pub(crate) fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -131,19 +130,43 @@ pub(crate) fn dll_release() {
 /// 未 bump，合成提交/取消会作用到过期范围）。本函数在恢复路径上复用
 /// [`ServiceInner::clear_composition`] 收尾（结束合成态、反注册 layout
 /// sink、bump 版本号），并清空按键缓存，让下游的陈旧门控重新采样。
-pub(crate) fn lock_service(inner: &Mutex<ServiceInner>) -> std::sync::MutexGuard<'_, ServiceInner> {
+pub(crate) fn lock_service(inner: &Mutex<ServiceInner>) -> MutexGuard<'_, ServiceInner> {
     match inner.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
             warn!("ServiceInner lock poisoned, resetting mutation-sensitive fields");
             let mut guard = poisoned.into_inner();
-            let ctx = guard.context.clone();
-            let cookie = guard.layout_sink_cookie;
-            guard.clear_composition(ctx.as_ref(), cookie);
+            // 毒化恢复路径必须在返回 guard 前完成收尾，因此无法在锁外反注册
+            // sink（已知例外；正常路径一律走 unadvise_sink_pair，见其注释）
+            unadvise_sink_pair(guard.clear_composition());
             guard.last_key_event = None;
             guard.last_eng_eval_key = None;
             guard
         }
+    }
+}
+
+/// 非阻塞获取 ServiceInner：锁被占用时返回 None，调用方跳过本次咨询性更新。
+///
+/// OnPushContext/OnPopContext 在窗口销毁（DestroyWindow → ShutdownTextServices）
+/// 的 teardown 路径上由 TSF 回调，回调线程持有 TSF 内部锁；若在此同步阻塞等待
+/// 本 Mutex，而持锁方（按键/编辑会话路径）又在等待 TSF 锁，即构成锁序倒置
+/// 死锁（Notepad 关窗卡死的根因）。这两处仅做咨询性记录，且按键路径会无条件
+/// 刷新 context，竞争时跳过是安全的。
+pub(crate) fn try_lock_service(
+    inner: &Mutex<ServiceInner>,
+) -> Option<MutexGuard<'_, ServiceInner>> {
+    match inner.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(TryLockError::Poisoned(p)) => {
+            warn!("ServiceInner lock poisoned, resetting mutation-sensitive fields");
+            let mut guard = p.into_inner();
+            unadvise_sink_pair(guard.clear_composition());
+            guard.last_key_event = None;
+            guard.last_eng_eval_key = None;
+            Some(guard)
+        }
+        Err(TryLockError::WouldBlock) => None,
     }
 }
 
@@ -197,6 +220,10 @@ pub(crate) struct ServiceInner {
     pub(crate) ipc_conn: Option<IpcConnection>,
     /// 上次尝试重连的时间戳，用于限制重连频率（daemon 不可用时避免不断重连）。
     pub(crate) last_reconnect_attempt: Option<Instant>,
+    /// 徽标按发送端视角是否可见：Show 置真，任何 Hide 置假
+    /// （SetInputMode* 仅同步字样不改显隐，不改标志）。供英文直输 Hide
+    /// 的源侧去重（已隐藏时逐键发 Hide 是纯 IPC 开销）
+    pub(crate) indicator_visible: bool,
     /// Cached thread manager (set on Activate).
     pub(crate) thread_mgr: Option<ITfThreadMgr>,
     /// TSF client ID.
@@ -211,8 +238,11 @@ pub(crate) struct ServiceInner {
     pub(crate) last_key_event: Option<(WPARAM, LPARAM, KeyEvent)>,
     /// Last known caret position for fallback when GetTextExt fails.
     pub(crate) last_caret_pos: Option<(i32, i32, i32)>,
-    /// Cookie returned by ITfSource::AdviseSink for ITfTextLayoutSink.
-    pub(crate) layout_sink_cookie: Option<u32>,
+    /// Layout sink registration：ITfTextLayoutSink 的 (所属 context, cookie) 配对。
+    /// 配对存储保证 UnadviseSink 打到当初 AdviseSink 的同一 context 的
+    /// ITfSource 上——cookie 跨 context 无效，错配会泄漏 sink 并持续派发
+    /// 布局事件（评审 P1 修复）。
+    pub(crate) layout_sink: Option<(ITfContext, u32)>,
     /// Cookie returned by ITfSource::AdviseSink for ITfThreadMgrEventSink.
     pub(crate) thread_mgr_event_sink_cookie: Option<u32>,
     /// Language bar item interface, kept for removal on deactivation.
@@ -257,6 +287,7 @@ impl ServiceInner {
         Self {
             ipc_conn: None,
             last_reconnect_attempt: None,
+            indicator_visible: false,
             thread_mgr: None,
             client_id: 0,
             context: None,
@@ -264,7 +295,7 @@ impl ServiceInner {
             active: false,
             last_key_event: None,
             last_caret_pos: None,
-            layout_sink_cookie: None,
+            layout_sink: None,
             thread_mgr_event_sink_cookie: None,
             langbar_item: None,
             langbar_item_sink: None,
@@ -301,22 +332,33 @@ impl ServiceInner {
         };
     }
 
-    /// 清除 composition 状态并反注册 layout sink（两处 edit session 共用收尾逻辑）。
-    pub(crate) fn clear_composition(
-        &mut self,
-        ctx: Option<&ITfContext>,
-        layout_cookie: Option<u32>,
-    ) {
+    /// 取出布局 sink 配对，不做 COM 调用。
+    ///
+    /// 调用方必须在**释放 inner 锁之后**用 [`unadvise_sink_pair`] 反注册：
+    /// UnadviseSink 是 TSF COM 调用，与 TSF 内部锁存在锁序，持 inner 锁调用
+    /// 会与"持 TSF 锁回调、又等 inner 锁"的路径构成锁序倒置死锁（既定模式）。
+    pub(crate) fn take_layout_sink(&mut self) -> Option<(ITfContext, u32)> {
+        self.layout_sink.take()
+    }
+
+    /// 清除 composition 状态（两处 edit session 共用收尾逻辑），返回待反注册
+    /// 的 layout sink 配对——反注册见 [`unadvise_sink_pair`]，须在锁外调用。
+    pub(crate) fn clear_composition(&mut self) -> Option<(ITfContext, u32)> {
         self.composition = None;
         self.last_caret_pos = None;
         self.context_version += 1;
-        if let Some(cookie) = layout_cookie
-            && let Some(ctx) = ctx
-            && let Ok(source) = ctx.cast::<ITfSource>()
-        {
-            let _ = unsafe { source.UnadviseSink(cookie) };
-        }
-        self.layout_sink_cookie = None;
+        self.take_layout_sink()
+    }
+}
+
+/// 反注册布局 sink（须在释放 inner 锁后调用）：以配对存储的
+/// (context, cookie) 打回当初 AdviseSink 的同一 context 的 ITfSource——
+/// cookie 跨 context 无效，错配会泄漏 sink 并持续派发布局事件。
+pub(crate) fn unadvise_sink_pair(pair: Option<(ITfContext, u32)>) {
+    if let Some((ctx, cookie)) = pair
+        && let Ok(source) = ctx.cast::<ITfSource>()
+    {
+        let _ = unsafe { source.UnadviseSink(cookie) };
     }
 }
 
@@ -397,6 +439,37 @@ pub(crate) fn try_reconnect_ipc(inner_arc: &Arc<Mutex<ServiceInner>>) -> bool {
 /// Send a UI command to the daemon via IPC (free function for use outside impl).
 /// 连接缺失或已断开时自动重连后再发送,失败记录日志,不再静默丢弃。
 pub(crate) fn send_ui_command_inner(inner_arc: &Arc<Mutex<ServiceInner>>, cmd: UiCommand) {
+    // 源侧徽标可见性维护：仅 Show/Hide 两个变体涉及标志（取锁），其余
+    // 命令（逐键热路径：候选窗更新、光标位置等）直接透传不加锁
+    enum IndicatorUpdate {
+        Show,
+        Hide(bool),
+    }
+    let indicator = match &cmd {
+        UiCommand::ShowModeIndicator { .. } => Some(IndicatorUpdate::Show),
+        UiCommand::HideModeIndicator { invalidate_caret } => {
+            Some(IndicatorUpdate::Hide(*invalidate_caret))
+        }
+        _ => None,
+    };
+
+    // Hide 的去重判定在发送前完成（已隐藏的英文直输 Hide 不发）：焦点失效
+    // 语义（invalidate_caret=true）必须送达 UI 作废 has_caret，即使已隐藏
+    // 也不去重（失效与显隐是正交语义）。
+    //
+    // 此处只读不写：标志的更新与 Show 对称，一律在**确认发出之后**完成。
+    // 若提前置假，连接缺失/发送失败时 UI 仍显示着徽标，后续英文直输的 Hide
+    // 会被去重吞掉，徽标滞留在屏幕上直到下次 Show 或候选窗更新（去重宁可
+    // 漏发不可错吞）
+    let mut send = true;
+    if let Some(IndicatorUpdate::Hide(invalidate_caret)) = &indicator {
+        let was_visible = lock_service(inner_arc).indicator_visible;
+        send = *invalidate_caret || was_visible;
+    }
+    if !send {
+        return;
+    }
+
     if !ensure_ipc_connection(inner_arc) {
         warn!(
             "send_ui_command_inner: no IPC connection, dropping command {:?}",
@@ -407,11 +480,26 @@ pub(crate) fn send_ui_command_inner(inner_arc: &Arc<Mutex<ServiceInner>>, cmd: U
 
     let request = IpcRequest::UiCommand(cmd);
     let mut inner = lock_service(inner_arc);
-    if let Some(ref mut conn) = inner.ipc_conn
-        && let Err(e) = send_request_buf(&mut conn.writer, &request, &mut conn.send_buf)
-    {
-        warn!("send_ui_command_inner: send failed: {}", e);
-        inner.ipc_conn = None;
+    let sent_ok = if let Some(ref mut conn) = inner.ipc_conn {
+        match send_request_buf(&mut conn.writer, &request, &mut conn.send_buf) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("send_ui_command_inner: send failed: {}", e);
+                inner.ipc_conn = None;
+                false
+            }
+        }
+    } else {
+        false
+    };
+    // 可见标志只在发送成功后更新：连接缺失/发送失败时标志保持原值，
+    // 随后的 Show/Hide 不会被去重误吞（去重宁可漏发不可错吞——UI 侧幂等）
+    if sent_ok {
+        match indicator {
+            Some(IndicatorUpdate::Show) => inner.indicator_visible = true,
+            Some(IndicatorUpdate::Hide(_)) => inner.indicator_visible = false,
+            None => {}
+        }
     }
 }
 
@@ -422,12 +510,18 @@ pub(crate) fn send_ui_command_inner(inner_arc: &Arc<Mutex<ServiceInner>>, cmd: U
 pub struct WindowsTsfIme {
     /// 运行时方案/主题/中英模式/自动切换开关状态，daemon 每次切换时同步更新
     current: Arc<Mutex<RuntimeSettings>>,
+    /// 当前聚焦（最近一次徽标 Show）所属的连接编号：跨进程 Show/Hide
+    /// 乱序仲裁依据（连接间 IPC 到达顺序无保证）
+    focus_pipe_id: Arc<AtomicU64>,
 }
 
 impl WindowsTsfIme {
     /// 使用共享状态创建。`current` 会被 daemon 在每次方案/主题/中英模式切换时自动更新。
     pub fn new(current: Arc<Mutex<RuntimeSettings>>) -> Self {
-        Self { current }
+        Self {
+            current,
+            focus_pipe_id: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     pub fn current(&self) -> &Arc<Mutex<RuntimeSettings>> {
@@ -448,19 +542,31 @@ impl PlatformIme for WindowsTsfIme {
         info!("Windows TSF IPC server listening on {}", IPC_PIPE_NAME);
 
         let platform_rx = Arc::new(Mutex::new(platform_rx));
+        // 连接编号：为每个 TSF DLL 连接分配递增 id，供跨进程 Show/Hide
+        // 乱序仲裁（仅最新连接的徽标 Show 视为聚焦方）
+        let mut next_pipe_id: u64 = 0;
 
         loop {
             match listener.accept() {
                 Ok(stream) => {
                     info!("TSF DLL connected");
+                    next_pipe_id += 1;
+                    let pipe_id = next_pipe_id;
                     let engine_tx = engine_tx.clone();
                     let platform_rx = Arc::clone(&platform_rx);
                     let ui_tx = ui_tx.clone();
                     let current = Arc::clone(&self.current);
+                    let focus_pipe_id = Arc::clone(&self.focus_pipe_id);
                     thread::spawn(move || {
-                        if let Err(e) =
-                            handle_ipc_client(stream, engine_tx, platform_rx, ui_tx, current)
-                        {
+                        if let Err(e) = handle_ipc_client(
+                            stream,
+                            engine_tx,
+                            platform_rx,
+                            ui_tx,
+                            current,
+                            pipe_id,
+                            focus_pipe_id,
+                        ) {
                             error!("IPC client error: {}", e);
                         }
                     });
@@ -482,6 +588,14 @@ impl PlatformIme for WindowsTsfIme {
     }
 }
 
+// 评审历史（第十轮 P1×3 撤销）：此处曾有"Show 前台进程校验+重试"与
+// "单调 pipe_id 认领（claim_focus）"两层仲裁，实测引入三类回归——①
+// 同连接后续 Show 被 `>=` 拒绝吞掉；②连接断开与重试线程竞态永久占用
+// 聚焦标记；③pipe_id 只反映连接建立顺序、不代表焦点新近度，单调拒绝会
+// 冻结切回旧连接的徽标与候选窗光标跟踪。最终语义见 handle_ipc_client
+// 的 Show 分支注释：Show 即焦点认领（最后 Show 胜出），Hide/UpdatePosition
+// 按聚焦连接过滤
+
 /// 处理单个 TSF DLL 连接：按帧协议循环读取请求并分发。
 ///
 /// 并发说明：`PIPE_UNLIMITED_INSTANCES` 允许多个宿主进程中的 TSF DLL 同时
@@ -495,6 +609,8 @@ fn handle_ipc_client(
     platform_rx: Arc<Mutex<Receiver<SchemeResult>>>,
     ui_tx: Sender<UiCommand>,
     current: Arc<Mutex<RuntimeSettings>>,
+    pipe_id: u64,
+    focus_pipe_id: Arc<AtomicU64>,
 ) -> io::Result<()> {
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
@@ -515,6 +631,28 @@ fn handle_ipc_client(
             let response: IpcResponse = result.into();
             send_response_buf(writer, &response, buf)
         };
+
+    // 断开清理守卫：handle_ipc_client 的所有退出路径（含 `?` 写失败提前
+    // 返回）都会经过 Drop。CAS 限定"仅本连接持有聚焦标记时清除"，避免与
+    // 另一连接的并发 Show/断开交错时清掉对方的标记
+    struct FocusGuard<'a> {
+        focus_pipe_id: &'a AtomicU64,
+        pipe_id: u64,
+    }
+    impl Drop for FocusGuard<'_> {
+        fn drop(&mut self) {
+            let _ = self.focus_pipe_id.compare_exchange(
+                self.pipe_id,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+    let _focus_guard = FocusGuard {
+        focus_pipe_id: &focus_pipe_id,
+        pipe_id,
+    };
 
     loop {
         let request = match read_request(&mut reader, &mut buf) {
@@ -558,7 +696,37 @@ fn handle_ipc_client(
                 write_response(&mut writer, &mut buf, result)?;
             }
             IpcRequest::UiCommand(ui_cmd) => {
-                let _ = ui_tx.send(ui_cmd);
+                // 跨进程 Show/Hide 仲裁：连接间 IPC 到达顺序无保证。
+                //
+                // Show 即焦点认领（最后 Show 胜出）：ShowModeIndicator 仅由
+                // 获得焦点的实例（OnSetFocus）或持有焦点的切换实例（模式
+                // 切换收尾）发出，最后一次 Show 就是最新焦点归属，任何连接
+                // 的 Show 都可认领。不按 pipe_id 大小设限（见上方说明）。
+                // 残留竞态：近同时的"旧连接模式切换 Show"与"新连接焦点
+                // Show"跨管道乱序时后到者胜出——最坏一次 transient 错认领，
+                // 下一次任一实例的 Show 即纠正。
+                //
+                // 焦点失效/英文直输 Hide 与光标位置更新仅聚焦连接转发：
+                // 旧窗口（已失焦）迟到的同类命令会隐藏/移走用户正输入窗口
+                // 的徽标——这正是仲裁要防的乱序（评审 P2 修复）
+                match &ui_cmd {
+                    UiCommand::ShowModeIndicator { .. } => {
+                        focus_pipe_id.store(pipe_id, Ordering::Release);
+                        let _ = ui_tx.send(ui_cmd);
+                    }
+                    // 焦点失效隐藏 / 英文直输隐藏 / 光标位置更新都按聚焦
+                    // 连接过滤：旧窗口（已失焦）迟到的同类命令会隐藏新
+                    // 窗口正在使用的徽标、或把徽标写回旧窗口的过期光标
+                    // 位置（跨管道到达顺序无保证）
+                    UiCommand::HideModeIndicator { .. } | UiCommand::UpdatePosition { .. } => {
+                        if focus_pipe_id.load(Ordering::Acquire) == pipe_id {
+                            let _ = ui_tx.send(ui_cmd);
+                        }
+                    }
+                    _ => {
+                        let _ = ui_tx.send(ui_cmd);
+                    }
+                }
             }
             IpcRequest::GetSettings => {
                 let settings = *locked(&current);

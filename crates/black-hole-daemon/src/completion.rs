@@ -7,11 +7,14 @@
 //! 保证按键管线零阻塞；LLM 未就绪/失败/超时时行为与"无补全"等价。
 
 use black_hole_shared::{CompletionHint, EngineCommand, LlmCompletionSettings, UiCommand};
+use reqwest::{Client, Error};
+use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
+use tokio::{runtime::Builder, task::JoinHandle, time::timeout};
 use tracing::{debug, error, warn};
 
 /// 补全请求：由引擎线程在每次 Composing 结果产生时投递
@@ -48,12 +51,12 @@ pub trait LlmClient: Send + Sync {
 /// 使用 async + 可 abort 的 future：终止补全时取消任务即关闭底层连接，
 /// 网络请求本身不再发出/不再等待。
 pub struct HttpLlmClient {
-    client: reqwest::Client,
+    client: Client,
 }
 
 impl HttpLlmClient {
     pub fn new() -> Result<Self, String> {
-        let client = reqwest::Client::builder()
+        let client = Client::builder()
             // 连接超时固定 15s：国内直连 api.deepseek.com 实测建连可耗时数秒，
             // 过短会在连接阶段就误报超时。
             .connect_timeout(Duration::from_secs(15))
@@ -100,13 +103,13 @@ impl LlmClient for HttpLlmClient {
             }
 
             // per-request 超时：reqwest Client 级 timeout 在构建时设为连接超时，
-            // 此处用 tokio::time::timeout 包裹发送与响应体读取两个阶段。
+            // 此处用 timeout 包裹发送与响应体读取两个阶段。
             let read_timeout = Duration::from_millis(settings.timeout_ms);
-            let response = tokio::time::timeout(read_timeout, request.send())
+            let response = timeout(read_timeout, request.send())
                 .await
                 .map_err(|_| format!("LLM 请求超时（{}ms）", settings.timeout_ms))?
                 .map_err(|e| format!("LLM 请求失败: {}", describe_llm_error(&e, &settings)))?;
-            let value: serde_json::Value = tokio::time::timeout(read_timeout, response.json())
+            let value: Value = timeout(read_timeout, response.json())
                 .await
                 .map_err(|_| format!("LLM 响应读取超时（{}ms）", settings.timeout_ms))?
                 .map_err(|e| format!("LLM 响应解析失败: {}", e))?;
@@ -157,7 +160,7 @@ fn normalize_completion(text: &str, seed: &str) -> Option<String> {
 
 /// 将 reqwest 错误转换为可读的排查提示：区分 HTTP 状态错误与网络/超时错误，
 /// 并对常见的模型名/API Key 配置错误给出提示。
-fn describe_llm_error(e: &reqwest::Error, settings: &LlmCompletionSettings) -> String {
+fn describe_llm_error(e: &Error, settings: &LlmCompletionSettings) -> String {
     if e.is_timeout() {
         format!(
             "请求超时（已等待 {}ms；若直连云端 API 请检查网络/代理，或调大超时设置）",
@@ -208,15 +211,12 @@ pub fn run_completion_worker(
     let (result_tx, result_rx) =
         mpsc::channel::<(u64, CompletionRequest, Result<Option<String>, String>)>();
     // 当前在途请求任务句柄：新请求发起/上屏时 abort 以真正终止网络请求
-    let mut inflight: Option<tokio::task::JoinHandle<()>> = None;
+    let mut inflight: Option<JoinHandle<()>> = None;
     // 上次观察到的代际号：引擎 Committed 递增时据此 abort 在途请求
     let mut last_generation = latest_seq.load(Ordering::SeqCst);
 
     // tokio runtime：驱动 async 请求；abort JoinHandle 即取消 reqwest future、关闭连接
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
+    let rt = match Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
             error!(

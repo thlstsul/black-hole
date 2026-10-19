@@ -21,13 +21,14 @@ use black_hole_shared::{
 };
 use black_hole_ui::{SettingsManager, run_candidate_window, run_settings_panel};
 use clap::Parser;
-use notify::Watcher;
+use ctrlc::set_handler;
+use notify::{Event, RecursiveMode, Result as NotifyResult, Watcher, recommended_watcher};
 use std::env;
 use std::error::Error;
 use std::fs;
 use std::io;
 use std::mem::discriminant;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{AssertUnwindSafe, catch_unwind, set_hook, take_hook};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -124,11 +125,11 @@ impl App {
 
         // 运行时方案/主题/中英模式/自动切换开关状态，平台线程通过 IPC GetSettings 读取，dispatch 时同步更新
         // 中英模式是运行时状态而非设置项：daemon 启动播种为中文（false），
-        // 会话内由 SetInputMode/SetInputModeTransient 更新共享状态供跨进程
-        // 同步，不持久化 settings.json，重启后回到中文。连接时各平台实例
-        // 直接应用 daemon 当前模式（含会话内已切换的英文）：英文模式下
-        // 自动切换已由 OnTestKeyDown 补设 context 正常触发，无需再以
-        // "连接默认中文"兜底。
+        // 会话内由 SetInputMode/SetInputModeTransient 更新共享状态，不持久化
+        // settings.json，重启后回到中文。中英模式的权威是聚焦实例的本地
+        // mode_switch：聚焦（OnSetFocus）与切换/自动切换时由 TSF 实例上报，
+        // 本共享状态由这些上报（及 Show 命令声明的模式值）回写刷新——
+        // 连接/重连时不向实例回写模式（见 sync_settings_from_daemon）。
         // auto_switch 是持久化设置项，须在启动时从 settings 恢复，否则用户开启的
         // 自动切换在 daemon 重启后静默失效（直到下次手动切换或热更新才恢复）。
         let current_settings: Arc<Mutex<RuntimeSettings>> = Arc::new(Mutex::new(
@@ -210,8 +211,8 @@ impl App {
         let watch_stop_flag = Arc::clone(&watch_stop);
         let watch_handle = thread::spawn(move || {
             let settings_mgr = SettingsManager::new();
-            let (watch_tx, watch_rx) = mpsc::channel::<notify::Result<notify::Event>>();
-            let mut watcher = match notify::recommended_watcher(watch_tx) {
+            let (watch_tx, watch_rx) = mpsc::channel::<NotifyResult<Event>>();
+            let mut watcher = match recommended_watcher(watch_tx) {
                 Ok(w) => w,
                 Err(e) => {
                     warn!("Failed to create settings watcher: {}", e);
@@ -224,7 +225,7 @@ impl App {
                 if let Err(e) = fs::create_dir_all(config_dir) {
                     warn!("Failed to create config dir {:?}: {}", config_dir, e);
                 }
-                if let Err(e) = watcher.watch(config_dir, notify::RecursiveMode::NonRecursive) {
+                if let Err(e) = watcher.watch(config_dir, RecursiveMode::NonRecursive) {
                     warn!("Failed to watch config dir {:?}: {}", config_dir, e);
                 }
             }
@@ -325,15 +326,15 @@ impl App {
     /// 链式调用前一个 hook（默认 hook）：Linux/控制台场景 stderr 的
     /// 标准 panic 输出保持可见，日志文件只是补充而非替代。
     fn install_panic_hook() {
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
+        let previous_hook = take_hook();
+        set_hook(Box::new(move |info| {
             previous_hook(info);
             let location = info
                 .location()
                 .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
                 .unwrap_or_else(|| "<unknown>".to_string());
             let message = panic_payload_text(info.payload());
-            let thread = std::thread::current();
+            let thread = thread::current();
             error!(
                 "PANIC in thread '{}': {} at {}",
                 thread.name().unwrap_or("<unnamed>"),
@@ -413,7 +414,7 @@ impl App {
     // ------------------------------------------------------------------
 
     fn setup_signal_handler(ui_tx: mpsc::Sender<UiCommand>) {
-        let result = ctrlc::set_handler(move || {
+        let result = set_handler(move || {
             info!("Received interrupt signal, requesting shutdown...");
             // ctrlc 回调运行在专用线程上，可安全发送事件
             let _ = ui_tx.send(UiCommand::Exit);
@@ -601,6 +602,9 @@ impl App {
                 debug!("UI dispatch: set input mode english={}", english);
                 let mut cur = current_settings.lock().unwrap();
                 cur.english = english;
+                drop(cur);
+                // 转发给候选窗线程：徽标在同一进程内随命令切换中英并重新显示
+                let _ = ui_render_tx.send(UiCommand::SetInputMode(english));
             }
             UiCommand::SetAutoSwitch(enabled) => {
                 info!("UI dispatch: set auto switch mode to {}", enabled);
@@ -617,8 +621,27 @@ impl App {
                 // 保留分支以穷尽匹配，并防止误转发到候选窗线程。
                 info!("UI dispatch: exit requested");
             }
+            UiCommand::ShowModeIndicator {
+                context,
+                invalidate_caret,
+                english,
+            } => {
+                // 聚焦显示徽标：显隐与字样随 Show 命令自带（english 字段），
+                // 转发时不得以共享状态改写（权威 = 聚焦实例本地 mode_switch）；
+                // 同时把声明的模式回写共享状态，使 GetSettings 消费方读到
+                // 聚焦实例的真实模式（聚焦上报即刷新，无陈旧窗口期）
+                if let Some(english) = english {
+                    current_settings.lock().unwrap().english = english;
+                }
+                let _ = ui_render_tx.send(UiCommand::ShowModeIndicator {
+                    context,
+                    invalidate_caret,
+                    english,
+                });
+            }
             other => {
-                // 候选窗等命令转发给 UI 渲染线程
+                // 候选窗等命令转发给 UI 渲染线程（含徽标显隐/光标位置命令，
+                // 徽标在同一进程内由候选窗命令线程处理）
                 let _ = ui_render_tx.send(other);
             }
         }

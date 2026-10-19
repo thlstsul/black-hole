@@ -14,7 +14,7 @@
 use super::caret::{read_surrounding_text, truncate_for_log};
 use super::hook::focused_thread_id;
 use super::key_event::context_changed;
-use super::service::apply_input_mode_toggle;
+use super::service::{apply_input_mode_toggle, caret_context_for_show};
 use super::{ServiceInner, lock_service, locked, safe_com, send_ui_command_inner};
 use black_hole_shared::{ModeSuggestion, UiCommand, suggest_input_mode};
 use std::sync::{Arc, Mutex};
@@ -33,7 +33,18 @@ pub(crate) fn apply_auto_mode_toggle(inner: &Arc<Mutex<ServiceInner>>, target: b
         if target { "英文" } else { "中文" }
     );
     apply_input_mode_toggle(inner, target);
+    // 先上报模式（同步字样），再显式 Show 徽标（携带本实例焦点光标）：
+    // Show 触发的重绘必然呈现新字样
     send_ui_command_inner(inner, UiCommand::SetInputModeTransient(target));
+    let context = caret_context_for_show();
+    send_ui_command_inner(
+        inner,
+        UiCommand::ShowModeIndicator {
+            context,
+            invalidate_caret: false,
+            english: Some(target),
+        },
+    );
 }
 
 /// 编辑会话内共用：通过 TSF 文本存储读取光标周围文本并给出语境建议。
