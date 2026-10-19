@@ -238,37 +238,6 @@ fn item_font_size(font_size: u32) -> f32 {
     font_size as f32 + 2.0
 }
 
-fn render_candidate_item(
-    ui: &mut Ui,
-    display_number: usize,
-    candidate: &Candidate,
-    text_color: Color32,
-    label_color: Color32,
-    show_label: bool,
-    font_size: u32,
-) {
-    // 无论是否显示序号，均使用固定尺寸，确保布局完全一致
-    let label_text = if show_label {
-        format!("{}.", display_number)
-    } else {
-        String::new()
-    };
-    let item_font = item_font_size(font_size);
-    ui.spacing_mut().item_spacing.x = 0.0;
-    ui.add_sized(
-        [20.0, 14.0],
-        Label::new(RichText::new(label_text).size(14.0).color(label_color)).selectable(false),
-    );
-    ui.add(
-        Label::new(
-            RichText::new(&candidate.text)
-                .size(item_font)
-                .color(text_color),
-        )
-        .selectable(false),
-    );
-}
-
 /// 计算当前应渲染的候选下标窗口 [start, end)：
 /// - 展开状态：返回完整列表，由 ScrollArea 负责滚动，避免候选被截断
 /// - 折叠状态：最多 max_candidates 项，且始终包含引擎的选中索引，
@@ -546,10 +515,25 @@ fn render_selected_block(
     } else {
         (colors.base_100, colors.base_content)
     };
+    // CJK 字体行高比字形墨迹高出数像素，块上下视觉留白会宽于左右；
+    // 按墨迹相对行盒的上下空隙收缩垂直内边距，使四边留白视觉一致
+    let galley = ui.painter().layout_no_wrap(
+        selected.text.clone(),
+        FontId::proportional(selected_font),
+        text_color,
+    );
+    let top_gap = (galley.mesh_bounds.top() - galley.rect.top()).max(0.0);
+    let bottom_gap = (galley.rect.bottom() - galley.mesh_bounds.bottom()).max(0.0);
+    let margin = Margin {
+        left: 8,
+        right: 8,
+        top: (8.0 - top_gap).max(0.0).round() as i8,
+        bottom: (8.0 - bottom_gap).max(0.0).round() as i8,
+    };
     EguiFrame::new()
         .fill(fill)
         .corner_radius(CornerRadius::same(6))
-        .inner_margin(Margin::same(8))
+        .inner_margin(margin)
         .show(ui, |ui| {
             ui.add(
                 Label::new(
@@ -675,6 +659,9 @@ fn render_expanded_row(
 }
 
 /// 渲染单个候选项单元格，返回其响应（供滚动跟随使用）。
+/// 序号在高亮块之外以固定宽度渲染：块内只包文字，四边留白等宽且文字
+/// 水平居中。所有行都渲染固定宽度的序号占位盒（仅选中行显示数字），
+/// 选中项移动时各行布局保持不变，表格不跳动。
 fn render_candidate_cell(
     ui: &mut Ui,
     col: usize,
@@ -684,9 +671,50 @@ fn render_candidate_cell(
     font_size: u32,
     colors: &theme::Palette,
 ) -> eframe::egui::InnerResponse<()> {
-    let (tc, lc, bg) = item_colors(is_selected, colors);
-    candidate_item_frame(ui, bg.unwrap_or(colors.base_100), |ui| {
-        render_candidate_item(ui, col + 1, candidate, tc, lc, show_label, font_size);
+    let (tc, _lc, bg) = item_colors(is_selected, colors);
+    {
+        let number_row_height = ui
+            .ctx()
+            .fonts_mut(|f| f.row_height(&FontId::proportional(item_font_size(font_size))));
+        // 序号与高亮块紧邻（item_spacing 置 0），随后恢复行内间距
+        let cell_spacing = ui.spacing_mut().item_spacing.x;
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.add_sized(
+            [20.0, number_row_height],
+            Label::new(if show_label {
+                RichText::new(format!("{}.", col + 1)).size(14.0).color(_lc)
+            } else {
+                // 非选中行：仅占位，不显示数字
+                RichText::new("").size(14.0)
+            })
+            .selectable(false)
+            .halign(Align::Center),
+        );
+        ui.spacing_mut().item_spacing.x = cell_spacing;
+    }
+    // CJK 字体行高比字形墨迹高出数像素，块上下视觉留白会宽于左右；
+    // 按墨迹相对行盒的上下空隙收缩垂直内边距，使四边留白视觉一致
+    let font_id = FontId::proportional(item_font_size(font_size));
+    let galley = ui
+        .painter()
+        .layout_no_wrap(candidate.text.clone(), font_id, tc);
+    let top_gap = (galley.mesh_bounds.top() - galley.rect.top()).max(0.0);
+    let bottom_gap = (galley.rect.bottom() - galley.mesh_bounds.bottom()).max(0.0);
+    let margin = Margin {
+        left: 4,
+        right: 4,
+        top: (4.0 - top_gap).max(0.0).round() as i8,
+        bottom: (4.0 - bottom_gap).max(0.0).round() as i8,
+    };
+    candidate_item_frame(ui, bg.unwrap_or(colors.base_100), margin, |ui| {
+        ui.add(
+            Label::new(
+                RichText::new(&candidate.text)
+                    .size(item_font_size(font_size))
+                    .color(tc),
+            )
+            .selectable(false),
+        );
     })
 }
 
@@ -717,12 +745,13 @@ fn render_collapsed_row(
 fn candidate_item_frame(
     ui: &mut Ui,
     fill: Color32,
+    margin: Margin,
     content: impl FnOnce(&mut Ui),
 ) -> eframe::egui::InnerResponse<()> {
     EguiFrame::new()
         .fill(fill)
         .corner_radius(CornerRadius::same(4))
-        .inner_margin(Margin::same(4))
+        .inner_margin(margin)
         .show(ui, |ui| {
             ui.horizontal(|ui| content(ui));
         })

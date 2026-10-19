@@ -6,8 +6,8 @@ use black_hole_shared::{Candidate, CandidateWindowSettings, Theme, UiCommand};
 pub use candidate_window::run_candidate_window;
 use eframe::egui::Frame as EguiFrame;
 use eframe::egui::{
-    Align, Color32, Context, CornerRadius, FontData, FontDefinitions, FontFamily, Label, Layout,
-    Margin, Pos2, Rect, RichText, ScrollArea, Ui, Vec2, ViewportBuilder, ViewportCommand,
+    Align, Color32, Context, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Label,
+    Layout, Margin, Pos2, Rect, RichText, ScrollArea, Ui, Vec2, ViewportBuilder, ViewportCommand,
 };
 use eframe::egui_wgpu::{WgpuSetup, WgpuSetupCreateNew};
 use eframe::run_native;
