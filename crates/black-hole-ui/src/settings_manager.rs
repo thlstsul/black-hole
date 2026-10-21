@@ -138,7 +138,9 @@ impl SettingsManager {
         }
     }
 
-    fn config_dir() -> PathBuf {
+    /// 用户配置目录（`settings.json` 所在目录）。同时供 daemon 选日志回退
+    /// 位置使用，避免为拿目录再构造一次 `SettingsManager` 重复读盘。
+    pub fn config_dir() -> PathBuf {
         ProjectDirs::from("com", "black-hole", "ime")
             .map(|dirs| dirs.config_dir().to_path_buf())
             .unwrap_or_else(|| {

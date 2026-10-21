@@ -9,87 +9,109 @@
 //! 本钩子只观察按键、从不消费按键本身，保证 Ctrl+C 等组合键正常工作。
 //!
 //! 钩子回调运行在安装钩子的线程（Activate 所在的应用 UI 线程，自带消息循环）上，
-//! 通过前台窗口所属线程在 `ACTIVE_SERVICES` 注册表中定位对应的服务实例并切换。
+//! 按"实例级前台焦点标志 → 前台窗口所属线程"的顺序在 `ACTIVE_SERVICES`
+//! 注册表中定位**当前真正持有输入焦点**的那个服务实例并切换。
+//!
+//! WH_KEYBOARD_LL 是全局钩子：每个装有本输入法的进程都会被系统投递每一次
+//! 按键事件。因此**本进程不在前台时绝不能切换自己的实例**（否则同一次 Ctrl
+//! 会被前后台两个实例各切一次，两边模式相位不同时徽标就与正在输入的实例
+//! 相反，后台实例的 Show 还会抢走 daemon 的"聚焦连接"）。选择规则见
+//! [`pick_toggle_target`]。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, Weak};
 
+use windows::Win32::System::Threading::GetCurrentThreadId;
+
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentProcessId;
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_CONTROL, VK_LCONTROL, VK_RCONTROL,
-};
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_LCONTROL, VK_RCONTROL};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetForegroundWindow, GetWindowThreadProcessId, HHOOK, KBDLLHOOKSTRUCT,
     SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP,
 };
 
-use super::send_ui_command_inner;
 use super::service::{apply_input_mode_toggle, caret_context_for_show};
-use super::{ContextSample, ServiceInner, locked};
+use super::{ServiceInner, locked};
+use super::{
+    gesture_consume_release, gesture_ctrl_pressed, gesture_other_key_pressed, send_ui_command_inner,
+};
 use black_hole_shared::UiCommand;
 use tracing::{debug, warn};
 
-/// 钩子路径手动切换的缓存基线门控：仅当采样快照（[`ContextSample`]）的焦点
-/// 线程、光标位置与语境版本均与当前状态一致时才信任缓存基线（UIA 回退已
-/// 移除，钩子回调无法即时采样语境建议）。判定规则：
-/// - 焦点线程：两者均需已知且相等（多进程应用 WebView2 等中
-///   GetForegroundWindow 不可靠，窗口身份以 TSF 焦点线程为准）；
-/// - 光标位置：两者均需已知且相等——光标移动不 bump 版本，需单独比对；
-///   自绘光标等从不跟踪位置的应用中 None==None 空真无法证明位置未变，
-///   保守拒绝；
-/// - 版本：缓存未被合成/焦点等语境变更作废（见 record_context_sample）。
-///
-/// 任一不匹配（焦点线程切换、光标移动、合成期间、从未采样）均拒绝，让自动
-/// 切换按新语境正常工作；钩子路径手动切换此时无法即时锁定，改为置位
-/// pending_manual_lock，由下个实时采样点在评估前以新鲜建议延迟锁定基线。
-fn cached_baseline_usable(
-    sample: &ContextSample,
-    focused_tid: Option<u32>,
-    current_pos: Option<(i32, i32, i32)>,
-    current_version: u64,
-) -> bool {
-    sample.focus_tid.is_some()
-        && sample.focus_tid == focused_tid
-        && sample.caret_pos.is_some()
-        && sample.caret_pos == current_pos
-        && sample.version == current_version
-}
-
 /// 当前进程内所有已激活的文本服务实例（线程 id → 弱引用）。
-/// 钩子回调据此定位前台窗口所属线程对应的服务。
+/// 钩子回调据此定位持有输入焦点的服务实例（见 [`pick_toggle_target`]）。
 static ACTIVE_SERVICES: Mutex<Option<HashMap<u32, Weak<Mutex<ServiceInner>>>>> = Mutex::new(None);
 /// 已安装的钩子句柄（进程内只安装一次），用 usize 存储避免裸指针的 Send/Sync 问题。
 static HOOK: Mutex<Option<usize>> = Mutex::new(None);
 /// 当前进程内 Ctrl 是否处于按下状态，用于过滤按住时的自动重复按下事件。
 static CTRL_DOWN: Mutex<bool> = Mutex::new(false);
-/// 当前持有 TSF 输入焦点的线程 id（由 service.rs 的 OnSetFocus 维护）。
-/// WebView2 等多进程应用中，IME 承载进程与宿主窗口进程不同，GetForegroundWindow
-/// 无法反映真正的输入焦点，必须依赖 TSF 自身的焦点回调。
-static FOREGROUND_TID: Mutex<Option<u32>> = Mutex::new(None);
+/// 进程内持有 TSF 键盘前台焦点的线程集合，以及最近一次获得焦点的线程。
+///
+/// 由 service.rs 的 `ITfKeyEventSink::OnSetFocus` 维护（收到焦点时加入集合，
+/// 失去焦点时**仅移除本线程**），钩子回调据此选择切换目标（见
+/// [`pick_toggle_target`]）。
+///
+/// 用"集合 + 最近者"而不是单值：进程内可能有多个文本服务实例（多窗口/
+/// 多线程），别的实例的失焦回调不得抹掉当前聚焦实例的记录。这份状态只被
+/// 焦点回调与钩子回调短暂持锁读写，**绝不与 `ServiceInner` 的锁嵌套**——
+/// 低层键盘钩子回调里若等待按键路径持有的 `ServiceInner` 锁（按键路径会
+/// 持锁跨同步 IPC），会拖慢甚至卡住宿主输入。
+#[derive(Default)]
+struct FocusState {
+    /// 最近一次获得 TSF 键盘前台焦点的线程 id
+    latest: Option<u32>,
+    /// 当前自称持有 TSF 键盘前台焦点的线程集合（多实例进程的兜底依据）
+    claimed: HashSet<u32>,
+}
 
-/// 记录当前持有 TSF 输入焦点的线程（OnSetFocus(fforeground=true) 时调用）。
+static FOCUS: Mutex<Option<FocusState>> = Mutex::new(None);
+
+/// 记录某线程获得 TSF 键盘前台焦点（ITfKeyEventSink::OnSetFocus 收到
+/// 前台焦点时调用）。
 pub(crate) fn set_foreground_thread(thread_id: u32) {
     debug!("hook: set_foreground_thread thread_id={}", thread_id);
-    if let Ok(mut guard) = FOREGROUND_TID.lock() {
-        *guard = Some(thread_id);
+    if let Ok(mut guard) = FOCUS.lock() {
+        let state = guard.get_or_insert_with(FocusState::default);
+        state.claimed.insert(thread_id);
+        state.latest = Some(thread_id);
     }
 }
 
-/// 清除 TSF 输入焦点记录（OnSetFocus(fforeground=false) 时调用）。
-pub(crate) fn clear_foreground_thread() {
-    debug!("hook: clear_foreground_thread");
-    if let Ok(mut guard) = FOREGROUND_TID.lock() {
-        *guard = None;
+/// 移除某线程的 TSF 键盘前台焦点记录（OnSetFocus 失去前台焦点时调用）。
+///
+/// 只移除本线程：进程内其它实例（窗口/线程）的失焦回调不得抹掉当前聚焦
+/// 实例的记录——记录被抹掉后钩子路径会退回"前台窗口线程 / 唯一实例"的
+/// 近似选择，可能选中与 TSF 按键路径不同的实例，同一次 Ctrl 被两个实例
+/// 各切一次（模式相位不同的两个实例各自上报模式/Show，徽标就与真正在输入
+/// 的实例相反）。
+pub(crate) fn clear_foreground_thread(thread_id: u32) {
+    if let Ok(mut guard) = FOCUS.lock()
+        && let Some(state) = guard.as_mut()
+    {
+        state.claimed.remove(&thread_id);
+        if state.latest == Some(thread_id) {
+            // 兜底：仍有其它实例自称前台时改指向它（正常情况下集合至多一个）
+            state.latest = state.claimed.iter().copied().next();
+        }
+        debug!(
+            "hook: clear_foreground_thread thread_id={} latest={:?} claimed={:?}",
+            thread_id, state.latest, state.claimed
+        );
     }
 }
 
-/// 读取当前持有 TSF 输入焦点的线程 id（None=无 TSF 焦点）。
-/// 多进程应用（WebView2 等）中 GetForegroundWindow 不可靠，钩子门控与缓存
-/// 采样都以此身份标识为锚（见 cached_baseline_usable）。
-pub(crate) fn focused_thread_id() -> Option<u32> {
-    FOREGROUND_TID.lock().ok().and_then(|g| *g)
+/// 读取焦点状态快照（`(最近聚焦线程, 自称前台线程集合)`）。
+/// 仅持 [`FOCUS`] 自身的锁，不触碰任何服务实例的锁。
+fn focus_snapshot() -> (Option<u32>, HashSet<u32>) {
+    match FOCUS.lock() {
+        Ok(guard) => guard
+            .as_ref()
+            .map(|state| (state.latest, state.claimed.clone()))
+            .unwrap_or_default(),
+        Err(_) => (None, HashSet::new()),
+    }
 }
 
 /// 注册一个已激活的服务实例（Activate 时调用），并确保钩子已安装。
@@ -190,8 +212,11 @@ unsafe extern "system" fn keyboard_hook_proc(
             }
         } else if event == WM_KEYDOWN {
             // 按住 Ctrl 期间按下其他键（如 Ctrl+C、Ctrl+Shift），取消切换候选。
-            let ctrl_held = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0;
-            if ctrl_held {
+            // 不能用 GetAsyncKeyState 判定 Ctrl 是否按住：低层钩子回调在该
+            // 按键事件注入输入流之前执行，异步键状态尚未更新，快速连击时
+            // 会读到陈旧的"未按下"而漏掉取消（见 on_ctrl_pressed 注释）。
+            // 改用回调自身按 KEYDOWN/KEYUP 维护的 CTRL_DOWN 跟踪。
+            if *locked(&CTRL_DOWN) {
                 on_other_key_pressed();
             }
         }
@@ -221,205 +246,344 @@ fn foreground_thread_id() -> Option<u32> {
     }
 }
 
-/// 获取前台线程对应的服务实例（弱引用升级失败则返回 None）。
+/// 钩子路径的切换目标选择（纯函数，便于单测）：返回应响应本次物理 Ctrl 的
+/// 实例线程 id；`None` = 本进程不是当前输入前台，钩子不得动作。
 ///
-/// 优先使用 TSF `OnSetFocus` 记录的焦点线程 —— WebView2 等多进程应用中
-/// IME 承载进程与宿主窗口进程不同，`GetForegroundWindow` 不可靠；
-/// 其次按前台窗口所属线程匹配（传统单进程应用）；
-/// 最后回退到唯一注册实例，兼容前台线程与激活线程不一致的情况。
-fn foreground_service() -> Option<Arc<Mutex<ServiceInner>>> {
-    let focused_tid = FOREGROUND_TID.lock().ok().and_then(|g| *g);
-    let win_tid = foreground_thread_id();
-    let guard = ACTIVE_SERVICES.lock().ok()?;
-    let map = guard.as_ref()?;
-
-    // 1) TSF 焦点线程（OnSetFocus 记录）优先。
-    if let Some(tid) = focused_tid
-        && let Some(weak) = map.get(&tid)
-        && let Some(inner) = weak.upgrade()
+/// 钩子是**进程级**观察者：每个装有本输入法的进程都安装一份 WH_KEYBOARD_LL，
+/// 系统对每次按键都会投递到所有进程的钩子。若不判断本进程是否在前台，后台
+/// 进程的钩子也会把自己的实例切换一次并向 daemon 上报模式/Show 徽标——同一次
+/// Ctrl 被两个实例（甚至两个不同进程）各切一次，两边模式相位不同时徽标就与
+/// 真正在输入的实例相反（取反）；后台实例的 Show 还会抢走 daemon 的
+/// "聚焦连接"（此后前台窗口的 Hide/位置更新被仲裁丢弃）。
+///
+/// 输入：
+/// - `focused_tid`：`OnSetFocus` 记录的 TSF 前台线程（进程级记录，可能被
+///   迟到/别实例的回调覆盖或清除）；
+/// - `focused_claimed`：`focused_tid` 对应的实例自身仍自称持有 TSF 键盘焦点
+///   （实例级标志，见 [`ServiceInner::foreground`]）；
+/// - `win_tid`：前台窗口所属线程，仅当该窗口属于本进程时为 `Some`；
+/// - `instances`：(线程 id, 该实例是否自称前台)。
+///
+/// 选择优先级（规则 1 要求前台窗口属于本进程；后台残留认领的误切换由
+/// on_ctrl_released 的同线程 GetFocus 权威校验兜底）：
+/// 1. 进程级焦点记录 + 该实例在自称前台集合内：信息最完整（同进程多实例）；
+/// 2. 恰好一个实例自称前台：进程级记录被清除/覆盖时的兜底，同时覆盖
+///    UWP 等前台窗口属于宿主进程（win_tid=None）的场景；
+///    多个实例同时自称前台（迟到回调）时不可信，继续向下判断；
+/// 3. 前台窗口属于本进程：按窗口线程定位；该线程未注册时回退唯一实例
+///    （激活线程与窗口线程不一致，如设置面板等无独立消息循环的宿主）；
+/// 4. 其余：本进程不在前台 —— 后台钩子只观察按键，不切换任何实例。
+fn pick_toggle_target(
+    focused_tid: Option<u32>,
+    focused_claimed: bool,
+    win_tid: Option<u32>,
+    instances: &[(u32, bool)],
+) -> Option<u32> {
+    // 1) 进程级焦点记录与该实例的焦点标志一致，且前台窗口属于本进程。
+    // 前台窗口归属是硬门控：TSF 焦点认领可能残留（OnSetFocus(false) 迟到/
+    // 丢失），后台进程凭残留认领通过规则 1 会对同一次物理 Ctrl 也切换自己的
+    // 实例——两进程各自上报相反模式，daemon "最后 Show 胜出"使徽标显示非
+    // 聚焦实例的字样（徽标反转）。经典 TSF 下 IME 承载进程与前台窗口所属
+    // 进程一致（Chrome/WebView2/Zed 均然），该门控不影响正常路径。
+    if win_tid.is_some()
+        && let Some(tid) = focused_tid
+        && focused_claimed
+        && instances.iter().any(|(t, _)| *t == tid)
     {
-        return Some(inner);
+        return Some(tid);
     }
 
-    // 2) 前台窗口所属线程（传统单进程应用场景）。
-    if let Some(tid) = win_tid
-        && let Some(weak) = map.get(&tid)
-        && let Some(inner) = weak.upgrade()
+    // 2) 唯一自称持有 TSF 键盘焦点的实例（不要求前台窗口属于本进程：
+    // UWP 等应用前台窗口在宿主进程 ApplicationFrameHost，而 IME 承载在
+    // 应用进程，win_tid 必为 None）。残留认领的后台误切换由
+    // on_ctrl_released 的同线程 GetFocus 权威校验兜底，不在此猜测。
+    let mut claimed = instances
+        .iter()
+        .filter(|(_, foreground)| *foreground)
+        .map(|(tid, _)| *tid);
+    if let Some(tid) = claimed.next()
+        && claimed.next().is_none()
     {
-        return Some(inner);
+        return Some(tid);
     }
 
-    // 3) 唯一实例兜底：未命中焦点线程但注册表中只有一个实例时回退使用。
-    if map.len() == 1 {
-        let weak = map.values().next()?;
-        debug!("hook: 未命中焦点线程，回退唯一注册实例");
-        return weak.upgrade();
+    // 3) 前台窗口属于本进程：窗口线程 → 唯一实例兜底
+    if let Some(tid) = win_tid {
+        if instances.iter().any(|(t, _)| *t == tid) {
+            return Some(tid);
+        }
+        if let [only] = instances {
+            return Some(only.0);
+        }
     }
 
-    debug!(
-        "hook: 未命中焦点线程（tsf={:?} win={:?}）且注册实例数={}",
-        focused_tid,
-        win_tid,
-        map.len()
-    );
+    // 4) 本进程不在前台：不动作（后台钩子绝不能切换自己的实例）
     None
 }
 
-fn on_ctrl_pressed() {
-    let Some(inner) = foreground_service() else {
-        debug!("hook: on_ctrl_pressed 未找到前台服务");
-        return;
+/// 获取应响应本次物理 Ctrl 的服务实例及其注册线程 id（弱引用升级失败则
+/// 返回 None）。选择规则见 [`pick_toggle_target`]：只有本进程是当前输入前台
+/// （或本进程内有实例自称持有 TSF 键盘焦点）时才返回目标实例。
+///
+/// 全程**不加任何 `ServiceInner` 锁**（焦点集合来自 [`focus_snapshot`]，
+/// 实例只做弱引用升级）：本函数在低层键盘钩子回调里运行，若等待按键路径
+/// 持有的服务锁（其持锁期间会做同步 IPC），会拖慢甚至卡住宿主输入。
+/// 焦点真伪的权威校验由调用方在拿到实例锁后进行（见 [`on_ctrl_released`]）。
+fn foreground_service() -> Option<(u32, Arc<Mutex<ServiceInner>>)> {
+    let (focused_tid, claimed_tids) = focus_snapshot();
+    // 仅当前台窗口属于本进程时为 Some（其它进程的前台窗口事件也会触发本钩子）
+    let win_tid = foreground_thread_id();
+    let instances: Vec<(u32, Arc<Mutex<ServiceInner>>)> = {
+        let guard = ACTIVE_SERVICES.lock().ok()?;
+        let map = guard.as_ref()?;
+        map.iter()
+            .filter_map(|(tid, weak)| weak.upgrade().map(|inner| (*tid, inner)))
+            .collect()
     };
-    if let Ok(mut guard) = inner.lock() {
-        // 新一轮 Ctrl 按下：重置抑制标志，避免上次残留（如钩子切换后
-        // TSF 从未收到 keyup）抑制本次 TSF 路径的合法切换。
-        guard.hook_toggled = false;
-        guard.mode_switch.ctrl_pressed();
+    if instances.is_empty() {
+        return None;
     }
+    let claims: Vec<(u32, bool)> = instances
+        .iter()
+        .map(|(tid, _)| (*tid, claimed_tids.contains(tid)))
+        .collect();
+    let focused_claimed = focused_tid.is_some_and(|tid| claimed_tids.contains(&tid));
+    let Some(target) = pick_toggle_target(focused_tid, focused_claimed, win_tid, &claims) else {
+        debug!(
+            "hook: 本进程不在输入前台，忽略按键（tsf={:?} win={:?} claims={:?}）",
+            focused_tid, win_tid, claims
+        );
+        return None;
+    };
+    // 现场可查：下次再出现"徽标取反"时据此判断是第几级选择命中、是否选错实例
+    debug!(
+        "hook: toggle target tid={} (tsf={:?} win={:?} claims={:?})",
+        target, focused_tid, win_tid, claims
+    );
+    instances.into_iter().find(|(tid, _)| *tid == target)
+}
+
+fn on_ctrl_pressed() {
+    // 只武装进程级手势，不触碰任何实例：与 TSF 路径共享同一份 pending，
+    // 一次手势在进程内只可能被消费一次（见 CTRL_GESTURE_PENDING）。
+    // 注意不能用 GetAsyncKeyState 校验"物理键仍按着"：低层钩子回调在该
+    // 按键事件注入输入流之前执行，异步键状态尚未更新，按下的 Ctrl 会读到
+    // "未按下"，导致手势永远不武装、切换失效。回调队列内按下先于松开派发
+    // （同一线程按序处理），不存在"迟到按下重新武装已消费手势"的乱序。
+    gesture_ctrl_pressed();
 }
 
 fn on_other_key_pressed() {
-    let Some(inner) = foreground_service() else {
-        debug!("hook: on_other_key_pressed 未找到前台服务");
-        return;
-    };
-    if let Ok(mut guard) = inner.lock() {
-        guard.mode_switch.other_key_pressed(true);
-    }
+    // 按住 Ctrl 期间按下其他键（Ctrl+C、Ctrl+Shift）：取消切换候选。
+    // 只取消进程级手势，不触碰任何实例。"Ctrl 是否按住"由调用方依据
+    // 钩子回调自身的 CTRL_DOWN 跟踪判定（GetAsyncKeyState 在低层钩子
+    // 回调里不可靠，见 on_ctrl_pressed 注释），此处无条件取消。
+    gesture_other_key_pressed(true);
 }
 
 fn on_ctrl_released() {
-    let Some(inner) = foreground_service() else {
-        debug!("hook: on_ctrl_released 未找到前台服务");
+    // 先解析目标并完成焦点校验，**最后**才消费进程级手势：若在解析前就
+    // 消费（先取票后验货），钩子侧任何早期放弃（本进程不在前台、焦点认领
+    // 残留校验失败）都会把手势吃掉——TSF OnTestKeyUp 路径随后拿到 false
+    // 提前返回，用户刻意按下的 Ctrl 切换被静默吞掉。改为验证通过后才
+    // 消费：钩子早期放弃时手势仍处于武装状态，聚焦实例的 TSF 路径仍可
+    // 接管（恢复旧实例级状态机的优雅降级）；反之若 TSF 路径先消费，本
+    // 函数拿到 false 直接返回，一次手势在进程内仍恰好被一条路径消费。
+    let Some((target_tid, inner)) = foreground_service() else {
+        debug!("hook: 未找到前台服务实例，手势留给 TSF 路径处理");
         return;
     };
-    // 在同一个临界区内消费候选并置位抑制标志，保证 TSF 路径 OnTestKeyUp
-    // 观察到的 hook_toggled 与状态机消费结果一致（避免 TOCTOU）。
-    let toggled = {
+    // 焦点真伪权威校验：焦点认领可能残留（OnSetFocus(false) 迟到/丢失），
+    // 后台进程/同进程僵尸实例凭残留认领被选中会对同一次物理 Ctrl 也切换
+    // 自己——两实例相位错开后各自上报相反模式，徽标显示非聚焦实例的字样。
+    // ITfThreadMgr::GetFocus 是 TSF 自己维护的焦点事实：仅当候选实例就在
+    // 钩子线程（STA 所有者线程）上时可直接查询（跨线程 COM 调用有阻塞
+    // 风险，低层钩子回调里禁止）。无 thread_mgr（未完成激活）时跳过校验。
+    if target_tid == unsafe { GetCurrentThreadId() } {
+        let thread_mgr = {
+            let guard = match inner.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            guard.thread_mgr.clone()
+        };
+        if let Some(tm) = thread_mgr {
+            let has_focus = unsafe { tm.GetFocus() }.is_ok();
+            if !has_focus {
+                debug!("hook: 候选实例的 TSF 线程管理器当前无焦点（认领已残留），丢弃本次切换");
+                return;
+            }
+        }
+    }
+    // 验证通过，此时才消费手势：拿到 false 说明 TSF 路径已先消费并完成
+    // 切换，本路径不得再次翻转（一次手势恰好被一条路径消费）。
+    if !gesture_consume_release() {
+        debug!("hook: 手势已被 TSF 路径消费，跳过钩子侧切换");
+        return;
+    }
+    // 消费手势成功，翻转**目标实例自身**的模式并走切换收尾
+    let english = {
         let mut guard = match inner.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
-        let toggled = guard.mode_switch.ctrl_released();
-        if toggled.is_some() {
-            guard.hook_toggled = true;
-        }
-        toggled
+        // 翻转目标值本身即新模式：set_english 的返回值只表示"是否发生变化"
+        // （此处必然变化），不能当作模式值使用——误用 Option::is_some 会让
+        // 每次切换都上报英文（恒为 true），徽标字样永远显示"英"
+        let english = !guard.mode_switch.is_english();
+        guard.mode_switch.set_english(english);
+        english
     };
-    if let Some(english) = toggled {
-        // 用户手动切换：钩子回调中无法请求 TSF 编辑会话读取周围文本，
-        // 以最近一次 TSF 采样到的语境建议作为锁定基线——None 基线会在
-        // 下一个真实建议（Some）时触发"语境变化"解锁、撤销手动切换；
-        // 从未采样时为 None（无自动切换信号，锁定无副作用）
-        if let Ok(mut guard) = inner.lock() {
-            // 钩子路径无法即时采样语境建议（UIA 回退已移除）：仅当最近一次
-            // 采样快照仍与当前焦点线程/光标位置/语境版本一致时才以缓存作
-            // 锁定基线（门控规则见 cached_baseline_usable）；基线不可信时
-            // 置位"延迟手动锁定"，下个实时采样点（按键评估/编辑会话）以
-            // 新鲜建议锁定基线，保护本次手动切换不被自动切换立即撤销。
-            if cached_baseline_usable(
-                &guard.context_sample,
-                focused_thread_id(),
-                guard.last_caret_pos,
-                guard.context_version,
-            ) {
-                let baseline = guard.context_sample.suggestion;
-                guard.auto_mode.lock_manual(baseline);
-            } else {
-                debug!("hook: 缓存基线不可用，置位延迟手动锁定");
-                guard.pending_manual_lock = true;
-            }
+    if let Ok(mut guard) = inner.lock() {
+        // 一律延迟锁定：钩子回调无法请求 TSF 编辑会话采样，而采样缓存
+        // 无法证明仍反映当前语境（last_caret_pos 只在布局事件后异步更新，
+        // 上屏/点击后的窗口内门控两侧是同一个滞后快照，空真通过会锁进
+        // 陈旧基线，下一键即被自动切换撤销——徽标取反）。延迟到下个评估
+        // 点以本次新鲜读取的建议锁定，防护更强且无陈旧窗口。
+        // 关闭自动切换时不置位：没有评估点会消费它，残留下次开启时可能
+        // 被当作"本次手动切换的基线"（开关同步路径也会清除残留）。
+        if guard.auto_switch {
+            guard.pending_manual_lock = true;
         }
-        debug!(
-            "Ctrl toggled via keyboard hook: {}",
-            if english { "英文" } else { "中文" }
-        );
-        apply_input_mode_toggle(&inner, english);
-        // 上报 daemon 持久化并更新全局状态，供其它进程（管理员/普通）同步；
-        // 随后显式 Show 徽标（携带本实例焦点光标）：先字样后 Show，
-        // Show 触发的重绘必然呈现新字样
-        send_ui_command_inner(&inner, UiCommand::SetInputMode(english));
-        let context = caret_context_for_show();
-        // 同一焦点会话内重显：未取到光标时沿用 UI 已记录的位置
-        // （invalidate_caret=false），否则切换中英时徽标会被清成"位置未知"
-        // 而屏外停放、用户看不到任何反馈
-        send_ui_command_inner(
-            &inner,
-            UiCommand::ShowModeIndicator {
-                context,
-                invalidate_caret: false,
-                english: Some(english),
-            },
-        );
     }
+    debug!(
+        "Ctrl toggled via keyboard hook: {}",
+        if english { "英文" } else { "中文" }
+    );
+    apply_input_mode_toggle(&inner, english);
+    // 上报 daemon 持久化并更新全局状态，供其它进程（管理员/普通）同步；
+    // 随后显式 Show 徽标（携带本实例焦点光标）：先字样后 Show，
+    // Show 触发的重绘必然呈现新字样
+    send_ui_command_inner(&inner, UiCommand::SetInputMode(english));
+    let context = caret_context_for_show();
+    // 同一焦点会话内重显：未取到光标时沿用 UI 已记录的位置
+    // （invalidate_caret=false），否则切换中英时徽标会被清成"位置未知"
+    // 而屏外停放、用户看不到任何反馈
+    send_ui_command_inner(
+        &inner,
+        UiCommand::ShowModeIndicator {
+            context,
+            invalidate_caret: false,
+            english: Some(english),
+        },
+    );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ContextSample, cached_baseline_usable};
-    use black_hole_shared::ModeSuggestion;
+    use super::{
+        clear_foreground_thread, focus_snapshot, pick_toggle_target, set_foreground_thread,
+    };
 
-    fn sample(focus_tid: Option<u32>, pos: Option<(i32, i32, i32)>, version: u64) -> ContextSample {
-        ContextSample {
-            suggestion: ModeSuggestion::English,
-            focus_tid,
-            caret_pos: pos,
-            version,
-        }
+    #[test]
+    fn foreground_focus_set_keeps_other_threads() {
+        // 焦点集合只能由记录所属线程移除：别的实例（线程）的失焦回调不得
+        // 抹掉当前聚焦实例的记录，否则钩子路径会退回近似选择，可能选中与
+        // TSF 按键路径不同的实例（同一次 Ctrl 被切两次）
+        set_foreground_thread(11);
+        clear_foreground_thread(22);
+        let (latest, claimed) = focus_snapshot();
+        assert_eq!(latest, Some(11), "非记录所属线程的失焦回调不得清除记录");
+        assert!(claimed.contains(&11));
+
+        // 两个实例同时声称前台（迟到回调）：记录最近者，集合保留两者，
+        // 选择函数在歧义时不再猜测
+        set_foreground_thread(12);
+        let (latest, claimed) = focus_snapshot();
+        assert_eq!(latest, Some(12));
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(
+            pick_toggle_target(Some(12), true, Some(12), &[(11, true), (12, true)]),
+            Some(12),
+            "多个自称前台时以最近记录者为准"
+        );
+
+        // 记录所属线程失焦：从集合移除，latest 改指向仍自称前台的实例
+        clear_foreground_thread(12);
+        let (latest, claimed) = focus_snapshot();
+        assert_eq!(latest, Some(11));
+        assert!(!claimed.contains(&12));
+        clear_foreground_thread(11);
+        let (latest, claimed) = focus_snapshot();
+        assert_eq!(latest, None);
+        assert!(claimed.is_empty());
     }
 
     #[test]
-    fn baseline_usable_requires_focus_position_version_match() {
-        let pos = Some((10, 20, 30));
-        // 全部匹配（焦点线程/位置/版本）：可用
-        assert!(cached_baseline_usable(
-            &sample(Some(1), pos, 3),
-            Some(1),
-            pos,
-            3
-        ));
-        // 焦点线程不匹配（焦点切换）：不可用
-        assert!(!cached_baseline_usable(
-            &sample(Some(1), pos, 3),
-            Some(2),
-            pos,
-            3
-        ));
-        // 焦点线程未知（无 TSF 焦点）：空真拒绝
-        assert!(!cached_baseline_usable(
-            &sample(Some(1), pos, 3),
-            None,
-            pos,
-            3
-        ));
-        // 光标位置不匹配（采样后移动到不同语境）：不可用
-        assert!(!cached_baseline_usable(
-            &sample(Some(1), pos, 3),
-            Some(1),
-            Some((40, 50, 60)),
-            3
-        ));
-        // 版本不匹配（合成/焦点变更作废缓存）：不可用
-        assert!(!cached_baseline_usable(
-            &sample(Some(1), pos, 2),
-            Some(1),
-            pos,
-            3
-        ));
-        // 位置未知（自绘光标等应用从不跟踪 last_caret_pos）：None==None 空真
-        // 无法证明位置未变，保守拒绝
-        assert!(!cached_baseline_usable(
-            &sample(Some(1), None, 3),
-            Some(1),
-            None,
-            3
-        ));
-        // 从未采样（None 焦点线程/位置）：不可用
-        assert!(!cached_baseline_usable(
-            &sample(None, None, 3),
-            Some(1),
-            pos,
-            3
-        ));
+    fn focused_thread_with_claim_wins() {
+        // 进程级记录 + 该实例自称前台：即使前台窗口线程指向别的实例
+        // （多线程窗口），也以 TSF 焦点实例为准——与 TSF 按键路径同一实例，
+        // 共享 ctrl_pending 自然去重
+        assert_eq!(
+            pick_toggle_target(Some(7), true, Some(8), &[(7, true), (8, false)]),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn stale_focused_thread_is_not_trusted() {
+        // 进程级记录指向某实例，但该实例已不自称前台（记录被迟到/别实例
+        // 回调污染）：不得据此切换；此处另有唯一自称前台实例 → 选它
+        assert_eq!(
+            pick_toggle_target(Some(7), false, Some(8), &[(7, false), (8, true)]),
+            Some(8)
+        );
+        // 无任何自称前台实例、前台窗口也不属于本进程 → 后台进程不动作
+        assert_eq!(
+            pick_toggle_target(Some(7), false, None, &[(7, false), (8, false)]),
+            None
+        );
+    }
+
+    #[test]
+    fn background_process_never_toggles_own_instance() {
+        // 后台进程（前台窗口属于其它进程 ⇒ win_tid=None，实例也早已失去
+        // 焦点标志）即使只有一个注册实例也不得回退切换——否则同一次 Ctrl
+        // 被前后台两个实例各切一次，相位不同时徽标取反
+        assert_eq!(pick_toggle_target(None, false, None, &[(3, false)]), None);
+        // 有进程级记录但实例不自称前台，同样拒绝
+        assert_eq!(
+            pick_toggle_target(Some(3), false, None, &[(3, false)]),
+            None
+        );
+    }
+
+    #[test]
+    fn sole_claim_fallback_covers_out_of_process_host() {
+        // UWP 等应用前台窗口在宿主进程（win_tid=None），但本进程唯一实例
+        // 自称持有 TSF 键盘焦点 → 由它响应 Ctrl（后台残留认领的误切换由
+        // on_ctrl_released 的同线程 GetFocus 权威校验兜底）
+        assert_eq!(pick_toggle_target(None, false, None, &[(5, true)]), Some(5));
+        // 进程级记录 + 该实例认领 + 前台窗口属于本进程：规则 1 命中
+        assert_eq!(
+            pick_toggle_target(Some(5), true, Some(5), &[(5, true)]),
+            Some(5)
+        );
+        // 多个实例同时自称前台（迟到回调遗留）：不可信，不再猜测
+        assert_eq!(
+            pick_toggle_target(None, false, None, &[(5, true), (6, true)]),
+            None
+        );
+    }
+
+    #[test]
+    fn foreground_window_fallbacks() {
+        // 前台窗口属于本进程：按窗口线程定位实例
+        assert_eq!(
+            pick_toggle_target(None, false, Some(9), &[(9, false), (10, false)]),
+            Some(9)
+        );
+        // 窗口线程未注册但进程内唯一实例（激活线程与窗口线程不一致）
+        assert_eq!(
+            pick_toggle_target(None, false, Some(9), &[(10, false)]),
+            Some(10)
+        );
+        // 窗口线程未注册且实例多于一个：无法确定，宁可不切换
+        assert_eq!(
+            pick_toggle_target(None, false, Some(9), &[(10, false), (11, false)]),
+            None
+        );
+        // 没有前台窗口信息（GetForegroundWindow 失败等）也不伪造目标
+        assert_eq!(pick_toggle_target(None, false, None, &[]), None);
     }
 }

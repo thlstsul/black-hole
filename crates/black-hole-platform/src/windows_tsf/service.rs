@@ -1,5 +1,7 @@
 use super::super::ipc::{IpcRequest, IpcResponse, read_response, send_request_buf};
-use super::auto_switch::{AutoSwitchEditSession, SuggestionReadSession, apply_auto_mode_toggle};
+use super::auto_switch::{
+    AutoSwitchEditSession, FocusAutoSwitchSession, SuggestionReadSession, apply_auto_mode_toggle,
+};
 use super::caret::{
     LayoutChangeEditSession, get_caret_position_via_gui_thread_info, get_own_thread_caret_position,
 };
@@ -11,7 +13,8 @@ use super::hook::{
 use super::key_event::{KeyHandlerEditSession, virtual_key_to_key_event};
 use super::langbar::BlackHoleLangBarItem;
 use super::{
-    ServiceInner, ensure_ipc_connection, lock_service, locked, safe_com, send_ui_command_inner,
+    ServiceInner, ensure_ipc_connection, gesture_consume_release, gesture_ctrl_pressed,
+    gesture_other_key_pressed, lock_service, locked, safe_com, send_ui_command_inner,
     try_lock_service, unadvise_sink_pair,
 };
 use black_hole_shared::{InputContext, KeyEvent, KeyState, ModeSuggestion, UiCommand};
@@ -73,6 +76,8 @@ pub(crate) struct EnglishEvalDecision {
 /// - 评估时 context 可用：pic 非空（将刷新）或既有 context 非空（空 pic 保留）
 /// - 是字符输入键（is_input_key；Shift/方向键等非输入键直接放行）
 /// - 本次按键未在 OnTestKeyDown 已评估过（already_evaluated，去重窗口）
+/// - 当前应用可取得光标周围文本（!context_unreadable；VSCode/Zed 等读不到
+///   语境的应用禁用评估，避免逐键发起注定失败的同步探测会话）
 ///
 /// 将决策从 COM 回调中提取为纯函数，便于单测覆盖刷新/空 pic 保留/去重
 /// 三个关键场景；回调仅负责执行动作（刷新 context、请求评估会话）。
@@ -83,6 +88,7 @@ pub(crate) fn decide_english_auto_switch(
     pic_present: bool,
     is_input_key: bool,
     already_evaluated: bool,
+    context_unreadable: bool,
 ) -> EnglishEvalDecision {
     let context_after = pic_present || context_was_some;
     EnglishEvalDecision {
@@ -91,7 +97,8 @@ pub(crate) fn decide_english_auto_switch(
             && !has_composition
             && context_after
             && is_input_key
-            && !already_evaluated,
+            && !already_evaluated
+            && !context_unreadable,
     }
 }
 
@@ -160,8 +167,8 @@ impl BlackHoleTextService {
     /// 向 daemon 查询当前的 scheme、theme、全局中英模式和自动切换开关，
     /// 并更新 ServiceInner，使托盘菜单能勾选正确的选项、跨进程（管理员/普通）
     /// 保持中英模式一致、自动切换开关设置热生效。
-    /// 始终应用 daemon 当前中英模式（含英文）：英文模式下自动切换已由
-    /// OnTestKeyDown 补设 context 后正常触发，无需再以"连接默认中文"兜底。
+    /// 始终同步 daemon 的方案/主题/自动切换开关（不含中英模式：模式权威
+    /// 为实例本地 mode_switch，见 sync_settings_from_daemon_inner）。
     fn sync_settings_from_daemon(&self) {
         sync_settings_from_daemon_inner(&self.inner);
     }
@@ -182,14 +189,13 @@ impl BlackHoleTextService {
 
     /// Send Reset to the engine and end any active composition.
     /// `preserve_input` 为 true 时保留输入框中的文本（相当于上屏），否则清空取消。
+    ///
+    /// 会请求同步编辑会话（结束合成），因此**不得在编辑会话内调用**——
+    /// 自动切换路径见 [`Self::on_auto_mode_toggled`]（只重置引擎）。
     fn send_reset(&self, preserve_input: bool) {
         let (ctx_opt, client_id) = {
             let mut inner = lock_service(&self.inner);
-            if let Some(ref mut conn) = inner.ipc_conn {
-                let request = IpcRequest::Reset;
-                let _ = send_request_buf(&mut conn.writer, &request, &mut conn.send_buf);
-                let _ = read_response(&mut conn.reader, &mut conn.resp_buf);
-            }
+            Self::send_engine_reset_locked(&mut inner);
             (inner.context.clone(), inner.client_id)
         };
 
@@ -211,6 +217,26 @@ impl BlackHoleTextService {
         }
 
         self.send_ui_command(UiCommand::HideCandidates);
+    }
+
+    /// 只重置引擎并收起候选窗：**不请求编辑会话**，可在编辑会话（
+    /// `DoEditSession`）内安全调用（自动切换的全部调用点都保证无进行中的
+    /// 合成，结束合成会话本就会是空操作）。
+    fn send_engine_reset(&self) {
+        {
+            let mut inner = lock_service(&self.inner);
+            Self::send_engine_reset_locked(&mut inner);
+        }
+        self.send_ui_command(UiCommand::HideCandidates);
+    }
+
+    /// 向引擎发送 Reset 并读取响应（调用方持有 inner 锁）。
+    fn send_engine_reset_locked(inner: &mut ServiceInner) {
+        if let Some(ref mut conn) = inner.ipc_conn {
+            let request = IpcRequest::Reset;
+            let _ = send_request_buf(&mut conn.writer, &request, &mut conn.send_buf);
+            let _ = read_response(&mut conn.reader, &mut conn.resp_buf);
+        }
     }
 
     /// Check whether an active composition exists.
@@ -279,6 +305,7 @@ impl BlackHoleTextService {
             pic_present,
             is_input_key,
             already_evaluated,
+            inner.auto_switch_no_text,
         );
         drop(inner);
         if decision.refresh_context {
@@ -288,37 +315,38 @@ impl BlackHoleTextService {
     }
 
     /// 采样当前语境建议：手动 Ctrl 切换时作为自动切换状态机的锁定基线。
-    /// 通过同步只读编辑会话读取光标周围文本（TSF 文本存储取不到时按无信号
-    /// 处理，UIA 回退已移除），读取失败或无信号返回 Neutral（Neutral 基线下
-    /// 任一有效建议即视为语境变化，自动解锁恢复自动切换，不会困住手动选择）。
-    fn sample_current_suggestion(&self) -> ModeSuggestion {
+    /// 通过同步只读编辑会话读取光标周围文本（UIA 回退已移除）。
+    /// 返回 `None` = 无法取得有效采样（无聚焦 context / 会话请求失败 / 文本
+    /// 存储不可用），调用方应置位 pending_manual_lock 延迟锁定——锁定
+    /// Neutral 基线没有保护作用（任一有效建议即解锁，手动选择会在首键被
+    /// 自动切换撤销，表现为徽标反复取反）。真实的中立语境（空文档）返回
+    /// Some(Neutral)：该基线有效抑制"中立语境回中文"规则，保护空文档中的
+    /// 手动英文选择。
+    fn sample_current_suggestion(&self) -> Option<ModeSuggestion> {
         let (ctx, client_id) = {
             let inner = lock_service(&self.inner);
-            // remote/锁屏等场景下 GetFocus 为 null、context 未设置：无信号
-            match inner.context.clone() {
-                Some(ctx) => (ctx, inner.client_id),
-                None => return ModeSuggestion::Neutral,
-            }
+            // remote/锁屏等场景下 GetFocus 为 null、context 未设置：无采样
+            (inner.context.clone()?, inner.client_id)
         };
 
-        let suggestion = Arc::new(Mutex::new(ModeSuggestion::Neutral));
+        let suggestion = Arc::new(Mutex::new(None));
         let session = SuggestionReadSession {
             inner_arc: self.inner.clone(),
             suggestion: suggestion.clone(),
         };
         let edit_session: ITfEditSession = session.into();
-        // 只读同步会话；请求失败（文档不可用等）视为无信号
+        // 只读同步会话；请求失败（文档不可用等）视为无采样
         let hr =
             unsafe { ctx.RequestEditSession(client_id, &edit_session, TF_ES_SYNC | TF_ES_READ) };
         if let Err(e) = hr {
             debug!("suggestion-read edit session request failed: {}", e);
-            return ModeSuggestion::Neutral;
+            return None;
         }
         *locked(&suggestion)
     }
 
-    /// 中英文模式切换后的收尾工作：结束进行中的 composition、
-    /// 重置引擎状态、同步系统输入法状态并刷新语言栏图标。
+    /// 中英文模式切换后的收尾工作（**手动切换**路径）：结束进行中的
+    /// composition、重置引擎状态、同步系统输入法状态并刷新语言栏图标。
     /// 切换到英文模式时保留输入框中的内容（上屏），切回中文时清空取消。
     fn on_input_mode_toggled(&self, english: bool) {
         info!(
@@ -327,6 +355,25 @@ impl BlackHoleTextService {
         );
         // 结束未完成的输入并重置引擎：切英文时保留输入框内容，切中文时取消。
         self.send_reset(english);
+        self.finish_mode_toggle(english);
+    }
+
+    /// 中英文模式切换后的收尾工作（**自动切换**路径）：与手动切换相同，
+    /// 但**不请求编辑会话**。
+    ///
+    /// 自动切换的全部调用点（中→英按键评估、英→中按键评估、聚焦评估）都在
+    /// `no_active_composition` 门控下执行，`send_reset` 里的 Commit/Cancel
+    /// 会话在 `composition == None` 时本就是空操作；而其中两处直接在编辑
+    /// 会话（`DoEditSession`）内执行，此时请求同步编辑会话是 TSF 的禁忌
+    /// （`TF_E_SYNCHRONOUS`，个别宿主有卡住风险）。只重置引擎即可。
+    fn on_auto_mode_toggled(&self, english: bool) {
+        // 切换日志由调用方（apply_auto_mode_toggle）统一记录，避免重复两行
+        self.send_engine_reset();
+        self.finish_mode_toggle(english);
+    }
+
+    /// 模式切换收尾的公共部分：同步 compartment、刷新语言栏图标。
+    fn finish_mode_toggle(&self, english: bool) {
         // 写入系统键盘 compartment，供其它应用感知当前输入法状态。
         self.sync_input_mode_compartments(english);
         let sink = {
@@ -404,13 +451,18 @@ pub(crate) fn sync_settings_from_daemon_inner(inner_arc: &Arc<Mutex<ServiceInner
     inner.current_scheme = scheme_id;
     inner.current_theme = theme;
     inner.auto_switch = auto_switch;
+    if !auto_switch {
+        // 关闭自动切换后没有评估点会消费延迟手动锁定，残留会在下次开启时
+        // 被误当成"新切换的基线"（见字段文档），随开关一起清掉
+        inner.pending_manual_lock = false;
+    }
     info!(
         "Synced settings from daemon: scheme={:?}, theme={:?}, auto_switch={}",
         scheme_id, theme, auto_switch
     );
 }
 
-/// 各路径（钩子/语言栏/Ctrl 释放/自动切换）共用的模式切换收尾：
+/// 各路径（钩子/语言栏/Ctrl 释放）共用的模式切换收尾：
 /// 结束合成、重置引擎、同步 compartment、刷新语言栏图标。调用方须随后
 /// 依次发送 SetInputMode* 上报模式并显式 Show 徽标（顺序先字样后 Show，
 /// 使 Show 触发的重绘必然呈现新字样）——切换实例必然持有输入焦点，Show
@@ -419,6 +471,14 @@ pub(crate) fn sync_settings_from_daemon_inner(inner_arc: &Arc<Mutex<ServiceInner
 pub(crate) fn apply_input_mode_toggle(inner: &Arc<Mutex<ServiceInner>>, english: bool) {
     let svc = BlackHoleTextService::new_for_sink(inner.clone());
     svc.on_input_mode_toggled(english);
+}
+
+/// 自动切换专用的模式切换收尾：语义同上，但**不请求编辑会话**（自动切换的
+/// 调用点都在编辑会话内或已保证无进行中的合成，见 [`BlackHoleTextService::
+/// on_auto_mode_toggled`]）。
+pub(crate) fn apply_auto_input_mode_toggle(inner: &Arc<Mutex<ServiceInner>>, english: bool) {
+    let svc = BlackHoleTextService::new_for_sink(inner.clone());
+    svc.on_auto_mode_toggled(english);
 }
 
 /// 获取徽标 Show 所需的光标上下文：取得到前台系统光标时携带位置；
@@ -578,6 +638,9 @@ impl BlackHoleTextService_Impl {
         });
         self.disconnect_ipc();
         unregister_service(unsafe { GetCurrentThreadId() });
+        // 停用的实例不再持有键盘焦点，移除本线程的焦点记录，避免钩子路径
+        // 把已注销的实例当作切换目标
+        clear_foreground_thread(unsafe { GetCurrentThreadId() });
         let mut inner = lock_service(&self.inner);
         inner.context = None;
         inner.thread_mgr = None;
@@ -632,6 +695,7 @@ impl ITfKeyEventSink_Impl for BlackHoleTextService_Impl {
 
 impl BlackHoleTextService_Impl {
     fn on_set_focus_body(&self, fforeground: BOOL) -> Result<()> {
+        let foreground = fforeground.as_bool();
         {
             let mut inner = lock_service(&self.inner);
             inner.last_caret_pos = None;
@@ -639,17 +703,18 @@ impl BlackHoleTextService_Impl {
         }
         // 记录 TSF 输入焦点：WebView2 等多进程应用的 IME 承载进程与宿主窗口
         // 进程不同，GetForegroundWindow 不可靠，钩子依赖此处的焦点状态判定前台。
-        if fforeground.as_bool() {
+        // 钩子路径的切换目标据此选择（见 hook.rs 的 pick_toggle_target）。
+        if foreground {
             set_foreground_thread(unsafe { GetCurrentThreadId() });
-            // 获得焦点时从 daemon 同步全局中英模式：管理员/普通进程
-            // 各自持有本地状态，切换进程时以此保持一致。始终应用 daemon
-            // 当前模式（含英文）：英文模式下自动切换已由 OnTestKeyDown
-            // 补设 context 后正常触发，无需以"连接默认中文"跳过。
+            // 获得焦点时从 daemon 同步方案/主题/自动切换开关。中英模式不在
+            // 拉取范围：模式权威是实例本地 mode_switch（见
+            // sync_settings_from_daemon_inner 的文档），聚焦不回写模式。
             self.sync_settings_from_daemon();
         } else {
-            clear_foreground_thread();
-        }
-        if !fforeground.as_bool() {
+            // 只移除本线程的记录：进程级状态被别的实例抹掉会让钩子路径退回
+            // 近似选择（前台窗口线程/唯一实例），可能与 TSF 按键路径选中
+            // 不同实例——同一次 Ctrl 被两个实例各切一次
+            clear_foreground_thread(unsafe { GetCurrentThreadId() });
             self.send_reset(false);
         }
         Ok(())
@@ -670,23 +735,19 @@ impl BlackHoleTextService_Impl {
             unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0
         );
 
-        // Ctrl 键：标记切换候选（TSF 路径；与全局钩子共用状态机，
-        // 防双切由 OnTestKeyUp 中的 hook_toggled 标志协调）。
+        // Ctrl 键：标记切换候选（进程级手势，与全局钩子路径共享，
+        // 一次手势在进程内只可能被一条路径消费——见 CTRL_GESTURE_PENDING）。
         // 永远不拦截 Ctrl 本身，保证 Ctrl+C 等组合键正常工作。
         if is_ctrl_key(vk) {
+            gesture_ctrl_pressed();
             let mut inner = lock_service(&self.inner);
-            // 新一轮 Ctrl 按下：重置抑制标志，避免上次残留（如钩子切换后
-            // 本路径从未收到 keyup）抑制本次合法切换。
-            inner.hook_toggled = false;
-            inner.mode_switch.ctrl_pressed();
             inner.last_key_event = None;
             return Ok(BOOL(0));
         }
 
         // 按住 Ctrl 期间按下其他键（如 Ctrl+C、Ctrl+Shift），取消切换候选。
         if unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0 {
-            let mut inner = lock_service(&self.inner);
-            inner.mode_switch.other_key_pressed(true);
+            gesture_other_key_pressed(true);
         }
 
         // 英文模式下不拦截任何按键；若开启"根据光标周围文本自动切换"，
@@ -818,41 +879,59 @@ impl BlackHoleTextService_Impl {
             unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0
         );
 
-        // Ctrl 松开：若全局钩子已抢先完成切换（hook_toggled=true）则跳过，
-        // 避免与钩子路径重复切换；否则由 TSF 路径执行切换。
-        // - Chrome 等不把修饰键事件转发给 TSF 的应用收不到此回调，由钩子切换；
+        // Ctrl 松开：消费进程级切换手势。与全局钩子路径（hook.rs
+        // on_ctrl_released）共享同一份 pending——无论回调派发顺序与命中
+        // 实例如何，同一次物理 Ctrl 只有一个路径拿到 true，杜绝双重切换。
+        // - Chrome 等不把修饰键事件转发给 TSF 的应用收不到此回调，由钩子消费；
         // - 设置面板等钩子回调不可靠（安装线程无消息循环）的应用走本路径。
         if is_ctrl_key(vk) {
-            let toggled = {
-                let mut inner = lock_service(&self.inner);
-                if inner.hook_toggled {
-                    inner.hook_toggled = false;
-                    None
-                } else {
-                    inner.mode_switch.ctrl_released()
-                }
-            };
-            if let Some(english) = toggled {
-                // 用户手动切换：即时采样当前语境建议作为锁定基线，
-                // 同语境的自动建议不再撤销本次选择（陈旧基线会导致
-                // 下个按键即被自动切换撤销，故必须即时采样）
-                let suggestion = self.sample_current_suggestion();
-                lock_service(&self.inner).auto_mode.lock_manual(suggestion);
-                self.on_input_mode_toggled(english);
-                // 上报 daemon 持久化并更新全局状态，供其它进程同步
-                self.send_ui_command(UiCommand::SetInputMode(english));
-                // 必须与钩子/语言栏路径一样显式 Show 徽标：徽标显隐只由
-                // Show/Hide 驱动，本路径（钩子未抢先完成切换时使用，如设置面板等
-                // 无消息循环、钩子回调不可靠的宿主）漏发 Show 会让切换中英时
-                // 徽标不出现。同一焦点会话内重显，取不到实时光标时沿用 UI 已记录
-                // 的位置（invalidate_caret=false）
-                let context = caret_context_for_show();
-                self.send_ui_command(UiCommand::ShowModeIndicator {
-                    context,
-                    invalidate_caret: false,
-                    english: Some(english),
-                });
+            if !gesture_consume_release() {
+                return Ok(BOOL(0));
             }
+            // 手势首次被本路径消费：翻转本实例的模式并走切换收尾。
+            // 翻转目标值本身即新模式：set_english 的返回值只表示"是否发生
+            // 变化"，不能当作模式值使用（误用 is_some 会恒报英文）
+            let english = {
+                let mut inner = lock_service(&self.inner);
+                let english = !inner.mode_switch.is_english();
+                inner.mode_switch.set_english(english);
+                english
+            };
+            // 用户手动切换：即时采样当前语境建议作为锁定基线，
+            // 同语境的自动建议不再撤销本次选择（陈旧基线会导致
+            // 下个按键即被自动切换撤销，故必须即时采样）。
+            // 采样不可得（无文本存储/会话失败）时不锁定 Neutral——
+            // 该基线在任一有效建议下立即解锁、无保护作用（首键即被
+            // 自动切换撤销，徽标反复取反）；改为延迟锁定（同钩子
+            // 路径语义），下个实时采样点以新鲜建议锁定基线。
+            match self.sample_current_suggestion() {
+                Some(suggestion) => {
+                    lock_service(&self.inner).auto_mode.lock_manual(suggestion);
+                }
+                None => {
+                    info!("manual toggle: no valid context sample, deferring manual lock");
+                    // 仅在自动切换开启时置位：关闭时没有评估点消费它，
+                    // 残留会在下次开启后被误当成新切换的基线
+                    let mut inner = lock_service(&self.inner);
+                    if inner.auto_switch {
+                        inner.pending_manual_lock = true;
+                    }
+                }
+            }
+            self.on_input_mode_toggled(english);
+            // 上报 daemon 持久化并更新全局状态，供其它进程同步
+            self.send_ui_command(UiCommand::SetInputMode(english));
+            // 必须与钩子/语言栏路径一样显式 Show 徽标：徽标显隐只由
+            // Show/Hide 驱动，本路径（钩子未抢先完成切换时使用，如设置面板等
+            // 无消息循环、钩子回调不可靠的宿主）漏发 Show 会让切换中英时
+            // 徽标不出现。同一焦点会话内重显，取不到实时光标时沿用 UI 已记录
+            // 的位置（invalidate_caret=false）
+            let context = caret_context_for_show();
+            self.send_ui_command(UiCommand::ShowModeIndicator {
+                context,
+                invalidate_caret: false,
+                english: Some(english),
+            });
         }
         Ok(BOOL(0))
     }
@@ -1155,6 +1234,9 @@ impl ITfThreadMgrEventSink_Impl for BlackHoleTextService_Impl {
                     let client_id = {
                         let mut inner = lock_service(&self.inner);
                         inner.context = Some(new_ctx.clone());
+                        // 焦点进入新文档：复位"应用不可读"粘性标记，新应用
+                        // 重新探测（聚焦评估/首键评估各一次，读不出则再次置位）
+                        inner.auto_switch_no_text = false;
                         inner.client_id
                     };
                     self.readvise_layout_sink(&new_ctx);
@@ -1195,20 +1277,51 @@ impl ITfThreadMgrEventSink_Impl for BlackHoleTextService_Impl {
                 // 在焦点通知中有死锁风险，见下方注释），会话排队后由应用在
                 // 空闲时授予读锁执行。在 Show 之后发起，保证 UpdatePosition
                 // 不会先于 Show 到达 UI（否则会被 invalidate_caret 作废）。
-                // 取到位置的应用（有系统 caret）无需此会话
-                if need_caret_session && let Some((new_ctx, client_id)) = focused_ctx {
-                    let session = LayoutChangeEditSession {
-                        inner_arc: self.inner.clone(),
-                        context: new_ctx.clone(),
-                    };
-                    let edit_session: ITfEditSession = session.into();
-                    let _ = unsafe {
-                        new_ctx.RequestEditSession(
-                            client_id,
-                            &edit_session,
-                            TF_ES_ASYNC | TF_ES_READ,
-                        )
-                    };
+                // 两个异步只读会话共用聚焦 context（所有权先取出，各自克隆），
+                // 均在 Show 之后发起：评估命中时的收尾 Show、光标补报的
+                // UpdatePosition 都不会先于聚焦 Show 到达 UI
+                if let Some((new_ctx, client_id)) = focused_ctx {
+                    // 聚焦时自动切换评估：开启"根据光标周围文本自动切换"时
+                    // 请求一次异步评估，把"首键才按语境纠正模式"提前到进入
+                    // 编辑器时，消除"进入时徽标显示英文、首键才切回中文"的
+                    // 窗口期。评估规则/门控与首键完全一致（会话内实现）；
+                    // 语境未知的应用（无文本存储/虚拟化编辑器）由会话内
+                    // context_known 门控跳过
+                    // 先读取开关并立即释放 inner 锁：guard 若作为 if 条件的
+                    // 临时值，其生命周期会延长到整条 if 语句——持锁跨越下面
+                    // 的 RequestEditSession（COM 调用），阻塞竞争 ServiceInner
+                    // 的键盘钩子/语言栏/daemon IPC 路径（同文件会话路径均
+                    // 遵守"COM 调用期间不持有 inner 锁"的纪律）。
+                    let auto_switch = lock_service(&self.inner).auto_switch;
+                    if auto_switch {
+                        let session = FocusAutoSwitchSession {
+                            inner_arc: self.inner.clone(),
+                            context: new_ctx.clone(),
+                        };
+                        let edit_session: ITfEditSession = session.into();
+                        let _ = unsafe {
+                            new_ctx.RequestEditSession(
+                                client_id,
+                                &edit_session,
+                                TF_ES_ASYNC | TF_ES_READ,
+                            )
+                        };
+                    }
+                    // 光标补报（有系统 caret 的应用无需此会话）
+                    if need_caret_session {
+                        let session = LayoutChangeEditSession {
+                            inner_arc: self.inner.clone(),
+                            context: new_ctx.clone(),
+                        };
+                        let edit_session: ITfEditSession = session.into();
+                        let _ = unsafe {
+                            new_ctx.RequestEditSession(
+                                client_id,
+                                &edit_session,
+                                TF_ES_ASYNC | TF_ES_READ,
+                            )
+                        };
+                    }
                 }
             } else {
                 // 无焦点文档：隐藏并作废光标位置（焦点已失效）
@@ -1404,6 +1517,7 @@ mod tests {
             true,  // pic_present
             true,  // is_input_key
             false, // already_evaluated
+            false, // context_unreadable
         );
         assert!(d.refresh_context, "pic 非空应刷新 context");
         assert!(d.evaluate, "全门控满足应触发评估");
@@ -1421,12 +1535,13 @@ mod tests {
             false, // pic_present（空 pic）
             true,  // is_input_key
             false, // already_evaluated
+            false, // context_unreadable
         );
         assert!(!d.refresh_context, "空 pic 应保留既有 context，不刷新");
         assert!(d.evaluate, "空 pic 但既有 context 可用时仍应评估");
 
         // 空 pic 且无既有 context：无法评估
-        let d2 = decide_english_auto_switch(true, false, false, false, true, false);
+        let d2 = decide_english_auto_switch(true, false, false, false, true, false, false);
         assert!(!d2.evaluate, "空 pic 且无既有 context 时不得评估");
     }
 
@@ -1434,13 +1549,13 @@ mod tests {
     fn decide_english_auto_switch_dedup_window_suppresses_reeval() {
         // 场景三：同一按键已在 OnTestKeyDown 评估过（去重窗口内）→
         // OnKeyDown 收到同键不得重复评估
-        let d = decide_english_auto_switch(true, false, true, true, true, true);
+        let d = decide_english_auto_switch(true, false, true, true, true, true, false);
         assert!(!d.evaluate, "去重窗口内已评估的按键不得重复评估");
         // 仍应刷新 context（与 evaluate 解耦）
         assert!(d.refresh_context, "去重只抑制评估，不影响 context 刷新");
 
         // 去重窗口外（already_evaluated=false）恢复评估
-        let d2 = decide_english_auto_switch(true, false, true, true, true, false);
+        let d2 = decide_english_auto_switch(true, false, true, true, true, false, false);
         assert!(d2.evaluate, "去重窗口外应恢复评估");
     }
 
@@ -1449,16 +1564,20 @@ mod tests {
         // 门控各条件单独不满足时均不评估：
         // 开关关闭 / 合成中 / 非字符输入键
         assert!(
-            !decide_english_auto_switch(false, false, true, true, true, false).evaluate,
+            !decide_english_auto_switch(false, false, true, true, true, false, false).evaluate,
             "开关关闭不评估"
         );
         assert!(
-            !decide_english_auto_switch(true, true, true, true, true, false).evaluate,
+            !decide_english_auto_switch(true, true, true, true, true, false, false).evaluate,
             "合成中不评估"
         );
         assert!(
-            !decide_english_auto_switch(true, false, true, true, false, false).evaluate,
+            !decide_english_auto_switch(true, false, true, true, false, false, false).evaluate,
             "非字符输入键不评估"
+        );
+        assert!(
+            !decide_english_auto_switch(true, false, true, true, true, false, true).evaluate,
+            "应用无法取得周围文本（VSCode/Zed 类）不评估——禁用自动切换"
         );
     }
 }

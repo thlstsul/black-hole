@@ -29,7 +29,13 @@ const MAX_FOLLOWING_CHARS: i32 = 16;
 /// - 前文：克隆光标 range，用 `ShiftStart` 把起点向前扩展后 `GetText`；
 /// - 后文：克隆光标 range，用 `ShiftEnd` 把终点向后扩展后 `GetText`。
 ///
-/// 读取失败或无可读内容时对应项为 None。
+/// 读取失败或无可读内容时对应项为 None。第三项 = 语境建议是否可信：
+/// 读到真实文本，或两个方向的位移都到达文档边界**且文本存储确认该处为空**
+/// （见 [`store_confirms_empty`]）。`false` = 语境未知（无选区 / 克隆折叠
+/// 失败 / 内容存在但读不出——虚拟化编辑器选区正常但 GetText 为空 / 位移
+/// 失败 / 边界到位但存储无法读取空 range）：自动切换评估与手动锁定基线采样
+/// 必须跳过，不得把"读不到"当"真空文档"处理，否则中立回中文规则会撤销用户
+/// 的手动选择（徽标取反）。
 pub(crate) fn read_surrounding_text(
     ec: u32,
     ctx: &ITfContext,
@@ -53,20 +59,16 @@ pub(crate) fn read_surrounding_text(
             composition.and_then(|c| unsafe { c.GetRange() }.ok())
         }
     };
-    // 存储可用性：GetSelection 成功或存在可用的合成 range。消费方据此跳过
-    // "中立语境回中文"评估（见 AutoSwitchEditSession：无文本存储的应用每键
-    // 评估只会得到无信号建议，会强制切回英文模式）。
-    let store_available = caret_range.is_some();
     let Some(range) = caret_range else {
         return (None, None, false);
     };
 
-    // 折叠到起点（光标位置）
+    // 折叠到起点（光标位置）；克隆/折叠失败 = 无法探测语境（未知）
     let Ok(caret) = (unsafe { range.Clone() }) else {
-        return (None, None, store_available);
+        return (None, None, false);
     };
     if unsafe { caret.Collapse(ec, TF_ANCHOR_START) }.is_err() {
-        return (None, None, store_available);
+        return (None, None, false);
     }
 
     // 合成串 range：合成中合成串是文档流的一部分，取上下文时必须排除"正在输入的字母"
@@ -91,14 +93,16 @@ pub(crate) fn read_surrounding_text(
     };
 
     // 前文：起点向前扩展 MAX_PRECEDING_CHARS 字符
-    let preceding = {
+    let (preceding, back_probe) = {
         let mut text = String::new();
+        let mut probe = ShiftProbe::Failed;
         if let Ok(r) = unsafe { caret.Clone() } {
             let mut shifted = 0i32;
-            let ok = unsafe { r.ShiftStart(ec, -MAX_PRECEDING_CHARS, &mut shifted, null()) }
-                .is_ok()
-                && shifted != 0;
-            if ok {
+            probe = ShiftProbe::classify(
+                unsafe { r.ShiftStart(ec, -MAX_PRECEDING_CHARS, &mut shifted, null()) },
+                shifted,
+            );
+            if probe == ShiftProbe::Moved {
                 // 光标落在合成串内/末尾时，前文会混入正在输入的字母，
                 // 把终点收回到合成串起点，只取真实前文。
                 if caret_side >= 0
@@ -109,17 +113,20 @@ pub(crate) fn read_surrounding_text(
                 text = read_range_text(ec, &r);
             }
         }
-        (!text.is_empty()).then_some(text)
+        ((!text.is_empty()).then_some(text), probe)
     };
 
     // 后文：终点向后扩展 MAX_FOLLOWING_CHARS 字符
-    let following = {
+    let (following, fwd_probe) = {
         let mut text = String::new();
+        let mut probe = ShiftProbe::Failed;
         if let Ok(r) = unsafe { caret.Clone() } {
             let mut shifted = 0i32;
-            let ok = unsafe { r.ShiftEnd(ec, MAX_FOLLOWING_CHARS, &mut shifted, null()) }.is_ok()
-                && shifted != 0;
-            if ok {
+            probe = ShiftProbe::classify(
+                unsafe { r.ShiftEnd(ec, MAX_FOLLOWING_CHARS, &mut shifted, null()) },
+                shifted,
+            );
+            if probe == ShiftProbe::Moved {
                 // 光标落在合成串内/起点时，后文会混入正在输入的字母，
                 // 把起点移到合成串末尾，只取真实后文。
                 if caret_side == 0
@@ -130,10 +137,70 @@ pub(crate) fn read_surrounding_text(
                 text = read_range_text(ec, &r);
             }
         }
-        (!text.is_empty()).then_some(text)
+        ((!text.is_empty()).then_some(text), probe)
     };
 
-    (preceding, following, store_available)
+    // 语境可判性：读到真实文本，或两方向位移都证实到达文档边界**且**文本
+    // 存储确认该处确实为空；其余（内容存在但读不出、探测失败、存储异常）
+    // 视为语境未知，消费方据此跳过评估/基线锁定
+    let both_boundary = back_probe == ShiftProbe::AtBoundary && fwd_probe == ShiftProbe::AtBoundary;
+    let confirmed_empty = both_boundary && store_confirms_empty(ec, &caret);
+    let known = context_known(
+        preceding.is_some() || following.is_some(),
+        back_probe,
+        fwd_probe,
+        confirmed_empty,
+    );
+    if !known && both_boundary {
+        // 位移都到位但存储不确认（读不出）：典型虚拟化编辑器，记录下来便于
+        // 现场区分"真空白文档"与"读不到"
+        debug!("surrounding text: probes report boundaries but store does not confirm empty");
+    }
+    (preceding, following, known)
+}
+
+/// 空文档判定的存储确认：在 0 长度 range 上读取一次文本，只有返回成功且
+/// 长度 0 才认为存储"能读且此处为空"。
+///
+/// 仅凭 `ShiftStart/ShiftEnd` 的零位移判定"真空文档"不够：部分虚拟化/有
+/// 缺陷的存储对不可读区域同样返回成功 + 零位移，会把"读不到"误判为空文档，
+/// 届时"中立语境回中文"规则会在英文模式下撤销用户的手动选择。
+fn store_confirms_empty(ec: u32, range: &ITfRange) -> bool {
+    let mut buf = [0u16; 1];
+    let mut len = buf.len() as u32;
+    unsafe { range.GetText(ec, 0, &mut buf, &mut len as *mut _) }.is_ok() && len == 0
+}
+
+/// 单方向位移探测结果（[`read_surrounding_text`] 用于判定语境可判性）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ShiftProbe {
+    /// 位移非零：该方向存在内容（或至少存在可移动的范围）
+    Moved,
+    /// 位移为零：已到达文档边界，该方向证实无内容
+    AtBoundary,
+    /// 位移调用失败：无法探测（虚拟化文本存储常见）
+    Failed,
+}
+
+impl ShiftProbe {
+    /// 位移结果分类：Ok 且位移非零 = 存在内容；Ok 但位移为零 = 证实到达
+    /// 文档边界；Err = 探测失败。
+    fn classify(result: Result<()>, shifted: i32) -> Self {
+        match result {
+            Ok(_) if shifted != 0 => ShiftProbe::Moved,
+            Ok(_) => ShiftProbe::AtBoundary,
+            Err(_) => ShiftProbe::Failed,
+        }
+    }
+}
+
+/// 语境可判性判定（纯函数，便于单测）：读到真实文本，或两个方向都到达文档
+/// 边界**且存储确认该处为空**时，Neutral 建议才可信；其余（内容存在但读不出、
+/// 探测失败、存储无法读取空 range）一律视为语境未知——自动切换评估与手动
+/// 锁定基线都不得使用，否则"读不到"会被当成"真空文档"，中立回中文规则会
+/// 撤销用户的手动选择（徽标取反）。
+fn context_known(read_ok: bool, back: ShiftProbe, fwd: ShiftProbe, confirmed_empty: bool) -> bool {
+    read_ok || (confirmed_empty && back == ShiftProbe::AtBoundary && fwd == ShiftProbe::AtBoundary)
 }
 
 /// 读取 range 内纯文本（UTF-16 → String）
@@ -369,14 +436,13 @@ impl ITfEditSession_Impl for LayoutChangeEditSession_Impl {
         let comp = {
             let inner = lock_service(&self.inner_arc);
             // 会话排队/执行期间焦点可能已切换（异步会话从 OnSetFocus 发起，
-            // 排队窗口更长）：context 已被覆写说明本次坐标属于旧窗口，
-            // 直接丢弃，不向 UI 发送过期坐标
-            if inner
-                .context
-                .as_ref()
-                .is_some_and(|c| c.as_raw() != ctx.as_raw())
-            {
-                return Ok(());
+            // 排队窗口更长）：context 不再等于会话携带的 context（含 None：
+            // OnPopContext 清空且不 bump context_version，版本号检查拦不住）
+            // 说明本次坐标属于旧窗口/已失焦文档，直接丢弃，不向 UI 发送
+            // 过期坐标
+            match &inner.context {
+                Some(c) if c.as_raw() == ctx.as_raw() => (),
+                _ => return Ok(()),
             }
             inner.composition.as_ref().cloned()
         };
@@ -392,5 +458,68 @@ impl ITfEditSession_Impl for LayoutChangeEditSession_Impl {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_known_requires_text_or_confirmed_empty_document() {
+        // 读到真实文本：无论探测结果如何都可信（建议由真实文本计算）
+        assert!(context_known(
+            true,
+            ShiftProbe::Failed,
+            ShiftProbe::Failed,
+            false
+        ));
+        assert!(context_known(
+            true,
+            ShiftProbe::Moved,
+            ShiftProbe::Moved,
+            false
+        ));
+        // 两方向都到达边界且存储确认该处为空：真空文档，Neutral 可信
+        assert!(context_known(
+            false,
+            ShiftProbe::AtBoundary,
+            ShiftProbe::AtBoundary,
+            true
+        ));
+        // 两方向都到达边界但存储不确认（读不出）：不可知——仅凭零位移会把
+        // "读不到"误判为空文档，英文模式下手动选择会被"中立回中文"撤销
+        assert!(!context_known(
+            false,
+            ShiftProbe::AtBoundary,
+            ShiftProbe::AtBoundary,
+            false
+        ));
+        // 单方向边界、另一方向失败：对侧内容可能存在但读不出，不可知
+        assert!(!context_known(
+            false,
+            ShiftProbe::AtBoundary,
+            ShiftProbe::Failed,
+            true
+        ));
+        assert!(!context_known(
+            false,
+            ShiftProbe::Failed,
+            ShiftProbe::AtBoundary,
+            true
+        ));
+        // 两方向都探测失败 / 有位移但读不出文本（虚拟化编辑器）：不可知
+        assert!(!context_known(
+            false,
+            ShiftProbe::Failed,
+            ShiftProbe::Failed,
+            true
+        ));
+        assert!(!context_known(
+            false,
+            ShiftProbe::Moved,
+            ShiftProbe::AtBoundary,
+            true
+        ));
     }
 }

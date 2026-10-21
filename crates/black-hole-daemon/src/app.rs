@@ -29,6 +29,7 @@ use std::fs;
 use std::io;
 use std::mem::discriminant;
 use std::panic::{AssertUnwindSafe, catch_unwind, set_hook, take_hook};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -302,19 +303,79 @@ impl App {
     /// 初始化 tracing 日志系统
     ///
     /// 返回的 guard 必须被持有，否则非阻塞文件 appender 会被提前刷新关闭。
+    ///
+    /// 日志文件不可创建**不得**让守护进程启动失败：受限环境（受限令牌/
+    /// 沙箱/只读临时目录）下 `%TEMP%` 可能不可写，此时降级为"仅标准输出"
+    /// 并继续运行——日志是运维辅助，输入法本体不能因此起不来。
     fn init_tracing() -> WorkerGuard {
-        let log_dir = env::temp_dir();
-        let file_appender = rolling::never(log_dir, "black-hole-daemon.log");
-        let (non_blocking, guard) = non_blocking(file_appender);
+        let (file_writer, guard, log_path) = match Self::open_log_file() {
+            Some((appender, path)) => {
+                let (writer, guard) = non_blocking(appender);
+                (writer, guard, Some(path))
+            }
+            None => {
+                // 所有候选目录都不可写：不写文件，但保留 stdout 层与 panic hook
+                eprintln!(
+                    "[WARN] 日志文件不可用（临时目录与配置目录均不可写），日志仅输出到标准输出"
+                );
+                let (writer, guard) = non_blocking(io::sink());
+                (writer, guard, None)
+            }
+        };
 
         registry()
             .with(EnvFilter::from_default_env())
             .with(fmt::layer().with_writer(io::stdout))
-            .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
+            .with(fmt::layer().with_writer(file_writer).with_ansi(false))
             .init();
+
+        match log_path {
+            Some(path) => info!("Logging to {}", path.display()),
+            // 用 error 级：默认 EnvFilter（未设 RUST_LOG 时仅 ERROR）下 warning
+            // 会被过滤掉，而降级为"仅标准输出"在 windows_subsystem 构建里
+            // stderr 也不可见——降级本身必须至少在可落盘的级别留痕
+            None => {
+                error!("File logging disabled: neither temp nor config logs directory is writable")
+            }
+        }
 
         Self::install_panic_hook();
         guard
+    }
+
+    /// 以**非 panic** 方式打开日志文件，返回 (appender, 完整路径)。
+    ///
+    /// 依次尝试临时目录（现行位置，便于快速排查）与用户配置目录下的
+    /// `logs`（受限环境下临时目录不可写时的回退，不与 settings.json 混放）；
+    /// 全部失败返回 None，由调用方降级为仅标准输出。`rolling::never` 内部
+    /// 用 `expect` 处理创建失败，受限环境会直接 panic，故改用可返回错误的
+    /// Builder 接口。
+    fn open_log_file() -> Option<(rolling::RollingFileAppender, PathBuf)> {
+        let mut candidates = vec![env::temp_dir()];
+        candidates.push(SettingsManager::config_dir().join("logs"));
+        Self::open_log_file_in(&candidates)
+    }
+
+    /// [`Self::open_log_file`] 的候选目录版本（失败逐个回退，便于单测注入
+    /// 不可写目录）。
+    fn open_log_file_in(candidates: &[PathBuf]) -> Option<(rolling::RollingFileAppender, PathBuf)> {
+        for dir in candidates {
+            if let Err(e) = fs::create_dir_all(dir) {
+                eprintln!("[WARN] 无法创建日志目录 {}: {}", dir.display(), e);
+                continue;
+            }
+            match rolling::RollingFileAppender::builder()
+                .rotation(rolling::Rotation::NEVER)
+                .filename_prefix("black-hole-daemon")
+                .filename_suffix("log")
+                .build(dir)
+            {
+                // Rotation::NEVER + 前缀/后缀 拼出的文件名与 rolling::never 一致
+                Ok(appender) => return Some((appender, dir.join("black-hole-daemon.log"))),
+                Err(e) => eprintln!("[WARN] 无法创建日志文件（目录 {}）: {}", dir.display(), e),
+            }
+        }
+        None
     }
 
     /// 全局 panic hook：panic 信息经 tracing 写入日志文件。
@@ -1034,5 +1095,39 @@ mod tests {
             &Settings::default(),
             "文件不存在应保留默认值（不应用 last_applied）"
         );
+    }
+
+    #[test]
+    fn log_file_skips_unusable_candidates() {
+        // 第一候选是普通文件（无法当目录用）→ 跳过并回退到第二候选；
+        // 这是"临时目录不可写时改用配置目录"的核心行为，若把创建失败
+        // 当致命错误，受限环境（受限令牌/沙箱）下守护进程会直接 panic
+        let unusable = temp_config_path("log-unusable");
+        fs::write(&unusable, "not a directory").unwrap();
+        let fallback_dir = temp_config_path("log-fallback-dir")
+            .parent()
+            .unwrap()
+            .to_path_buf();
+
+        let (appender, path) =
+            App::open_log_file_in(&[unusable, fallback_dir.clone()]).expect("应回退到可写目录");
+        assert_eq!(path, fallback_dir.join("black-hole-daemon.log"));
+        // appender 可写：落一行后文件应真实存在
+        {
+            use std::io::Write as _;
+            let mut writer = appender;
+            writer.write_all(b"probe\n").unwrap();
+        }
+        assert!(path.exists(), "日志文件应已创建");
+    }
+
+    #[test]
+    fn log_file_none_when_all_candidates_unusable() {
+        // 全部候选都不可用：返回 None（调用方降级为仅标准输出），绝不 panic
+        let a = temp_config_path("log-fail-a");
+        fs::write(&a, "x").unwrap();
+        let b = temp_config_path("log-fail-b");
+        fs::write(&b, "x").unwrap();
+        assert!(App::open_log_file_in(&[a, b]).is_none());
     }
 }

@@ -32,8 +32,8 @@ use windows_core::{Error, GUID, Interface, PCWSTR, Result as CoreResult, w};
 
 use super::{PlatformError, PlatformIme};
 use black_hole_shared::{
-    AutoModeSwitch, EngineCommand, InputModeSwitch, KeyEvent, ModeSuggestion, RuntimeSettings,
-    SchemeId, SchemeResult, Theme, UiCommand, panic_payload_text,
+    AutoModeSwitch, EngineCommand, InputModeSwitch, KeyEvent, RuntimeSettings, SchemeId,
+    SchemeResult, Theme, UiCommand, panic_payload_text,
 };
 
 pub mod auto_register;
@@ -196,25 +196,6 @@ pub(crate) struct IpcConnection {
     pub(crate) send_buf: Vec<u8>,
 }
 
-/// 最近一次语境建议采样快照。由三个 TSF 采样点（key_event.rs 的
-/// handle_key_event_internal、auto_switch.rs 的 AutoSwitchEditSession /
-/// SuggestionReadSession）经 [`ServiceInner::record_context_sample`] 统一写入，
-/// 供钩子路径手动切换（hook.rs）作锁定基线。
-#[derive(Clone, Copy, Default)]
-pub(crate) struct ContextSample {
-    /// 语境建议（Neutral=无信号或读取失败）。
-    pub(crate) suggestion: ModeSuggestion,
-    /// 采样时的 TSF 焦点线程 id（FOREGROUND_TID 快照）：多进程应用（WebView2
-    /// 等）中 GetForegroundWindow 不可靠，窗口身份以焦点线程为锚。
-    pub(crate) focus_tid: Option<u32>,
-    /// 采样时的光标位置（last_caret_pos 快照）：光标移动不 bump context_version，
-    /// 钩子路径额外要求缓存位置与当前光标一致。
-    pub(crate) caret_pos: Option<(i32, i32, i32)>,
-    /// 采样时（读取前快照）的 context_version：与当前版本比对判断缓存是否被
-    /// 后续语境变更作废。
-    pub(crate) version: u64,
-}
-
 pub(crate) struct ServiceInner {
     /// IPC connection to the daemon (out-of-process mode).
     pub(crate) ipc_conn: Option<IpcConnection>,
@@ -255,27 +236,34 @@ pub(crate) struct ServiceInner {
     pub(crate) current_scheme: SchemeId,
     /// Current theme tracked by the language bar menu.
     pub(crate) current_theme: Theme,
-    /// 中英文模式切换状态机（Ctrl 键触发，按线程独立维护）。
+    /// 中英文模式切换状态机（模式本体按实例维护；Ctrl 手势的 pending
+    /// 状态是进程级的，见 [`CTRL_GESTURE`]）。
     pub(crate) mode_switch: InputModeSwitch,
-    /// 最近一次 Ctrl 松开是否已由全局键盘钩子完成切换。
-    /// TSF 路径（OnTestKeyUp）看到该标志时跳过，避免与钩子重复切换。
-    pub(crate) hook_toggled: bool,
     /// "根据光标周围文本自动切换中英模式"开关（由 daemon 的 GetSettings 同步，支持热更新）。
     pub(crate) auto_switch: bool,
     /// 自动切换状态机：评估语境建议、维护手动切换锁定的语境基线。
     pub(crate) auto_mode: AutoModeSwitch,
-    /// 语境变更版本：合成开始/结束、焦点切换、Deactivate 时 +1。与
-    /// [`ContextSample::version`] 比对判断采样缓存是否已被后续语境变更作废。
+    /// 语境变更版本：合成开始/结束、焦点切换、Deactivate 时 +1。
     pub(crate) context_version: u64,
-    /// 最近一次语境建议采样快照。钩子路径手动切换无法请求 TSF 编辑会话，
-    /// 仅在焦点线程/光标位置/版本与当前状态一致时以缓存作锁定基线
-    /// （见 hook.rs 的 cached_baseline_usable）。
-    pub(crate) context_sample: ContextSample,
-    /// "延迟手动锁定"标志：钩子路径手动切换（hook.rs on_ctrl_released）因
-    /// 缓存门控失败无法即时 lock_manual 时置位，下个实时语境采样点
-    /// （key_event.rs 中→英评估 / auto_switch.rs 英→中评估）在 evaluate 前
-    /// 以新鲜建议消费该标志锁定基线，保护手动切换不被随后的自动切换撤销。
+    /// "延迟手动锁定"标志：手动 Ctrl 切换（hook.rs on_ctrl_released；TSF
+    /// Ctrl 路径采样失败时同理）无法即时取得可信语境建议时置位，下个实时
+    /// 语境采样点（key_event.rs 中→英评估 / auto_switch.rs 英→中评估与聚焦
+    /// 评估）在 evaluate 前以本次新鲜读取的建议消费该标志锁定基线，保护
+    /// 手动切换不被随后的自动切换撤销。
+    ///
+    /// 仅在自动切换开启时置位（关闭时没有评估点会消费它，残留会在下次开启
+    /// 后被误当成新切换的基线；开关同步路径也会清除残留）。在无文本存储的
+    /// 应用里可能长期挂起，直到同一实例的后续可信采样才消费——届时以那次
+    /// 语境的建议锁定基线，效果只是可能少一次自动纠正，**不会撤销手动选择**，
+    /// 因此不在焦点切换时清除（那会让"切走再切回同一文档"的首键被自动切换
+    /// 拉回，正是本次要修的病症）。
     pub(crate) pending_manual_lock: bool,
+    /// "当前应用无法取得光标周围文本"粘性标记（VSCode/Zed 等虚拟化编辑器、
+    /// 纯 IMM32 无文本存储的应用）。任一自动切换评估路径的语境读取报告
+    /// context_known=false 时置位：本实例内禁用后续自动切换评估——英→中按键
+    /// 路径不再发起每次按键一次的同步只读会话（反复探测注定失败，纯开销），
+    /// 中→英与聚焦评估路径照常跳过。焦点进入新文档时复位，新应用重新探测。
+    pub(crate) auto_switch_no_text: bool,
     /// 英文模式自动切换评估去重：最近一次在 OnTestKeyDown 评估过的按键及时间。
     /// 部分应用（如 WebView2）对同一按键既调 OnTestKeyDown 又调 OnKeyDown，
     /// OnKeyDown 据此在时间窗内跳过重复评估。
@@ -303,33 +291,13 @@ impl ServiceInner {
             current_scheme: SchemeId::Pinyin,
             current_theme: Theme::Light,
             mode_switch: InputModeSwitch::default(),
-            hook_toggled: false,
             auto_switch: false,
             auto_mode: AutoModeSwitch::default(),
             context_version: 0,
-            context_sample: ContextSample::default(),
             pending_manual_lock: false,
+            auto_switch_no_text: false,
             last_eng_eval_key: None,
         }
-    }
-
-    /// 记录一次语境建议采样快照。`version`/`caret_pos` 必须传读取前的快照
-    /// （entry_version / last_caret_pos）：版本盖章必须与采样文本同源——若盖
-    /// 写入时的当前版本，读取窗口内的语境变更会留下"新文本+旧版本"或
-    /// "旧文本+新版本"的错位，钩子路径的版本门控会空真通过或误拒。
-    pub(crate) fn record_context_sample(
-        &mut self,
-        suggestion: ModeSuggestion,
-        focus_tid: Option<u32>,
-        caret_pos: Option<(i32, i32, i32)>,
-        version: u64,
-    ) {
-        self.context_sample = ContextSample {
-            suggestion,
-            focus_tid,
-            caret_pos,
-            version,
-        };
     }
 
     /// 取出布局 sink 配对，不做 COM 调用。
@@ -360,6 +328,61 @@ pub(crate) fn unadvise_sink_pair(pair: Option<(ITfContext, u32)>) {
     {
         let _ = unsafe { source.UnadviseSink(cookie) };
     }
+}
+
+/// 是否无有效合成（None 或 GetRange 已失效的死合成）。各自动切换评估点
+/// 共用（key_event.rs 中→英 / auto_switch.rs 英→中与聚焦评估）：合成进行中
+/// 不做语境评估，避免把正在输入的拼音字母当作文档文本。
+pub(crate) fn no_active_composition(composition: &Option<ITfComposition>) -> bool {
+    match composition {
+        None => true,
+        Some(c) => unsafe { c.GetRange().is_err() },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 进程级 Ctrl 切换手势状态
+// ---------------------------------------------------------------------------
+
+/// "按下 Ctrl 标记候选、松开单独 Ctrl 切换"手势的 pending 状态，**进程级
+/// 共享**（钩子路径与 TSF 按键路径消费同一份）。
+///
+/// 为什么必须进程级：一次物理 Ctrl 手势属于键盘而非任何单个实例，但本进程
+/// 内可能同时存在多个活跃实例（多线程宿主、重复 Activate 残留），且钩子路径
+/// 与 TSF 按键路径可能命中**不同**的实例——若 pending 状态挂在实例上
+/// （原 `InputModeSwitch.ctrl_pending` + `hook_toggled` 标志），两条路径会各
+/// 自翻转各自实例的模式（同一次 Ctrl 双重切换），相位错开的两实例随后上报
+/// 相反的模式，daemon "最后 Show 胜出"的徽标仲裁就会呈现非聚焦实例的字样
+/// （徽标显示反了）。改为进程级后，同一次手势在进程内**恰好被消费一次**，
+/// 只有赢家的实例翻转并上报。
+static CTRL_GESTURE_PENDING: Mutex<bool> = Mutex::new(false);
+
+/// 标记 Ctrl 切换手势候选（按下 Ctrl；自动重复的按下是幂等的）。
+pub(crate) fn gesture_ctrl_pressed() {
+    if let Ok(mut pending) = CTRL_GESTURE_PENDING.lock() {
+        *pending = true;
+    }
+}
+
+/// 按住 Ctrl 期间按下其他键（Ctrl+C、Ctrl+Shift 等）：取消切换候选。
+pub(crate) fn gesture_other_key_pressed(ctrl_held: bool) {
+    if ctrl_held && let Ok(mut pending) = CTRL_GESTURE_PENDING.lock() {
+        *pending = false;
+    }
+}
+
+/// 消费 Ctrl 松开手势：返回 `true` 表示本次松开对应一次完整的
+/// "单独按下→松开"手势且**首次**被消费；调用方据此翻转自身实例的模式。
+/// 并发路径（钩子线程 / 聚焦实例的 TSF 线程）只有一个能拿到 `true`。
+pub(crate) fn gesture_consume_release() -> bool {
+    CTRL_GESTURE_PENDING
+        .lock()
+        .map(|mut pending| {
+            let armed = *pending;
+            *pending = false;
+            armed
+        })
+        .unwrap_or(false)
 }
 
 // TSF COM server runs in a single-threaded apartment (STA); all fields are

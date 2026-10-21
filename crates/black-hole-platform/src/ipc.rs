@@ -87,7 +87,12 @@ pub enum IpcResponse {
     Settings {
         scheme_id: SchemeId,
         theme: Theme,
-        /// 全局中英文输入模式：true=英文，false=中文
+        /// 全局中英文输入模式：true=英文，false=中文。
+        ///
+        /// 新版本 TSF 实例**不再消费**该字段（中英模式权威是聚焦实例本地的
+        /// `mode_switch`，聚焦/切换时由实例上报给 daemon）。字段保留只为
+        /// 滚动升级兼容：没有 `#[serde(default)]`，删掉会让旧版 DLL 反序列化
+        /// 失败（`read_response` 报错→丢键）。
         english: bool,
         /// 是否启用"根据光标周围文本自动切换中英模式"
         #[serde(default)]

@@ -165,6 +165,19 @@ impl BlackHoleLangBarItem {
             inner.mode_switch.set_english(next)
         };
         if let Some(english) = toggled {
+            // 用户手动切换：语言栏线程不能安全请求同步编辑会话采样语境
+            // （编辑会话须由应用 UI 线程授予文档锁），与钩子路径同款走
+            // 延迟锁定：置位后下个实时采样点（按键/聚焦评估）以新鲜建议
+            // 锁定基线，抑制同语境的自动建议。不锁定则本次手动选择会在
+            // 首键被自动切换撤销，徽标反复取反。
+            // 仅在自动切换开启时置位：关闭时没有评估点消费它，残留会在
+            // 下次开启后被误当成新切换的基线。
+            {
+                let mut inner = lock_service(&self.inner);
+                if inner.auto_switch {
+                    inner.pending_manual_lock = true;
+                }
+            }
             apply_input_mode_toggle(&self.inner, english);
             // 上报 daemon 持久化并更新全局状态，供其它进程（管理员/普通）同步；
             // 随后显式 Show 徽标（携带本实例焦点光标）：先字样后 Show，

@@ -3,12 +3,9 @@ use super::caret::{
     get_caret_position_via_gui_thread_info, read_surrounding_text, truncate_for_log,
 };
 use super::commit::apply_result;
-use super::hook::focused_thread_id;
-use super::{ServiceInner, lock_service, safe_com, try_reconnect_ipc};
+use super::{ServiceInner, lock_service, no_active_composition, safe_com, try_reconnect_ipc};
 use crate::ipc::{IpcRequest, read_response, send_request_buf};
-use black_hole_shared::{
-    InputContext, KeyEvent, KeyState, ModeSuggestion, Modifiers, suggest_input_mode,
-};
+use black_hole_shared::{InputContext, KeyEvent, KeyState, Modifiers, suggest_input_mode};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -217,9 +214,9 @@ fn handle_key_event_internal(
             drop(inner);
 
             // 读取光标周围文本（整句补全上下文与自动切换评估共用），供 SetContext
-            // 与自动切换评估消费；TSF 文本存储不可用的应用（VSCode 虚拟化编辑器、
-            // 纯 IMM32 应用）取不到时为 None，消费方按无信号处理。
-            let (preceding_text, following_text, _) =
+            // 与自动切换评估消费；语境未知（无文本存储 / 虚拟化编辑器读不出
+            // 内容）时前/后文为 None，评估方按无文本跳过（宁缺毋滥）。
+            let (preceding_text, following_text, context_known) =
                 read_surrounding_text(ec, &ctx, composition.as_ref());
 
             // 重新加锁：继续走消费 surrounding 的路径。
@@ -227,6 +224,11 @@ fn handle_key_event_internal(
             if should_retry_read(entry_version, inner.context_version, retried) {
                 retried = true;
                 continue 'read;
+            }
+            // 语境未知（无文本存储/虚拟化编辑器）：置位"应用不可读"粘性标记，
+            // 禁用后续自动切换评估（含英→中路径的逐键探测会话）
+            if !context_known {
+                inner.auto_switch_no_text = true;
             }
             // 重试后仍变化（版本不一致且已重试过）：接受第二次快照继续正常
             // 流程——OnTestKeyDown 已对同一按键返回"IME 将消费"，放行
@@ -244,10 +246,7 @@ fn handle_key_event_internal(
             // 命中建议则切换并复用手动切换收尾，本次按键不再送入引擎，
             // 由 OnKeyDown 依据 auto_switched 标志放行给应用（英文直输）。
             if inner.auto_switch {
-                let no_composition = match &composition {
-                    None => true,
-                    Some(c) => unsafe { c.GetRange().is_err() },
-                };
+                let no_composition = no_active_composition(&composition);
                 if no_composition && let Some((preceding_text, following_text)) = &surrounding {
                     let suggestion =
                         suggest_input_mode(preceding_text.as_deref(), following_text.as_deref());
@@ -326,18 +325,6 @@ fn handle_key_event_internal(
 
             drop(inner);
             apply_result(service.clone(), ec, &ctx, &response.into())?;
-            // 缓存本次采样（含焦点线程、光标位置与语境版本）：内容与位置都锚定
-            // 读取前的快照（entry_version / last_caret_pos），版本盖章必须与
-            // 采样文本同源（详见 record_context_sample 的文档）。
-            lock_service(service).record_context_sample(
-                surrounding
-                    .as_ref()
-                    .map(|(p, f)| suggest_input_mode(p.as_deref(), f.as_deref()))
-                    .unwrap_or(ModeSuggestion::Neutral),
-                focused_thread_id(),
-                last_caret_pos,
-                entry_version,
-            );
             return Ok::<(), Error>(());
         }
     }));

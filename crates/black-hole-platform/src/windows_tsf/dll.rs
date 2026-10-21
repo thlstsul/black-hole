@@ -3,16 +3,10 @@ use super::{
     CLSID_BLACKHOLE_TIP, GLOBAL_REF_COUNT, dll_add_ref, dll_release, locked, safe_com,
     set_dll_instance,
 };
-#[cfg(debug_assertions)]
-use std::env;
 use std::ffi::c_void;
-#[cfg(debug_assertions)]
-use std::fs;
-#[cfg(debug_assertions)]
-use std::process;
 use std::ptr;
 #[cfg(debug_assertions)]
-use std::sync::Once;
+use std::{env, fs, process, sync::Once};
 #[cfg(debug_assertions)]
 use tracing::Level;
 #[cfg(debug_assertions)]
